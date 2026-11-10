@@ -160,6 +160,7 @@ def run_dqn(n_episodes, weights_path):
           f"{n_episodes} episodes (seed {FIRST_SEED}..{FIRST_SEED + n_episodes - 1})...",
           flush=True)
     cmd = [DQN_PYTHON, DQN_EVAL,
+           "--scenario", "legacy", "--backend", "gama",
            "--weights", weights_path,
            "--episodes", str(n_episodes),
            "--episode-horizon", str(HORIZON_CYCLES),

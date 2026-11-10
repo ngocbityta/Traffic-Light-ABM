@@ -229,10 +229,12 @@ global {
 	float replay_speed <- 35.0;
 	int replay_maneuver <- 0;
 	int replay_lane <- 4;
+	int replay_request_id <- -1; // stable CSV row for paired microscopic diagnostics
 	int ground_requests <- 0;
 	int bypass_requests <- 0;
 	int ground_pending <- 0;
 	int bypass_pending <- 0;
+	list<int> pending_by_origin <- [0,0,0,0,0,0,0,0,0,0,0,0]; // paired diagnostics
 	float queue_time_integral <- 0.0;
 	float system_time_integral <- 0.0; // R1: vehicle-seconds on roads and waiting to enter
 	float stopped_time_integral <- 0.0; // R2: stopped vehicle-seconds on all routes
@@ -435,6 +437,7 @@ global {
 		if (empty(active_vehicles where (distance_to(each.location, start_inter.location) < 15.0 #m and abs(each.surface_height()) < 3))) {
 			create base_vehicle_species number: 1 {
 				total_vehicles_created <- total_vehicles_created + 1;
+				demand_row_id <- replay_request_id;
 
 				do configure_vehicle(car_only: false);
 
@@ -610,6 +613,7 @@ global {
 				replay_speed <- replay_rows[3, row];
 				replay_maneuver <- int(replay_rows[4, row]);
 				replay_lane <- int(replay_rows[5, row]);
+				replay_request_id <- row;
 				int before <- total_vehicles_created + bypass_vehicles_created;
 				if (origin < 4) {
 					intersection start_inter <- network_nodes[["N_SOURCE", "S_SOURCE", "E_SOURCE", "W_SOURCE"][origin]];
@@ -627,6 +631,7 @@ global {
 		ground_pending <- 0;
 		bypass_pending <- 0;
 		loop origin from: 0 to: 11 {
+			pending_by_origin[origin] <- length(replay_queues[origin]);
 			if (origin < 4) { ground_pending <- ground_pending + length(replay_queues[origin]); }
 			else { bypass_pending <- bypass_pending + length(replay_queues[origin]); }
 		}
@@ -657,6 +662,7 @@ global {
 		intersection origin <- first(waypoints);
 		if (empty(active_vehicles where (distance_to(each.location, origin.location) < 15 #m and abs(each.surface_height() - origin.surface_z) < 3))) {
 			create base_vehicle_species {
+				demand_row_id <- replay_request_id;
 				do configure_vehicle(car_only: true);
 				route_kind <- route_name;
 				spawn_surface_z <- origin.surface_z;
@@ -981,6 +987,7 @@ species road skills: [road_skill] {
 // Mo hinh vi mo da tac tu dong xe hon hop (O to, Xe may, Xe bus)
 // =========================================================================
 species base_vehicle_species skills: [driving] parallel: false {
+	int demand_row_id <- -1;
 	string vehicle_type <- "car"; // "motorcycle", "car", "bus"
 	rgb color;
 	float vehicle_width <- 1.9 #m;

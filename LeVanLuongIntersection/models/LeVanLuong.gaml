@@ -12,6 +12,13 @@ global {
 	file areas_file <- geojson_file("../includes/areas.geojson");
 	geometry shape <- envelope(areas_file);
 	float step <- 0.2 #s;
+	float traffic_seed <- -1.0; // Optional ordinary parameter for paired headless validation.
+	string demand_file_path <- "";
+	bool replay_demand <- false;
+	matrix<float> replay_rows;
+	int replay_cursor <- 0;
+	int total_vehicles_created <- 0;
+	int total_vehicles_passed <- 0;
 	float sublane_width <- 0.8; // m — phải khớp SUBLANE_W trong scripts/build_layout.py (num_lanes đã tính sẵn từ số này)
 
 	// ---- Nhu cầu (giả định, sửa theo số đếm thực tế) ----
@@ -26,12 +33,22 @@ global {
 	float all_red <- 3.0 #s;
 	float cycle_length <- green_lvl + green_hdt + 2 * all_red; // "cycle" là biến có sẵn của GAMA
 	string phase <- "LVL";
+	bool train_mode <- false;
+	bool dqn_waiting_action <- false;
+	int dqn_action <- -1;
+	int next_decision_in_cycles <- 50;
+	int red_ticks_left <- 0;
+	string pending_phase <- "LVL";
+	float queue_time_integral <- 0.0;
+	float system_time_integral <- 0.0;
+	float weighted_delay_integral <- 0.0;
 
 	graph road_network;
 	list<road> approaches;
 	map<string, int> front_row_max; // số sublane bị chiếm đồng thời ở hàng đầu (≤ 1,5 m trước vạch dừng), lớn nhất từ đầu mô phỏng
 
 	init {
+		if (traffic_seed >= 0.0) { seed <- int(traffic_seed); }
 		create area from: areas_file with: [kind::string(read("kind"))];
 		create road from: roads_file with: [rid::string(read("id")), kind::string(read("kind")), arm::string(read("arm")),
 			to_arm::string(read("to_arm")), turn::string(read("turn")), num_lanes::int(read("num_lanes")), width::float(read("width"))] {
@@ -53,15 +70,64 @@ global {
 	}
 
 	reflex signal {
-		float t <- time - cycle_length * floor(time / cycle_length);
-		phase <- t < green_lvl ? "LVL" : (t < green_lvl + all_red ? "none" : (t < green_lvl + all_red + green_hdt ? "HDT" : "none"));
+		if train_mode {
+			if dqn_action >= 0 {
+				string wanted <- dqn_action = 0 ? "LVL" : "HDT";
+				if wanted != phase and red_ticks_left = 0 {
+					pending_phase <- wanted;
+					red_ticks_left <- 15;
+				}
+				dqn_action <- -1;
+			}
+			if red_ticks_left > 0 {
+				phase <- "none";
+				red_ticks_left <- red_ticks_left - 1;
+				if red_ticks_left = 0 { phase <- pending_phase; }
+			}
+			if (cycle + 1) mod 50 = 0 { dqn_waiting_action <- true; }
+			next_decision_in_cycles <- dqn_waiting_action ? 1 : 50 - ((cycle + 1) mod 50);
+		} else {
+			float t <- time - cycle_length * floor(time / cycle_length);
+			phase <- t < green_lvl ? "LVL" : (t < green_lvl + all_red ? "none" : (t < green_lvl + all_red + green_hdt ? "HDT" : "none"));
+		}
 		ask intersection where (each.approach != nil) {
 			bool green <- (approach.arm in ["NE", "SW"]) ? (phase = "LVL") : (phase = "HDT");
 			if green { stop[0] <- []; } else { stop[0] <- [approach]; }
 		}
 	}
 
-	reflex spawn {
+	action set_dqn_action(int a) {
+		dqn_action <- a;
+		dqn_waiting_action <- false;
+	}
+
+	reflex load_replay_demand when: cycle = 0 and demand_file_path != "" {
+		replay_demand <- true;
+		replay_rows <- matrix<float>(csv_file(demand_file_path, ",", float, false));
+	}
+
+	reflex spawn_replay_demand when: replay_demand {
+		loop while: replay_cursor < replay_rows.rows {
+			// GAMA exposes cycle n after reflexes observed n-1.
+			if (replay_rows[0, replay_cursor] > cycle + 1) { break; }
+			int origin <- int(replay_rows[1, replay_cursor]);
+			string arm_name <- ["NE", "SE", "SW", "NW"][origin];
+			string turn_wanted <- ["left", "right", "through"][int(replay_rows[4, replay_cursor])];
+			road incoming <- road first_with (each.rid = arm_name + "_in");
+			road connector <- road first_with (each.kind = "connector" and each.arm = arm_name and each.turn = turn_wanted);
+			road outgoing <- road first_with (each.kind = "exit" and each.arm = connector.to_arm);
+			create vehicle with: [location::incoming.source_node.location,
+				dest::intersection(outgoing.target_node),
+				is_car::(int(replay_rows[2, replay_cursor]) = 1),
+				demand_row_id::replay_cursor,
+				requested_speed_kmh::replay_rows[3, replay_cursor],
+				requested_lane::int(replay_rows[5, replay_cursor])];
+			total_vehicles_created <- total_vehicles_created + 1;
+			replay_cursor <- replay_cursor + 1;
+		}
+	}
+
+	reflex spawn when: demand_file_path = "" {
 		ask approaches {
 			if flip(flow_per_approach / 3600 * step) {
 				float r <- rnd(1.0);
@@ -69,11 +135,18 @@ global {
 				road c <- road first_with (each.kind = "connector" and each.arm = arm and each.turn = turn_wanted);
 				road ex <- road first_with (each.kind = "exit" and each.arm = c.to_arm);
 				create vehicle with: [location::source_node.location, dest::intersection(ex.target_node), is_car::flip(1 - motorbike_ratio)];
+				total_vehicles_created <- total_vehicles_created + 1;
 			}
 		}
 	}
 
 	reflex measure_front_row {
+		system_time_integral <- system_time_integral + length(vehicle) * step;
+		loop v over: vehicle {
+			if v.speed < 1.0 * #km / #h { queue_time_integral <- queue_time_integral + step; }
+			weighted_delay_integral <- weighted_delay_integral +
+				(1.0 - min([1.0, v.speed / v.max_speed])) * step;
+		}
 		ask approaches {
 			int n <- front_row();
 			if n > front_row_max[arm] { front_row_max[arm] <- n; }
@@ -136,15 +209,20 @@ species intersection skills: [intersection_skill] {
 }
 
 species vehicle skills: [driving] {
+	int demand_row_id <- -1;
 	intersection dest;
 	bool is_car;
+	float requested_speed_kmh <- -1.0;
+	int requested_lane <- -1;
 	rgb color;
 
 	init {
 		color <- is_car ? rgb(80, 160, 255) : rgb(255, 210, 60); // gán trong init vì is_car đến từ with:
 		num_lanes_occupied <- is_car ? 2 : 1;
 		vehicle_length <- is_car ? 4.5 #m : 1.9 #m;
-		max_speed <- (is_car ? gauss(50, 5) : gauss(40, 5)) * #km / #h;
+		max_speed <- (requested_speed_kmh > 0.0 ? requested_speed_kmh :
+			(is_car ? gauss(50, 5) : gauss(40, 5))) * #km / #h;
+		if (requested_lane >= 0) { lowest_lane <- requested_lane; }
 		max_acceleration <- is_car ? 2.5 : 2.0;
 		time_headway <- is_car ? 1.2 : 0.6;
 		min_safety_distance <- is_car ? 1.0 : 0.3;
@@ -165,6 +243,7 @@ species vehicle skills: [driving] {
 	reflex move when: final_target != nil {
 		do drive;
 		if final_target = nil {
+			total_vehicles_passed <- total_vehicles_passed + 1;
 			do unregister;
 			do die;
 		}
@@ -206,4 +285,23 @@ experiment main type: gui {
 		monitor "SW vào: sublane / hàng đầu max" value: string((road first_with (each.rid = "SW_in")).num_lanes) + " / " + front_row_max["SW"];
 		monitor "NW vào: sublane / hàng đầu max" value: string((road first_with (each.rid = "NW_in")).num_lanes) + " / " + front_row_max["NW"];
 	}
+}
+
+// Pauseable headless reference for paired Python/GAMA metric comparisons.
+experiment python_parity type: gui autorun: false {
+	parameter "Traffic seed" var: traffic_seed;
+	parameter "Paired demand CSV" var: demand_file_path;
+	parameter "Flow per approach" var: flow_per_approach;
+	parameter "Motorbike ratio" var: motorbike_ratio;
+	parameter "Left turn share" var: p_left;
+	parameter "Right turn share" var: p_right;
+	parameter "LVL green" var: green_lvl;
+	parameter "HDT green" var: green_hdt;
+	parameter "All red" var: all_red;
+}
+
+experiment dqn_server_experiment type: gui autorun: false {
+	parameter "Traffic seed" var: traffic_seed;
+	parameter "Paired demand CSV" var: demand_file_path;
+	parameter "Training mode" var: train_mode;
 }
