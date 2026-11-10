@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the eight spatial experiments on identical demand and validation seeds."""
+"""Run spatial experiments on identical demand and validation seeds."""
 
 import argparse
 import csv
@@ -14,7 +14,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TRAIN = ROOT / "dqn_py" / "train.py"
 ALGORITHMS = ("rainbow", "hybrid")
-REWARDS = ("r1", "r2", "r3", "r4")
+LEGACY_REWARDS = ("r1", "r2", "r3", "r4")
+LVL_REWARDS = ("r1", "r2", "r4")
 
 
 def parse_args():
@@ -25,6 +26,8 @@ def parse_args():
     parser.add_argument("--episode-horizon", type=int, required=True)
     parser.add_argument("--episodes", type=int, default=0)
     parser.add_argument("--port", type=int, default=6868)
+    parser.add_argument("--scenario", choices=("lvl", "legacy"), default="lvl")
+    parser.add_argument("--backend", choices=("gama", "python"), default="python")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--rollout-decisions", type=int, default=16)
     parser.add_argument("--fast-simulation", action=argparse.BooleanOptionalAction,
@@ -57,7 +60,7 @@ def run_matrix(args):
     root.mkdir(parents=True, exist_ok=True)
     manifest_path = root / "matrix_manifest.json"
     common = {key: str(getattr(args, key)) for key in
-                           ("total_steps", "max_train_seconds", "episode_horizon", "episodes", "workers",
+                           ("scenario", "backend", "total_steps", "max_train_seconds", "episode_horizon", "episodes", "workers",
                             "rollout_decisions", "fast_simulation",
                             "seed_base", "validation_seed_base", "r1_ref", "r2_ref", "b_ref",
                             "r2_lambda", "r3_beta", "pressure_lambda", "validate_every",
@@ -71,7 +74,7 @@ def run_matrix(args):
     else:
         manifest = {"common": common, "cases": {}}
     for algorithm in ALGORITHMS:
-        for reward in REWARDS:
+        for reward in (LVL_REWARDS if args.scenario == "lvl" else LEGACY_REWARDS):
             name = f"{algorithm}_{reward}"
             destination = root / name
             snapshot = destination / "training_state.pt"
@@ -89,7 +92,9 @@ def run_matrix(args):
             if destination.exists() and not (args.resume and snapshot.exists()):
                 raise FileExistsError(f"{destination} exists; choose another directory or --resume")
             command = [sys.executable, "-u", str(TRAIN),
-                       "--algorithm", algorithm, "--reward-mode", reward,
+                       "--algorithm", algorithm, "--scenario", args.scenario,
+                       "--backend", args.backend,
+                       "--reward-mode", reward,
                        "--total-steps", str(args.total_steps),
                        "--episode-horizon", str(args.episode_horizon),
                        "--port", str(args.port), "--workers", str(args.workers),
@@ -104,8 +109,9 @@ def run_matrix(args):
                        "--buffer-size", str(args.buffer_size),
                        "--warmup", str(args.warmup), "--batch-size", str(args.batch_size),
                        "--validate-every", str(args.validate_every),
-                       "--checkpoint-every", str(args.checkpoint_every),
-                       "--start-server"]
+                       "--checkpoint-every", str(args.checkpoint_every)]
+            if args.backend == "gama":
+                command.append("--start-server")
             if args.max_train_seconds is not None:
                 command += ["--max-train-seconds", str(args.max_train_seconds)]
             if args.episodes:
@@ -131,7 +137,7 @@ def run_matrix(args):
                     train_seconds = sum(float(row["wall_seconds"]) for row in rows)
                     decisions = sum(int(row["decisions"]) for row in rows)
                     sim_seconds = sum(int(row.get("simulated_cycles", row["final_cycle"]))
-                                      for row in rows) * .1
+                                      for row in rows) * (.2 if args.scenario == "lvl" else .1)
                     updates = int(rows[-1]["updates"])
                     metrics = {"episodes": len(rows), "decisions": decisions,
                                "updates": updates,
@@ -171,7 +177,7 @@ def run_matrix(args):
                 raise SystemExit(f"{name} failed with exit code {result.returncode}; see {destination}")
             if server_errors:
                 print(f"[MATRIX] Warning: {name} server log has {len(server_errors)} Java/runtime errors", flush=True)
-    print(f"[MATRIX] Eight cases complete: {manifest_path}")
+    print(f"[MATRIX] {len(manifest['cases'])} cases complete: {manifest_path}")
 
 
 if __name__ == "__main__":

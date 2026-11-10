@@ -178,3 +178,9 @@ experiment my_batch_experiment type: batch until: (cycle >= doan_horizon_cycles)
 	// cung luong yeu cau xe -> so sanh cong bang & kha lap lai
 	parameter "Seed" var: seed init: 5001.0;
 }
+
+experiment python_parity type: gui autorun: false {
+	parameter "Demand CSV" var: demand_file_path;
+	parameter "Traffic seed" var: traffic_seed;
+	parameter "Fast simulation" var: fast_training init: true;
+}
