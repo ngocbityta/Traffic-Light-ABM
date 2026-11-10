@@ -23,17 +23,21 @@ MODEL = ROOT / "LeVanLuongIntersection" / "models" / "LeVanLuong.gaml"
 EXPR = ('"" + cycle + "|" + phase + "|" + length(vehicle) + "|" + '
         'total_vehicles_created + "|" + total_vehicles_passed + "|" + '
         'front_row_max["NE"] + "|" + front_row_max["SE"] + "|" + '
-        'front_row_max["SW"] + "|" + front_row_max["NW"]')
+        'front_row_max["SW"] + "|" + front_row_max["NW"] + "|" + '
+        'queue_time_integral + "|" + system_time_integral + "|" + '
+        'weighted_delay_integral')
 FIELDS = ("active", "created", "passed", "front_row_max_NE", "front_row_max_SE",
-          "front_row_max_SW", "front_row_max_NW")
+          "front_row_max_SW", "front_row_max_NW",
+          "queue_time_integral", "system_time_integral", "weighted_delay_integral")
 
 
 async def gama_snapshot(env):
     raw = str(await env._exec_expression(EXPR)).split("|")
-    if len(raw) != 9:
+    if len(raw) != 12:
         raise RuntimeError(f"Invalid Le Van Luong payload: {raw}")
     return {"cycle": int(float(raw[0])), "phase": raw[1],
-            **{key: int(float(value)) for key, value in zip(FIELDS, raw[2:])}}
+            **{key: (int(float(value)) if i < 7 else round(float(value), 3))
+               for i, (key, value) in enumerate(zip(FIELDS, raw[2:]))}}
 
 
 async def main(args):
@@ -104,10 +108,19 @@ async def main(args):
                    max(1, rows[-1]["gama_active"]),
                "final_created_error": rows[-1]["absolute_error_created"],
                "final_passed_error": rows[-1]["absolute_error_passed"],
+               "final_queue_time_integral_error": rows[-1]["absolute_error_queue_time_integral"],
+               "final_system_time_integral_error": rows[-1]["absolute_error_system_time_integral"],
+               "final_weighted_delay_integral_error": rows[-1]["absolute_error_weighted_delay_integral"],
                "final_front_row_max_errors": {arm: rows[-1][f"absolute_error_front_row_max_{arm}"]
                                               for arm in ("NE", "SE", "SW", "NW")}}
     output.with_suffix(".json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
+    if args.enforce:
+        passed = (summary["phase_match"] and
+                  summary["final_active_relative_error"] <= args.tolerance and
+                  summary["final_passed_error"] <= max(5, int(args.horizon * 0.01)))
+        if not passed:
+            raise SystemExit(f"Parity enforcement failed with tolerance {args.tolerance}")
 
 
 if __name__ == "__main__":
@@ -117,6 +130,10 @@ if __name__ == "__main__":
     parser.add_argument("--sample-every", type=int, default=50)
     parser.add_argument("--port", type=int, default=6977)
     parser.add_argument("--start-server", action="store_true")
+    parser.add_argument("--tolerance", type=float, default=0.05,
+                        help="Maximum relative error threshold for enforcement")
+    parser.add_argument("--enforce", action="store_true",
+                        help="Exit non-zero if parity thresholds are violated")
     parser.add_argument("--output", type=Path,
                         default=Path("comparison_results/lvl_python_gama.csv"))
     options = parser.parse_args()

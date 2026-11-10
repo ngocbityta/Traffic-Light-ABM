@@ -99,6 +99,8 @@ class GamaTrafficEnv:
         await env.close()
     """
 
+    step_seconds = 0.1
+
     def __init__(self, host="localhost", port=6868,
                  model_path=DEFAULT_MODEL, experiment="dqn_server_experiment",
                  verbose=True, timeout=600.0, reward_scope="all",
@@ -480,7 +482,7 @@ class GamaTrafficEnv:
             next_state = await self.read_state(force_dtse=True)
         reward = self.transition_reward(current_state, next_state)
         info = {"next_decision_in_cycles": advanced - 1,
-                "elapsed_seconds": advanced * .1, "truncated": truncated,
+                "elapsed_seconds": advanced * getattr(self, "step_seconds", 0.1), "truncated": truncated,
                 "bootstrap_valid": next_state["dqn_waiting_action"]}
         return next_state, reward, truncated, info
 

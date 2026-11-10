@@ -24,7 +24,7 @@ DT = 0.2
 
 
 def road_lengths(path=ROOT / "includes" / "roads.geojson"):
-    source = json.loads(Path(path).read_text())
+    source = json.loads(Path(path).read_text(encoding="utf-8"))
     roads = {}
     for feature in source["features"]:
         props = feature["properties"]
@@ -54,6 +54,9 @@ class Vehicle:
     position: float = 0.0
     speed: float = 0.0
     time_since_lane_change: float = 0.0
+    leading_distance: float = math.inf
+    leading_speed: float = 0.0
+    road: str = ""
 
 
 class LeVanLuongSimulator:
@@ -83,6 +86,7 @@ class LeVanLuongSimulator:
         self.queue_time_integral = 0.0
         self.system_time_integral = 0.0
         self.weighted_delay_integral = 0.0
+        self.green_ticks = 0
         self.train_mode = bool(train_mode)
         self.dqn_waiting_action = False
         self.dqn_action = -1
@@ -93,7 +97,7 @@ class LeVanLuongSimulator:
         self._cursor = 0
         self._replay = demand_file is not None
         if self._replay:
-            with Path(demand_file).open(newline="") as stream:
+            with Path(demand_file).open(newline="", encoding="utf-8") as stream:
                 for raw in csv.reader(stream):
                     if raw:
                         if len(raw) != 6:
@@ -131,6 +135,10 @@ class LeVanLuongSimulator:
     def _advance_signal(self):
         if not self.train_mode:
             self.phase = self._phase()
+            if self.phase in ("LVL", "HDT"):
+                self.green_ticks += 1
+            else:
+                self.green_ticks = 0
             return
         if self.dqn_action >= 0:
             wanted = "LVL" if self.dqn_action == 0 else "HDT"
@@ -143,6 +151,10 @@ class LeVanLuongSimulator:
             self.red_ticks_left -= 1
             if self.red_ticks_left == 0:
                 self.phase = self.pending_phase
+        if self.phase in ("LVL", "HDT"):
+            self.green_ticks += 1
+        else:
+            self.green_ticks = 0
         if self.cycle > 0 and self.cycle % 50 == 0:
             self.dqn_waiting_action = True
         self.next_decision_in_cycles = (1 if self.dqn_waiting_action else
@@ -189,6 +201,7 @@ class LeVanLuongSimulator:
             approach_end=approach_end,
             connector_end=connector_end,
             route_end=connector_end + outgoing["length"],
+            road=f"{arm}_in",
             demand_row_id=demand_row_id))
         self.created += 1
 
@@ -209,9 +222,39 @@ class LeVanLuongSimulator:
         survivors = []
         for vehicle in self.vehicles:
             old_road, old_progress = self._neighbor_road_state[id(vehicle)]
+            is_in_road = old_road.endswith("_in")
+            green = (
+                (vehicle.arm in ("NE", "SW") and self.phase == "LVL") or
+                (vehicle.arm in ("SE", "NW") and self.phase == "HDT")
+            ) if is_in_road else True
+
+            # GAMA DrivingSkill.moveAcrossSegments:
+            # If distanceToNextPoint < 0.01 at the start of the step, the agent
+            # snaps directly to the node (rem = 0.0). If red (!readyToCross),
+            # speed is set to 0.0 and movement terminates without lane change.
+            if is_in_road and not green and vehicle.approach_end - vehicle.position < 0.01:
+                vehicle.position = vehicle.approach_end
+                vehicle.speed = 0.0
+                self._free_idm_cache.pop(id(vehicle), None)
+                if old_progress != vehicle.approach_end:
+                    old_entry = (old_progress, id(vehicle), vehicle)
+                    for sub in range(vehicle.lane, vehicle.lane + vehicle.occupied):
+                        entries = lane_maps[old_road][sub]
+                        index = bisect.bisect_left(entries, old_entry)
+                        if index < len(entries) and entries[index] == old_entry:
+                            entries.pop(index)
+                    new_entry = (vehicle.approach_end, id(vehicle), vehicle)
+                    for sub in range(vehicle.lane, vehicle.lane + vehicle.occupied):
+                        bisect.insort(lane_maps[old_road][sub], new_entry)
+                    self._neighbor_road_state[id(vehicle)] = (old_road, vehicle.approach_end)
+                survivors.append(vehicle)
+                continue
+
             self._choose_lane(vehicle, lane_maps)
             move_lane = vehicle.lane
             leader, gap, _, _ = self._neighbors(vehicle, vehicle.lane, lane_maps)
+            vehicle.leading_distance = gap
+            vehicle.leading_speed = leader.speed if leader else 0.0
             acceleration = self._idm(vehicle, gap, leader.speed if leader else 0.0)
             initial_speed = vehicle.speed
             predicted_speed = initial_speed + acceleration * DT
@@ -223,28 +266,45 @@ class LeVanLuongSimulator:
                 vehicle.speed = predicted_speed
             if math.isfinite(gap):
                 distance = min(distance, max(0.0, gap))
-            boundary = (vehicle.approach_end if old_road.endswith("_in") else
+            boundary = (vehicle.approach_end if is_in_road else
                         vehicle.connector_end if old_road not in
                         (f"{vehicle.to_arm}_out",) else vehicle.route_end)
             to_boundary = boundary - vehicle.position
-            if (boundary < vehicle.route_end and distance >= to_boundary and
-                    predicted_speed > 0):
+            can_cross = green if is_in_road else True
+            if (can_cross and boundary < vehicle.route_end and
+                    distance >= to_boundary and predicted_speed > 0):
                 # GAMA reaches the node using the predicted old-road speed,
-                # then computes IDM again with the new road's speed limit.
-                # The new acceleration moves the car for the time left in
-                # this tick, but updates its final speed over the full step.
+                # then enters the new road, evaluates MOBIL lane choice, and
+                # computes IDM with the new road's parameters.
                 remaining = max(0.0, DT - to_boundary / predicted_speed)
                 vehicle.position = boundary
-                next_road, _ = self._road_state(vehicle)
+                old_entry = (old_progress, id(vehicle), vehicle)
+                for sub in range(move_lane, move_lane + vehicle.occupied):
+                    entries = lane_maps[old_road][sub]
+                    index = bisect.bisect_left(entries, old_entry)
+                    if index < len(entries) and entries[index] == old_entry:
+                        entries.pop(index)
+                if is_in_road:
+                    vehicle.road = f"{vehicle.arm}_{vehicle.to_arm}"
+                else:
+                    vehicle.road = f"{vehicle.to_arm}_out"
+                next_road = vehicle.road
                 vehicle.lane = min(vehicle.lane,
                                    self.roads[next_road]["num_lanes"] - vehicle.occupied)
                 if next_road not in lane_maps:
                     lane_maps[next_road] = [[] for _ in range(self.roads[next_road]["num_lanes"])]
                 self._neighbor_road_state[id(vehicle)] = (next_road, 0.0)
                 self._free_idm_cache.pop(id(vehicle), None)
+                new_entry = (0.0, id(vehicle), vehicle)
+                for sub in range(vehicle.lane, vehicle.lane + vehicle.occupied):
+                    bisect.insort(lane_maps[next_road][sub], new_entry)
+                self._choose_lane(vehicle, lane_maps)
                 new_leader, new_gap, _, _ = self._neighbors(vehicle, vehicle.lane, lane_maps)
+                vehicle.leading_distance = new_gap
+                vehicle.leading_speed = new_leader.speed if new_leader else 0.0
+                crossing_gap = new_gap if new_leader else math.inf
                 new_acceleration = self._idm(
-                    vehicle, new_gap, new_leader.speed if new_leader else 0.0)
+                    vehicle, crossing_gap, new_leader.speed if new_leader else 0.0)
                 if initial_speed + new_acceleration * remaining < 0:
                     new_distance = -0.5 * initial_speed * initial_speed / new_acceleration
                     vehicle.speed = 0.0
@@ -255,29 +315,36 @@ class LeVanLuongSimulator:
                 if math.isfinite(new_gap):
                     new_distance = min(new_distance, max(0.0, new_gap))
                 vehicle.position += max(0.0, new_distance)
+                curr_entry = (0.0, id(vehicle), vehicle)
+                for sub in range(vehicle.lane, vehicle.lane + vehicle.occupied):
+                    entries = lane_maps[next_road][sub]
+                    index = bisect.bisect_left(entries, curr_entry)
+                    if index < len(entries) and entries[index] == curr_entry:
+                        entries.pop(index)
+                final_entry = (new_distance, id(vehicle), vehicle)
+                for sub in range(vehicle.lane, vehicle.lane + vehicle.occupied):
+                    bisect.insort(lane_maps[next_road][sub], final_entry)
+                self._neighbor_road_state[id(vehicle)] = (next_road, new_distance)
+                new_road, new_entry = next_road, final_entry
             else:
                 vehicle.position += max(0.0, distance)
-            # A later MOBIL decision can evaluate this vehicle as a follower.
-            # Its free-road acceleration cache must reflect the new state.
-            self._free_idm_cache.pop(id(vehicle), None)
-            next_road = (f"{vehicle.arm}_in" if vehicle.position < vehicle.approach_end else
-                         f"{vehicle.arm}_{vehicle.to_arm}" if vehicle.position < vehicle.connector_end else
-                         f"{vehicle.to_arm}_out")
-            vehicle.lane = min(vehicle.lane,
-                               self.roads[next_road]["num_lanes"] - vehicle.occupied)
-            old_entry = (old_progress, id(vehicle), vehicle)
-            for sub in range(move_lane, move_lane + vehicle.occupied):
-                entries = lane_maps[old_road][sub]
-                index = bisect.bisect_left(entries, old_entry)
-                if index < len(entries) and entries[index] == old_entry:
-                    entries.pop(index)
-            new_road, new_progress = self._road_state(vehicle)
-            self._neighbor_road_state[id(vehicle)] = (new_road, new_progress)
-            if new_road not in lane_maps:
-                lane_maps[new_road] = [[] for _ in range(self.roads[new_road]["num_lanes"])]
-            new_entry = (new_progress, id(vehicle), vehicle)
-            for sub in range(vehicle.lane, vehicle.lane + vehicle.occupied):
-                bisect.insort(lane_maps[new_road][sub], new_entry)
+                if is_in_road and not green and vehicle.position > vehicle.approach_end:
+                    vehicle.position = vehicle.approach_end
+                    vehicle.speed = 0.0
+                self._free_idm_cache.pop(id(vehicle), None)
+                old_entry = (old_progress, id(vehicle), vehicle)
+                for sub in range(move_lane, move_lane + vehicle.occupied):
+                    entries = lane_maps[old_road][sub]
+                    index = bisect.bisect_left(entries, old_entry)
+                    if index < len(entries) and entries[index] == old_entry:
+                        entries.pop(index)
+                new_road, new_progress = self._road_state(vehicle)
+                self._neighbor_road_state[id(vehicle)] = (new_road, new_progress)
+                if new_road not in lane_maps:
+                    lane_maps[new_road] = [[] for _ in range(self.roads[new_road]["num_lanes"])]
+                new_entry = (new_progress, id(vehicle), vehicle)
+                for sub in range(vehicle.lane, vehicle.lane + vehicle.occupied):
+                    bisect.insort(lane_maps[new_road][sub], new_entry)
             if vehicle.position >= vehicle.route_end - 0.01:
                 self.passed += 1
                 for sub in range(vehicle.lane, vehicle.lane + vehicle.occupied):
@@ -296,35 +363,41 @@ class LeVanLuongSimulator:
         overlap = old_gap < 0
         if not overlap and vehicle.time_since_lane_change < 4.0:
             vehicle.time_since_lane_change += DT
+            vehicle.leading_distance = old_gap
+            vehicle.leading_speed = old_leader.speed if old_leader else 0.0
             return
+        old_leader_speed = old_leader.speed if old_leader else 0.0
         old_acc = (-sys.float_info.max if overlap else
-                   self._idm(vehicle, old_gap, old_leader.speed if old_leader else 0.0))
+                   self._idm(vehicle, old_gap, old_leader_speed))
+        vehicle.leading_distance = old_gap
+        vehicle.leading_speed = old_leader_speed
         best_lane, best_gain = vehicle.lane, 0.0
+        best_leader, best_front_gap = old_leader, old_gap
         for lane in range(self.roads[road]["num_lanes"] - vehicle.occupied + 1):
             if lane == vehicle.lane:
                 continue
             leader, front_gap, follower, back_gap = self._neighbors(vehicle, lane, lane_maps)
             if front_gap < 0 or back_gap < 0:
                 continue
-            target_acc = self._idm(vehicle, front_gap, leader.speed if leader else 0.0)
+            leader_speed = leader.speed if leader else 0.0
+            target_acc = self._idm(vehicle, front_gap, leader_speed)
             follower_delta = 0.0
-            if follower is not None:
-                prior_leader, prior_gap, _, _ = self._neighbors(
-                    follower, follower.lane, lane_maps)
-                # MOBIL does not charge a follower twice when it is already
-                # following this vehicle in the current lane. It also skips
-                # the delta when the follower's existing leader is closer
-                # than the candidate lane change would place this vehicle.
-                if (follower is not old_follower and prior_gap >= back_gap):
+            if follower is not None and follower is not old_follower:
+                # GAMA MOBIL: candidate follower delta is evaluated with
+                # priorGap = backGap + vehicleLength + frontGap.
+                # If candidate follower already has a closer leader on its current
+                # lane (leading_distance < back_gap), follower_delta is 0.
+                if getattr(follower, "leading_distance", math.inf) >= back_gap:
+                    prior_gap = back_gap + vehicle.length + front_gap
                     after = self._idm(follower, back_gap, vehicle.speed)
                     if after <= -4.0:
                         continue
-                    before = self._idm(follower, prior_gap,
-                                       prior_leader.speed if prior_leader else 0.0)
+                    before = self._idm(follower, prior_gap, leader_speed)
                     follower_delta = after - before
             gain = target_acc - old_acc + 0.1 * follower_delta + (0.25 if lane < vehicle.lane else -0.25)
             if gain > max(0.05, best_gain):
                 best_lane, best_gain = lane, gain
+                best_leader, best_front_gap = leader, front_gap
         if best_lane != vehicle.lane:
             entry = (progress, id(vehicle), vehicle)
             for sub in range(vehicle.lane, vehicle.lane + vehicle.occupied):
@@ -336,16 +409,24 @@ class LeVanLuongSimulator:
                 bisect.insort(lane_maps[road][sub], entry)
             vehicle.lane = best_lane
             vehicle.time_since_lane_change = 0.0
+            vehicle.leading_distance = best_front_gap
+            vehicle.leading_speed = best_leader.speed if best_leader else 0.0
         else:
             vehicle.time_since_lane_change += DT
 
     def _road_state(self, vehicle):
-        if vehicle.position < vehicle.approach_end:
-            return f"{vehicle.arm}_in", vehicle.position
-        if vehicle.position < vehicle.connector_end:
-            return (f"{vehicle.arm}_{vehicle.to_arm}",
-                    vehicle.position - vehicle.approach_end)
-        return f"{vehicle.to_arm}_out", vehicle.position - vehicle.connector_end
+        if not getattr(vehicle, "road", ""):
+            if vehicle.position < vehicle.approach_end:
+                return f"{vehicle.arm}_in", vehicle.position
+            if vehicle.position < vehicle.connector_end:
+                return (f"{vehicle.arm}_{vehicle.to_arm}",
+                        vehicle.position - vehicle.approach_end)
+            return f"{vehicle.to_arm}_out", vehicle.position - vehicle.connector_end
+        if vehicle.road == f"{vehicle.arm}_in":
+            return vehicle.road, vehicle.position
+        if vehicle.road == f"{vehicle.arm}_{vehicle.to_arm}":
+            return vehicle.road, vehicle.position - vehicle.approach_end
+        return vehicle.road, vehicle.position - vehicle.connector_end
 
     @staticmethod
     def _overlap(a, a_lane, b):
@@ -407,8 +488,12 @@ class LeVanLuongSimulator:
                     vehicle.arm in ("SE", "NW") and self.phase == "HDT")
                 if green:
                     next_road = f"{vehicle.arm}_{vehicle.to_arm}"
+                else:
+                    front = vehicle.approach_end - vehicle.position + vehicle.gap
             elif road == f"{vehicle.arm}_{vehicle.to_arm}":
                 next_road = f"{vehicle.to_arm}_out"
+            elif position > 0:
+                front = vehicle.route_end - vehicle.position + vehicle.gap
             if next_road in lane_maps:
                 next_lanes = self.roads[next_road]["num_lanes"]
                 next_lane = min(lane, next_lanes - vehicle.occupied)
@@ -439,7 +524,7 @@ class LeVanLuongSimulator:
                 stop_gap = vehicle.approach_end - vehicle.position + vehicle.gap
                 if stop_gap < gap:
                     gap, leader_speed = stop_gap, 0.0
-        elif vehicle.position >= vehicle.connector_end:
+        elif vehicle.position > vehicle.connector_end:
             stop_gap = vehicle.route_end - vehicle.position + vehicle.gap
             if stop_gap < gap:
                 gap, leader_speed = stop_gap, 0.0
@@ -472,14 +557,14 @@ class LeVanLuongSimulator:
             self.cycle += 1
             self._advance_signal()
             self._spawn()
-            self._move()
             self._measure()
+            self._move()
         return self.snapshot()
 
     def snapshot(self):
         result = {"cycle": self.cycle, "time_sec": round(self.cycle * DT, 3),
                   "phase": self.phase, "created": self.created, "passed": self.passed,
-                  "active": len(self.vehicles),
+                  "active": len(self.vehicles), "green_ticks": self.green_ticks,
                   "queue": sum(v.speed * 3.6 < 1 for v in self.vehicles),
                   "queue_time_integral": round(self.queue_time_integral, 3)}
         result.update(system_time_integral=round(self.system_time_integral, 3),
@@ -502,16 +587,22 @@ def main():
     parser.add_argument("--green-lvl", type=float, default=50)
     parser.add_argument("--green-hdt", type=float, default=40)
     parser.add_argument("--all-red", type=float, default=3)
+    parser.add_argument("--demand-file", type=Path, default=None,
+                        help="Replay demand CSV file (recommended for GAMA parity)")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.cycles < 0 or args.sample_every <= 0:
         parser.error("cycles must be non-negative and sample interval positive")
+    if args.demand_file is None:
+        sys.stderr.write("Warning: Running without --demand-file uses Python RNG for "
+                         "vehicle generation; will not match GAMA replay demand.\n")
     sim = LeVanLuongSimulator(seed=args.seed,
         flow_per_approach=args.flow_per_approach,
         motorbike_ratio=args.motorbike_ratio, p_left=args.p_left, p_right=args.p_right,
-        green_lvl=args.green_lvl, green_hdt=args.green_hdt, all_red=args.all_red)
+        green_lvl=args.green_lvl, green_hdt=args.green_hdt, all_red=args.all_red,
+        demand_file=args.demand_file)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", newline="") as handle:
+    with args.output.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=sim.snapshot().keys())
         writer.writeheader()
         writer.writerow(sim.snapshot())

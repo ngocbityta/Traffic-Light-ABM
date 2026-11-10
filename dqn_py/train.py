@@ -519,8 +519,8 @@ async def amain(args):
                                         else last["queue_time_integral"])
                                 if args.reward_mode == "total_wait":
                                     wait += last["external_wait_integral"]
-                                scores.append(wait / (args.episode_horizon *
-                                                      (.2 if args.scenario == "lvl" else .1)))
+                                dt = getattr(env, "step_seconds", .2 if args.scenario == "lvl" else .1)
+                                scores.append(wait / (args.episode_horizon * dt))
                         finally:
                             env._worst_delay_sq = normalizer
                             if not process_executors:
@@ -617,8 +617,8 @@ async def amain(args):
                                 else last["queue_time_integral"])
                         if args.reward_mode == "total_wait":
                             wait += last["external_wait_integral"]
-                        scores.append(wait / (args.episode_horizon *
-                                              (.2 if args.scenario == "lvl" else .1)))
+                        dt = getattr(env, "step_seconds", .2 if args.scenario == "lvl" else .1)
+                        scores.append(wait / (args.episode_horizon * dt))
                 finally:
                     env._worst_delay_sq = normalizer
                 score = sum(scores) / len(scores)
@@ -647,8 +647,8 @@ async def amain(args):
         with open(log_path, newline="") as stream:
             completed_rows = list(csv.DictReader(stream))
         train_elapsed = time.monotonic() - train_started
-        simulated_seconds = sum(int(row["simulated_cycles"]) for row in completed_rows) * (
-            .2 if args.scenario == "lvl" else .1)
+        dt = getattr(env, "step_seconds", .2 if args.scenario == "lvl" else .1)
+        simulated_seconds = sum(int(row["simulated_cycles"]) for row in completed_rows) * dt
         summary = {"algorithm": args.algorithm, "scenario": args.scenario,
                    "backend": args.backend,
                    "fidelity": ("LVL IDM/MOBIL paired approximation" if args.scenario == "lvl"

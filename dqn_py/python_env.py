@@ -138,7 +138,10 @@ class PythonTrafficEnv(GamaTrafficEnv):
         self._phase_wait = [0] * 4
         self._guard = False
         self._metrics = {}
-        self._integrals = {}
+        self._integrals = dict.fromkeys(("queue_time_integral", "external_wait_integral",
+                                         "external_all_time_integral", "system_time_integral",
+                                         "stopped_time_integral", "outgoing_block_integral",
+                                         "weighted_delay_integral"), 0.0)
         self._count_created = 0
         self._count_passed = 0
         self._bypass_created = 0
@@ -162,7 +165,7 @@ class PythonTrafficEnv(GamaTrafficEnv):
         self._model_demand = not bool(demand_path)
         self._rows = []
         if demand_path:
-            with Path(demand_path).open(newline="") as handle:
+            with Path(demand_path).open(newline="", encoding="utf-8") as handle:
                 for raw in csv.reader(handle):
                     if raw:
                         row = tuple(int(float(x)) for x in raw)
@@ -300,6 +303,11 @@ class PythonTrafficEnv(GamaTrafficEnv):
             self._advance_maxpressure_controller()
             return
         self._phase_ticks += 1
+        for a in range(4):
+            if self._phase == a * 2 and not self._all_red and self._phase % 2 == 0:
+                self._phase_wait[a] = 0
+            else:
+                self._phase_wait[a] += 1
         if self._all_red:
             self._red_ticks += 1
             if self._red_ticks >= 20 and self._junction_clear():
@@ -487,6 +495,7 @@ class PythonTrafficEnv(GamaTrafficEnv):
             edge = self._incoming_edge(vehicle)
             if edge is not None:
                 groups.setdefault(edge, []).append(vehicle)
+        gaps = self._leader_gaps()
         for vehicle in self.vehicles:
             edge = self._incoming_edge(vehicle)
             if (edge is None or vehicle.maneuver != "straight" or
@@ -504,7 +513,7 @@ class PythonTrafficEnv(GamaTrafficEnv):
             allowed = (range(4, 12) if vehicle.kind == 0 else
                        (8,) if vehicle.kind == 2 else range(4, 11))
             speed_limit = min(vehicle.desired, 50.0 / 3.6)
-            current_gap, current_leader_speed = self._leader_gaps()[id(vehicle)]
+            current_gap, current_leader_speed = gaps[id(vehicle)]
             current_accel = self._idm_acceleration(vehicle, speed_limit,
                                                     current_gap, current_leader_speed)
             for candidate in allowed:
@@ -560,6 +569,7 @@ class PythonTrafficEnv(GamaTrafficEnv):
                     break
                 old_lane = vehicle.lane
                 vehicle.lane = candidate
+                gaps = self._leader_gaps()
                 vehicle.last_lane_change_cycle = self._cycle
                 # Smooth lateral movement peaks at roughly 2.8 m/s for a
                 # one-sublane car change.  GAML scales duration by type.

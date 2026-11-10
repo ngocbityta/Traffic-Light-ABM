@@ -31,8 +31,12 @@ MASK = np.asarray([True, False, True, False])
 
 def _observation(cycle, phase, waiting, next_decision, created, passed,
                  queue_integral, system_integral, weighted_integral, vehicles,
-                 state_mode):
+                 state_mode, green_cycles=None):
     grid = np.zeros((4, 6, 20, 16), dtype=np.float32)
+    for arm_idx, arm_name in enumerate(ARMS):
+        valid_lanes = ROADS[f"{arm_name}_in"]["num_lanes"]
+        grid[arm_idx, 5, :, :valid_lanes] = 1.0
+    speed_counts = np.zeros((4, 20, 16), dtype=np.float32)
     dtse = np.zeros((3, 8, 20), dtype=np.float32)
     queues = [0, 0, 0, 0]
     approach_counts = [0, 0, 0, 0]
@@ -54,24 +58,28 @@ def _observation(cycle, phase, waiting, next_decision, created, passed,
             arm in (1, 3) and phase == "HDT")
         for sublane in range(max(0, lane), min(16, lane + occupied)):
             grid[arm, 0, bin_id, sublane] = 1.0
-            grid[arm, 1, bin_id, sublane] = ratio
+            grid[arm, 1, bin_id, sublane] += ratio
+            speed_counts[arm, bin_id, sublane] += 1.0
             grid[arm, 2, bin_id, sublane] = float(not served)
             grid[arm, 3, bin_id, sublane] = float(occupied == 2)
             grid[arm, 4, bin_id, sublane] = (1.0 if arm in (0, 2) else -1.0)
-            grid[arm, 5, bin_id, sublane] = 1.0
         row = 2 * arm + int(lane >= 8)
         dtse[0, row, bin_id] = 1.0
         dtse[1, row, bin_id] = max(dtse[1, row, bin_id], ratio)
         dtse[2, row, bin_id] = float(served)
+    np.divide(grid[:, 1], speed_counts, out=grid[:, 1], where=speed_counts > 0)
     state = dict(cycle=cycle, global_phase={"LVL": 0, "HDT": 4, "none": 1}[phase],
-                 green_cycles=cycle % 50, yellow_cycles=0,
+                 green_cycles=cycle % 50 if green_cycles is None else int(green_cycles),
+                 yellow_cycles=0,
                  queue_ns=queues[0] + queues[2], queue_ew=queues[1] + queues[3],
                  approach_ns=approach_counts[0] + approach_counts[2],
                  approach_ew=approach_counts[1] + approach_counts[3],
                  current_queue_length=queue_now,
-                 average_waiting_time=float("nan"), max_waiting_time=float("nan"),
+                 average_waiting_time=queue_integral / max(1, created) if created else 0.0,
+                 max_waiting_time=float("nan"),
                  average_speed=3.6 * speed_total / len(vehicles) if vehicles else 0.0,
-                 average_travel_time=float("nan"), total_vehicles_passed=passed,
+                 average_travel_time=system_integral / max(1, passed) if passed else 0.0,
+                 total_vehicles_passed=passed,
                  total_vehicles_created=created, decision_count=cycle // 50,
                  dqn_waiting_action=waiting, next_decision_in_cycles=next_decision,
                  delay_sq=delay_sq, queue_time_integral=queue_integral,
@@ -89,12 +97,6 @@ def _observation(cycle, phase, waiting, next_decision, created, passed,
 
 class _LVLCommon:
     step_seconds = DT
-
-    async def step(self, action, horizon=None, current_state=None):
-        state, reward, done, info = await super().step(
-            action, horizon=horizon, current_state=current_state)
-        info["elapsed_seconds"] *= DT / 0.1
-        return state, reward, done, info
 
 
 class LVLGamaEnv(_LVLCommon, GamaTrafficEnv):
@@ -159,7 +161,7 @@ class LVLPythonEnv(_LVLCommon, GamaTrafficEnv):
                        if row["name"] == "demand_file_path"), None)
         if not demand:
             raise ValueError("Le Van Luong training requires a paired demand CSV")
-        self.sim = LeVanLuongSimulator(seed=seed or 1, demand_file=demand,
+        self.sim = LeVanLuongSimulator(seed=1 if seed is None else seed, demand_file=demand,
                                       train_mode=True)
         return await self.read_state()
 
@@ -174,7 +176,8 @@ class LVLPythonEnv(_LVLCommon, GamaTrafficEnv):
         return _observation(sim.cycle, sim.phase, sim.dqn_waiting_action,
                             sim.next_decision_in_cycles, sim.created, sim.passed,
                             sim.queue_time_integral, sim.system_time_integral,
-                            sim.weighted_delay_integral, vehicles, self.state_mode)
+                            sim.weighted_delay_integral, vehicles, self.state_mode,
+                            green_cycles=getattr(sim, "green_ticks", None))
 
     async def set_action(self, action):
         self.sim.set_action(action)

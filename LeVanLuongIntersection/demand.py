@@ -33,7 +33,7 @@ def generate_demand(path, seed, horizon, flow_per_approach=2400.0,
             rows.append((cycle, origin, int(is_car), speed, turn, lane))
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as stream:
+    with path.open("w", newline="", encoding="utf-8") as stream:
         csv.writer(stream).writerows(rows)
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

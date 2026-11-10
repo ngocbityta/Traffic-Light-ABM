@@ -32,7 +32,7 @@ def generate_demand(path, seed, horizon, site="doan"):
             rows.append((cycle, origin, vtype, speed, turn, lane))
     rows.sort(key=lambda row: (row[0], row[1]))
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as stream:
+    with path.open("w", newline="", encoding="utf-8") as stream:
         csv.writer(stream).writerows(rows)
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
