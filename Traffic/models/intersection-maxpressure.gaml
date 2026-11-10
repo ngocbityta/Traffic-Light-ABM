@@ -123,12 +123,9 @@ global {
 }
 
 experiment my_experiment type: gui {
-	parameter "Xe cầu vượt và hầm" var: enable_bypass_traffic;
-	parameter "Xem mặt cắt hầm" var: show_tunnel_cutaway;
 	float minimum_cycle_duration <- 0.033#s; // About 3 model seconds per wall second (step = 0.1 s)
 	output synchronized: true {
 		monitor "Xe hoàn thành mặt đất" value: total_vehicles_passed;
-		monitor "Xe hoàn thành cầu vượt/hầm" value: bypass_vehicles_passed;
 		monitor "Hàng đợi mặt đất" value: current_queue_length;
 		monitor "Pha đèn" value: phase_names[global_phase];
 		monitor "Đếm ngược pha" value: signal_countdown;
@@ -136,14 +133,8 @@ experiment my_experiment type: gui {
 		display doan_3d type: opengl background: rgb(8,12,22) {
 			camera 'default' location: {820,1210,220} target: {1000,1000,16};
 			species doan_ground aspect: base;
-			species bridge_pillar;
-			species metro_pillar;
-			species tunnel_structure;
-			species flyover_structure;
-			species metro_structure;
 			species traffic_signal_post aspect: doan_3d;
 			species base_vehicle_species aspect: doan_3d;
-			species doan_metro aspect: base;
 		}
 
 		display intersection_view background: rgb(18, 22, 28) {

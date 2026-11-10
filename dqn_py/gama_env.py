@@ -499,7 +499,8 @@ def featurize(state):
         aux = np.zeros(17, dtype=np.float32)
         if 0 <= phase < 4:
             aux[phase] = 1.0
-        aux[4] = min(1.0, state["green_cycles"] / 600.0)
+        step_sec = state.get("step_seconds", 0.1)
+        aux[4] = min(1.0, (state["green_cycles"] * step_sec) / 60.0)
         aux[5:9] = np.clip([state["queue_ns"], state["queue_ew"],
                             state["approach_ns"], state["approach_ew"]], 0, 100) / 100.0
         pressure = np.asarray(state["pressure"], dtype=np.float32)

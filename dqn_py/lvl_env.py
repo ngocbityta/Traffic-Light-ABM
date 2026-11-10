@@ -25,7 +25,8 @@ VEHICLE_PATTERN = re.compile(
 STATE_EXPR = ('"" + cycle + "|" + phase + "|" + dqn_waiting_action + "|" + '
               'next_decision_in_cycles + "|" + total_vehicles_created + "|" + '
               'total_vehicles_passed + "|" + queue_time_integral + "|" + '
-              'system_time_integral + "|" + weighted_delay_integral')
+              'system_time_integral + "|" + weighted_delay_integral + "|" + '
+              'green_ticks')
 MASK = np.asarray([True, False, True, False])
 
 
@@ -89,7 +90,8 @@ def _observation(cycle, phase, waiting, next_decision, created, passed,
                  external_all_time_integral=0.0, outgoing_block_integral=0.0,
                  weighted_delay_integral=weighted_integral,
                  pressure=np.asarray([queues[0] + queues[2], 0,
-                                      queues[1] + queues[3], 0], dtype=np.float32))
+                                      queues[1] + queues[3], 0], dtype=np.float32),
+                 step_seconds=DT)
     state["spatial" if state_mode == "spatial" else "dtse"] = (
         grid if state_mode == "spatial" else dtse)
     return state
@@ -131,7 +133,7 @@ class LVLGamaEnv(_LVLCommon, GamaTrafficEnv):
 
     async def read_state(self, force_dtse=False):
         fields = str(await self._exec_expression(STATE_EXPR)).split("|")
-        if len(fields) != 9:
+        if len(fields) != 10:
             raise GamaEnvError(f"Invalid Le Van Luong state: {fields}")
         raw = str(await self._exec_expression(VEHICLES_EXPR))
         vehicles = [(float(a), float(b), int(c), int(d), e, float(f))
@@ -140,8 +142,9 @@ class LVLGamaEnv(_LVLCommon, GamaTrafficEnv):
             raise GamaEnvError("Le Van Luong vehicle snapshot is incomplete")
         return _observation(int(float(fields[0])), fields[1], fields[2].lower() == "true",
                             int(float(fields[3])), int(float(fields[4])),
-                            int(float(fields[5])), *map(float, fields[6:]),
-                            vehicles, self.state_mode)
+                            int(float(fields[5])), *map(float, fields[6:9]),
+                            vehicles, self.state_mode,
+                            green_cycles=int(float(fields[9])))
 
 
 class LVLPythonEnv(_LVLCommon, GamaTrafficEnv):

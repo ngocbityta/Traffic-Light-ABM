@@ -18,11 +18,10 @@ model collision_avoidance
 import "doan_scenery.gaml"
 
 global {
-	// DoAn network topology and route metadata.
-	bool enable_bypass_traffic <- true;
+	// Ground network topology and route metadata (no overpass, underpass, or elevated rail).
+	bool enable_bypass_traffic <- false;
 	float right_turn_share <- 0.15;
 	float uturn_share <- 0.05;
-	int bypass_spawn_interval <- 120;
 	map<string, intersection> network_nodes <- [];
 	map<string, road> network_roads <- [];
 	map<int, intersection> ground_exits <- [];
@@ -31,9 +30,6 @@ global {
 	map<int, intersection> ground_merges <- [];
 	map<int, intersection> ground_uturn_entries <- [];
 	map<int, intersection> ground_uturn_exits <- [];
-	map<string, list<intersection>> bypass_routes <- [];
-	list<string> bypass_route_names <- ["flyover_NS", "flyover_SN", "on_N", "on_S",
-		"off_N", "off_S", "tunnel_WE", "tunnel_EW"];
 	map<string, int> route_created <- [];
 	map<string, int> route_completed <- [];
 	int bypass_vehicles_created <- 0;
@@ -78,9 +74,9 @@ global {
 			is_incoming <- incoming;
 			is_outer_road <- kind = "ground";
 			is_signal_connector <- kind = "through" or kind = "left";
-			level_type <- (kind = "flyover" or kind = "ramp" or kind = "tunnel") ? kind : "ground";
-			maxspeed <- kind = "flyover" ? 60 #km/#h : (kind = "uturn" ? 10 #km/#h :
-				(kind = "left" or kind = "right" or kind = "ramp" ? 20 #km/#h : 50 #km/#h));
+			level_type <- "ground";
+			maxspeed <- (kind = "uturn" ? 10 #km/#h :
+				(kind = "left" or kind = "right" ? 20 #km/#h : 50 #km/#h));
 			network_roads[key] <- self;
 		}
 	}
@@ -153,63 +149,6 @@ global {
 			ask network_roads[arm + "_right"] { shape <- right_curve; }
 		}
 
-		// Separate directed flyover nodes. Grade separation never creates a junction.
-		loop direction over: ["NS", "SN"] {
-			float x <- direction = "NS" ? 998.5 : 1001.5;
-			list<float> ys <- direction = "NS" ? [10.0,640.0,1360.0,1990.0] : [1990.0,1360.0,640.0,10.0];
-			loop j from: 0 to: 3 { do add_doan_node(key: "F_" + direction + j, pos: {x,ys[j],50.0}); }
-			loop j from: 0 to: 2 {
-				do add_doan_road(key: "F_" + direction + j, from_key: "F_" + direction + j, to_key: "F_" + direction + (j+1),
-					kind: "flyover", approach: -1, incoming: false, lanes: nb_lanes, width: 1.5, via: []);
-			}
-			bypass_routes["flyover_" + direction] <- [network_nodes["F_" + direction + "0"], network_nodes["F_" + direction + "3"]];
-		}
-		do add_doan_road(key: "on_N", from_key: "N_PORTAL_IN", to_key: "F_NS1", kind: "ramp", approach: -1, incoming: false, lanes: nb_lanes, width: 1.5, via: []);
-		do add_doan_road(key: "on_S", from_key: "S_PORTAL_IN", to_key: "F_SN1", kind: "ramp", approach: -1, incoming: false, lanes: nb_lanes, width: 1.5, via: []);
-		do add_doan_road(key: "off_N", from_key: "F_SN2", to_key: "N_PORTAL_OUT", kind: "ramp", approach: -1, incoming: false, lanes: nb_lanes, width: 1.5, via: []);
-		do add_doan_road(key: "off_S", from_key: "F_NS2", to_key: "S_PORTAL_OUT", kind: "ramp", approach: -1, incoming: false, lanes: nb_lanes, width: 1.5, via: []);
-		// Keep lane slot IDs across merges: DrivingSkill's look-ahead uses those
-		// IDs BEFORE choose_lane runs. Vehicles may only use their route's slots;
-		// these 16 logical slots do not mean 16 physical lanes on the flyover.
-		ask road where (each.road_kind = "flyover") { shift_start <- -4.5; shift_end <- -4.5; }
-		ask road where (each.road_kind = "ramp") {
-			// Map the ramp's carriageway continuously onto its ground/flyover lanes.
-			shift_start <- road_key = "on_N" or road_key = "on_S" ? 1.5 : -4.5;
-			shift_end <- road_key = "on_N" or road_key = "on_S" ? -4.5 : 1.5;
-		}
-		bypass_routes["on_N"] <- [network_nodes["N_SOURCE"], network_nodes["N_PORTAL_IN"], network_nodes["F_NS1"], network_nodes["F_NS3"]];
-		bypass_routes["on_S"] <- [network_nodes["S_SOURCE"], network_nodes["S_PORTAL_IN"], network_nodes["F_SN1"], network_nodes["F_SN3"]];
-		bypass_routes["off_N"] <- [network_nodes["F_SN0"], network_nodes["F_SN2"], network_nodes["N_PORTAL_OUT"], network_nodes["N_TARGET"]];
-		bypass_routes["off_S"] <- [network_nodes["F_NS0"], network_nodes["F_NS2"], network_nodes["S_PORTAL_OUT"], network_nodes["S_TARGET"]];
-
-		// Dedicated tunnel approaches sit outside the surface carriageway.
-		// Separate boundary nodes keep them clear of ground traffic at both ends.
-		do add_doan_node(key: "W_TUNNEL_SOURCE", pos: {10,1045,0});
-		do add_doan_node(key: "E_TUNNEL_TARGET", pos: {1990,1045,0});
-		do add_doan_node(key: "E_TUNNEL_SOURCE", pos: {1990,955,0});
-		do add_doan_node(key: "W_TUNNEL_TARGET", pos: {10,955,0});
-		do add_doan_node(key: "W_TUNNEL_IN", pos: {760,1045,0});
-		do add_doan_node(key: "E_TUNNEL_OUT", pos: {1240,1045,0});
-		do add_doan_node(key: "E_TUNNEL_IN", pos: {1240,955,0});
-		do add_doan_node(key: "W_TUNNEL_OUT", pos: {760,955,0});
-		do add_doan_road(key: "tunnel_WE_feed", from_key: "W_TUNNEL_SOURCE", to_key: "W_TUNNEL_IN",
-			kind: "tunnel_feeder", approach: -1, incoming: false, lanes: nb_lanes, width: 1.75, via: []);
-		do add_doan_road(key: "tunnel_WE", from_key: "W_TUNNEL_IN", to_key: "E_TUNNEL_OUT",
-			kind: "tunnel", approach: -1, incoming: false, lanes: nb_lanes, width: 1.75,
-			via: [{920.0,1045.0,-60.0}, {1080.0,1045.0,-60.0}]);
-		do add_doan_road(key: "tunnel_WE_exit", from_key: "E_TUNNEL_OUT", to_key: "E_TUNNEL_TARGET",
-			kind: "tunnel_feeder", approach: -1, incoming: false, lanes: nb_lanes, width: 1.75, via: []);
-		do add_doan_road(key: "tunnel_EW_feed", from_key: "E_TUNNEL_SOURCE", to_key: "E_TUNNEL_IN",
-			kind: "tunnel_feeder", approach: -1, incoming: false, lanes: nb_lanes, width: 1.75, via: []);
-		do add_doan_road(key: "tunnel_EW", from_key: "E_TUNNEL_IN", to_key: "W_TUNNEL_OUT",
-			kind: "tunnel", approach: -1, incoming: false, lanes: nb_lanes, width: 1.75,
-			via: [{1080.0,955.0,-60.0}, {920.0,955.0,-60.0}]);
-		do add_doan_road(key: "tunnel_EW_exit", from_key: "W_TUNNEL_OUT", to_key: "W_TUNNEL_TARGET",
-			kind: "tunnel_feeder", approach: -1, incoming: false, lanes: nb_lanes, width: 1.75, via: []);
-		bypass_routes["tunnel_WE"] <- [network_nodes["W_TUNNEL_SOURCE"], network_nodes["W_TUNNEL_IN"],
-			network_nodes["E_TUNNEL_OUT"], network_nodes["E_TUNNEL_TARGET"]];
-		bypass_routes["tunnel_EW"] <- [network_nodes["E_TUNNEL_SOURCE"], network_nodes["E_TUNNEL_IN"],
-			network_nodes["W_TUNNEL_OUT"], network_nodes["W_TUNNEL_TARGET"]];
 	}
 
 	// Batch experiments replace the built-in seed after init. Apply an ordinary
@@ -255,7 +194,7 @@ global {
 	// does not use. Vehicle movement, signal timing and R1 remain unchanged.
 	bool fast_training <- false;
 	string training_reward_mode <- "all";
-	float lane_width <- 1.75 #m;  // Sublane width (motorcycle = 1 sublane = 1.5m; car = 2 sublanes = 3.0m)
+	float lane_width <- 0.8 #m;  // Sublane width (motorcycle = 1 sublane = 0.8m; car = 2 sublanes = 1.6m)
 	int nb_lanes <- 16;           // 16 sublanes per road direction
 
 	graph road_network;
@@ -569,10 +508,9 @@ global {
 		}
 		queue_time_integral <- queue_time_integral + current_queue_length * step;
 		external_wait_integral <- external_wait_integral + ground_pending * step;
-		external_all_time_integral <- external_all_time_integral +
-			(ground_pending + bypass_pending) * step;
+		external_all_time_integral <- external_all_time_integral + ground_pending * step;
 		system_time_integral <- system_time_integral +
-			(length(active_vehicles) + ground_pending + bypass_pending) * step;
+			(length(active_vehicles) + ground_pending) * step;
 		if (!r1_only) {
 			stopped_time_integral <- stopped_time_integral + stopped_all * step;
 			outgoing_block_integral <- outgoing_block_integral + blocked_outgoing * step;
@@ -588,24 +526,24 @@ global {
 		replay_demand <- true;
 		replay_rows <- matrix<float>(csv_file(demand_file_path, ",", float, false));
 		external_weighted_pending <- 0.0;
-		loop origin from: 0 to: 11 { replay_queues[origin] <- []; }
+		loop origin from: 0 to: 3 { replay_queues[origin] <- []; }
 	}
 
 	reflex admit_replay_demand when: replay_demand {
 		loop while: replay_cursor < replay_rows.rows {
 			if (replay_rows[0, replay_cursor] > cycle) { break; }
 			int origin <- int(replay_rows[1, replay_cursor]);
-			replay_queues[origin] <- replay_queues[origin] + replay_cursor;
-			int requested_class <- int(replay_rows[2, replay_cursor]);
-			external_weighted_pending <- external_weighted_pending +
-				(requested_class = 0 ? 0.3 : (requested_class = 2 ? 2.0 : 1.0));
-			if (origin < 4) { ground_requests <- ground_requests + 1; }
-			else { bypass_requests <- bypass_requests + 1; }
+			if (origin < 4) {
+				replay_queues[origin] <- replay_queues[origin] + replay_cursor;
+				int requested_class <- int(replay_rows[2, replay_cursor]);
+				external_weighted_pending <- external_weighted_pending +
+					(requested_class = 0 ? 0.3 : (requested_class = 2 ? 2.0 : 1.0));
+				ground_requests <- ground_requests + 1;
+			}
 			replay_cursor <- replay_cursor + 1;
 		}
-		// Rotate admission order for routes sharing a source; retain FIFO per route.
-		loop k from: 0 to: 11 {
-			int origin <- (k + int(cycle / bypass_spawn_interval)) mod 12;
+		loop k from: 0 to: 3 {
+			int origin <- k;
 			list<int> pending <- replay_queues[origin];
 			if (!empty(pending)) {
 				int row <- first(pending);
@@ -614,14 +552,10 @@ global {
 				replay_maneuver <- int(replay_rows[4, row]);
 				replay_lane <- int(replay_rows[5, row]);
 				replay_request_id <- row;
-				int before <- total_vehicles_created + bypass_vehicles_created;
-				if (origin < 4) {
-					intersection start_inter <- network_nodes[["N_SOURCE", "S_SOURCE", "E_SOURCE", "W_SOURCE"][origin]];
-					do spawn_vehicle_at(start_inter);
-				} else {
-					do spawn_bypass_vehicle(bypass_route_names[origin - 4]);
-				}
-				if (total_vehicles_created + bypass_vehicles_created > before) {
+				int before <- total_vehicles_created;
+				intersection start_inter <- network_nodes[["N_SOURCE", "S_SOURCE", "E_SOURCE", "W_SOURCE"][origin]];
+				do spawn_vehicle_at(start_inter);
+				if (total_vehicles_created > before) {
 					replay_queues[origin] <- pending - row;
 					external_weighted_pending <- max([0.0, external_weighted_pending -
 						(replay_type = 0 ? 0.3 : (replay_type = 2 ? 2.0 : 1.0))]);
@@ -629,19 +563,9 @@ global {
 			}
 		}
 		ground_pending <- 0;
-		bypass_pending <- 0;
-		loop origin from: 0 to: 11 {
+		loop origin from: 0 to: 3 {
 			pending_by_origin[origin] <- length(replay_queues[origin]);
-			if (origin < 4) { ground_pending <- ground_pending + length(replay_queues[origin]); }
-			else { bypass_pending <- bypass_pending + length(replay_queues[origin]); }
-		}
-	}
-
-	reflex spawn_bypass_traffic when: !replay_demand and enable_bypass_traffic and every(bypass_spawn_interval #cycle) {
-		// Rotate demand so ground and flyover origins are not monopolised by one route.
-		int offset <- int(cycle / bypass_spawn_interval) mod length(bypass_route_names);
-		loop k from: 0 to: length(bypass_route_names) - 1 {
-			do spawn_bypass_vehicle(route_name: bypass_route_names[(k + offset) mod length(bypass_route_names)]);
+			ground_pending <- ground_pending + length(replay_queues[origin]);
 		}
 	}
 
@@ -657,44 +581,15 @@ global {
 		}
 	}
 
-	action spawn_bypass_vehicle(string route_name) {
-		list<intersection> waypoints <- bypass_routes[route_name];
-		intersection origin <- first(waypoints);
-		if (empty(active_vehicles where (distance_to(each.location, origin.location) < 15 #m and abs(each.surface_height() - origin.surface_z) < 3))) {
-			create base_vehicle_species {
-				demand_row_id <- replay_request_id;
-				do configure_vehicle(car_only: true);
-				route_kind <- route_name;
-				spawn_surface_z <- origin.surface_z;
-				uses_signal <- false;
-				target <- last(waypoints);
-				location <- origin.location;
-				heading <- origin.location direction_to waypoints[1].location;
-				lowest_lane <- route_name = "tunnel_WE" or route_name = "tunnel_EW" ? 14 : 9;
-				allowed_lanes <- [lowest_lane]; base_allowed_lanes <- allowed_lanes;
-				do compute_path graph: road_network nodes: waypoints;
-				if (final_target = nil) { failed_route_count <- failed_route_count + 1; }
-				bypass_vehicles_created <- bypass_vehicles_created + 1;
-				route_created[route_name] <- (route_created contains_key route_name ? route_created[route_name] : 0) + 1;
-				active_vehicles <- active_vehicles + self;
-			}
-		}
-	}
-
-
 	init {
 		do init_doan_network;
 		road_network <- as_driving_graph(road, intersection);
 		ask intersection {
-			priority_roads <- roads_in where (road(each).road_kind = "ground" or road(each).road_kind = "flyover");
+			priority_roads <- roads_in where (road(each).road_kind = "ground");
 			managed_merge <- (length(roads_in) > 1 or length(roads_out) > 1) and
-				!empty((roads_in + roads_out) where (road(each).road_kind = "ramp" or road(each).road_kind = "tunnel" or
-				road(each).road_kind = "right" or road(each).road_kind = "uturn"));
-			merge_clearance <- !empty(roads_in where (road(each).road_kind = "ramp" or road(each).road_kind = "tunnel")) ?
-				((node_key = "F_SN1" or node_key = "F_NS1") ? 70.0 : 35.0) :
-				(!empty(roads_out where (road(each).road_kind = "ramp" or road(each).road_kind = "tunnel")) ? 25.0 :
-				(!empty((roads_in + roads_out) where
-					(road(each).road_kind = "uturn" or road(each).road_kind = "right")) ? 18.0 : 8.0));
+				!empty((roads_in + roads_out) where (road(each).road_kind = "right" or road(each).road_kind = "uturn"));
+			merge_clearance <- !empty((roads_in + roads_out) where
+				(road(each).road_kind = "uturn" or road(each).road_kind = "right")) ? 18.0 : 8.0;
 		}
 		// Divergences have no crossing traffic to reserve. Holding a slot here
 		// made vehicles stop far upstream of the signal, including U-turns.
@@ -702,8 +597,6 @@ global {
 			ask network_nodes[arm + "_U_IN"] { managed_merge <- false; }
 			ask network_nodes[arm + "_DIV"] { managed_merge <- false; }
 		}
-		ask network_nodes["N_PORTAL_IN"] { managed_merge <- false; }
-		ask network_nodes["S_PORTAL_IN"] { managed_merge <- false; }
 		intersection_target_list <- ground_exits.values;
 
 		// 4. Cau hinh den tin hieu tai 4 nut giao vao (p1..p4)
@@ -1094,12 +987,7 @@ species base_vehicle_species skills: [driving] parallel: false {
 	// Driving calls this hook before entering a road with a different lane count.
 	int choose_lane(agent new_road) {
 		road next <- road(new_road);
-		int chosen <- min([lowest_lane, next.num_lanes - num_lanes_occupied]);
-		if (route_kind != "ground") {
-			chosen <- route_kind = "tunnel_WE" or route_kind = "tunnel_EW" ? 14 : 9;
-			allowed_lanes <- [chosen]; base_allowed_lanes <- [chosen];
-		}
-		return chosen;
+		return min([lowest_lane, next.num_lanes - num_lanes_occupied]);
 	}
 
 	init {
@@ -1724,14 +1612,9 @@ species base_vehicle_species skills: [driving] parallel: false {
 			if (maneuver = "left") { left_turn_completed_count <- left_turn_completed_count + 1; }
 			if (maneuver = "right") { right_turn_completed_count <- right_turn_completed_count + 1; }
 			if (maneuver = "uturn") { uturn_completed_count <- uturn_completed_count + 1; }
-			if (route_kind != "ground") {
-				bypass_vehicles_passed <- bypass_vehicles_passed + 1;
-				route_completed[route_kind] <- (route_completed contains_key route_kind ? route_completed[route_kind] : 0) + 1;
-			} else {
-				total_vehicles_passed <- total_vehicles_passed + 1;
-				total_travel_time_sum <- total_travel_time_sum + (time - spawn_time);
-				average_travel_time <- total_travel_time_sum / total_vehicles_passed;
-			}
+			total_vehicles_passed <- total_vehicles_passed + 1;
+			total_travel_time_sum <- total_travel_time_sum + (time - spawn_time);
+			average_travel_time <- total_travel_time_sum / total_vehicles_passed;
 			do unregister;
 			location <- {0, 0};
 		}
@@ -1742,7 +1625,7 @@ species base_vehicle_species skills: [driving] parallel: false {
 		if (current_road != nil) {
 			point shift_pt <- {cos(heading + 90) * current_lateral_shift,
 				sin(heading + 90) * current_lateral_shift};
-			float elevation <- road(current_road).road_kind = "flyover" ? 2.2 : 1.6;
+			float elevation <- 1.6;
 			return location + shift_pt + {0,0,elevation + surface_height()};
 		} else { return location; }
 	}

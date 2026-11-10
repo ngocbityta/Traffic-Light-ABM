@@ -42,6 +42,7 @@ global {
 	float queue_time_integral <- 0.0;
 	float system_time_integral <- 0.0;
 	float weighted_delay_integral <- 0.0;
+	int green_ticks <- 0;
 
 	graph road_network;
 	list<road> approaches;
@@ -89,6 +90,11 @@ global {
 		} else {
 			float t <- time - cycle_length * floor(time / cycle_length);
 			phase <- t < green_lvl ? "LVL" : (t < green_lvl + all_red ? "none" : (t < green_lvl + all_red + green_hdt ? "HDT" : "none"));
+		}
+		if (phase in ["LVL", "HDT"]) {
+			green_ticks <- green_ticks + 1;
+		} else {
+			green_ticks <- 0;
 		}
 		ask intersection where (each.approach != nil) {
 			bool green <- (approach.arm in ["NE", "SW"]) ? (phase = "LVL") : (phase = "HDT");
@@ -179,10 +185,8 @@ species road skills: [road_skill] {
 	// số sublane khác nhau đang bị chiếm bởi xe có đầu xe cách vạch dừng ≤ 1,5 m
 	int front_row {
 		list<int> occ <- [];
-		point stop_pt <- last(shape.points);
-		loop v over: all_agents where ((each distance_to stop_pt) <= 1.5) {
-			vehicle vv <- vehicle(v);
-			occ <- occ + range(vv.lowest_lane, vv.lowest_lane + vv.num_lanes_occupied - 1);
+		loop v over: vehicle where (each.current_road = self and each.distance_to_current_target <= 1.5) {
+			occ <- occ + range(v.lowest_lane, v.lowest_lane + v.num_lanes_occupied - 1);
 		}
 		return length(remove_duplicates(occ));
 	}

@@ -452,5 +452,4 @@ experiment doan_audit_batch type: batch until: cycle >= audit_horizon {
 	parameter "Seed" var: traffic_seed init: 5001.0;
 	parameter "NS interval" var: spawn_rate_NS init: 100;
 	parameter "EW interval" var: spawn_rate_EW init: 100;
-	parameter "Bypass interval" var: bypass_spawn_interval init: 200;
 }

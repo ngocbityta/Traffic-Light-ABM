@@ -18,6 +18,9 @@ import time
 from pathlib import Path
 import numpy as np
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 sys.path.insert(0, str(BASE_DIR / "dqn_py"))
@@ -202,6 +205,23 @@ class VehicleBehaviorTestSuite:
             "MOBIL", "MOBIL-05-OverlapResolution",
             len(lanes) == 2,
             f"Xung đột trùng làn khi xuất hiện được giải tỏa ngay lập tức (lanes={lanes})"
+        )
+
+        # MOBIL-06: Continuous Bézier / Smootherstep lateral trajectory
+        sim = LeVanLuongSimulator(flow_per_approach=0, train_mode=True)
+        sim._create_vehicle("NE", "through", False, 10, 40)
+        sim.step(20)  # Reach cooldown expiration
+        v = sim.vehicles[0]
+        sim.step(1)   # Trigger lane change
+        shift_1 = v.current_lateral_shift
+        prog_1 = v.lane_change_progress
+        smooth_active = (0.0 < prog_1 < 1.0 and shift_1 != v.start_lateral_shift and shift_1 != v.target_lateral_shift)
+        sim.step(25)  # Allow transition to complete (duration ~ 2.9s)
+        smooth_complete = (v.lane_change_progress == 1.0 and abs(v.current_lateral_shift - v.target_lateral_shift) < 1e-5)
+        self.assert_test(
+            "MOBIL", "MOBIL-06-BezierLateralShift",
+            smooth_active and smooth_complete,
+            f"Lách ngang nội suy mượt mà qua đường cong Bézier (prog={prog_1:.2f}, shift={shift_1:.3f}m -> {v.current_lateral_shift:.3f}m, không teleport)"
         )
         print()
 
@@ -419,31 +439,56 @@ class VehicleBehaviorTestSuite:
     def test_legacy_controller_guards(self):
         print("--- [6] KIỂM THỬ BỘ ĐIỀU KHIỂN LEGACY & CHỐNG ĐÓI PHA ---")
 
-        # LEGACY-01: Phase wait cycle accumulation
+        # LEGACY-01: Phase wait cycle accumulation (with demand tracking per GAML)
         import asyncio
+        from dqn_py.python_env import Vehicle as LegacyVehicle, STOP_DISTANCE as LEGACY_STOP
         async def run_legacy():
             env = PythonTrafficEnv(verbose=False, state_mode="dtse")
-            await env.step_cycles(100)
-            c1 = env._phase_wait[0] == 0 and env._phase_wait[1] == 100
-            
+            # Without vehicles, all phase wait times must stay 0 (GAML logic: phase_demand = 0 resets wait)
+            await env.step_cycles(50)
+            c_empty = all(w == 0 for w in env._phase_wait)
+
+            # Place vehicle on approach 5 waiting to turn left (phase 1)
+            v = LegacyVehicle(origin=0, kind=1, desired=11.11, maneuver="left",
+                              lane=8, approach=5, destination=6, length=4.5,
+                              width=1.8, spawn_cycle=0, position=LEGACY_STOP - 50.0)
+            env.vehicles.append(v)
+            await env.step_cycles(50)
+            # Phase 0 is active/green -> wait is 0; Phase 1 has vehicle -> wait accumulated to 50
+            # Phase 2 and 3 have no vehicles -> wait remains 0
+            c_accum = (env._phase_wait[0] == 0 and env._phase_wait[1] == 50 and
+                       env._phase_wait[2] == 0 and env._phase_wait[3] == 0)
+
             # LEGACY-02: Starvation forced service
             await env.reset(parameters=[{"name": "dqn_service_guard", "type": "string", "value": "true"}])
             env._phase_wait[2] = 1250
             state = await env.read_state(force_dtse=True)
             mask = state["action_mask"]
             c2 = mask[2] and not any(mask[i] for i in (0, 1, 3))
-            return c1, c2
 
-        c1, c2 = asyncio.run(run_legacy())
+            # LEGACY-03: Empty phase reset (no starvation lock on empty phase)
+            await env.reset(parameters=[{"name": "dqn_service_guard", "type": "string", "value": "true"}])
+            env._phase_wait[3] = 1250
+            await env.step_cycles(1)  # demand[3] == 0 resets _phase_wait[3] to 0
+            c3 = env._phase_wait[3] == 0
+
+            return c_empty and c_accum, c2, c3
+
+        c1, c2, c3 = asyncio.run(run_legacy())
         self.assert_test(
             "Legacy", "LEGACY-01-PhaseWaitAccumulation",
             c1,
-            "Bộ đếm chờ pha tích lũy chính xác mỗi tick và reset khi có đèn xanh"
+            "Bộ đếm chờ pha tích lũy chính xác khi có xe và reset về 0 khi có đèn xanh"
         )
         self.assert_test(
             "Legacy", "LEGACY-02-StarvationGuardMask",
             c2,
             "Chống đói pha (wait >= 1200) khóa action_mask chỉ cho phép pha bị bỏ đói"
+        )
+        self.assert_test(
+            "Legacy", "LEGACY-03-EmptyPhaseNoStarvation",
+            c3,
+            "Pha không có xe (demand=0) tự động reset bộ đếm chờ về 0, không ép phục vụ pha trống"
         )
         print()
 
@@ -470,7 +515,7 @@ class VehicleBehaviorTestSuite:
 
         if failed == 0 and total > 0:
             print("\n🎉 XÁC NHẬN: 100% TẤT CẢ EDGE CASES & HÀNH VI XE ĐỀU ĐẠT CHUẨN XUẤT SẮC!")
-            print("   Mô phỏng Python đã ổn định, chuẩn hóa logic và sẵn sàng thay thế hoàn toàn cho quá trình huấn luyện RL.")
+            print("   Mô phỏng Python đã vượt qua toàn bộ kiểm thử hành vi vi mô và các trường hợp biên cực hạn.")
         else:
             print("\n⚠️ CẢNH BÁO: CÓ TEST CASE BỊ LỖI, VUI LÒNG KIỂM TRA LẠI!")
         print("=" * 95 + "\n")

@@ -217,7 +217,7 @@ global {
 	bool spawn_clearance_ok <- true;
 	reflex test_edge_spawn_clearance when: cycle < 300 and cycle mod 10 = 0 {
 		// TARGET nodes contain finished agents. Check live vehicles at their
-		// actual shared SOURCE instead, including flyover origins.
+		// actual shared SOURCE instead.
 		loop v over: active_vehicles where (each.current_road != nil and each.final_target != nil) {
 			intersection source <- intersection(road(v.current_road).source_node);
 			if (distance_to(v.location, source.location) < 20 #m) {

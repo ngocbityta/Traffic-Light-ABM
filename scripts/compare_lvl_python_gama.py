@@ -109,8 +109,26 @@ async def main(args):
                "final_created_error": rows[-1]["absolute_error_created"],
                "final_passed_error": rows[-1]["absolute_error_passed"],
                "final_queue_time_integral_error": rows[-1]["absolute_error_queue_time_integral"],
+               "final_queue_time_integral_relative_error": round(
+                   rows[-1]["absolute_error_queue_time_integral"] /
+                   max(1.0, rows[-1]["gama_queue_time_integral"]), 4),
                "final_system_time_integral_error": rows[-1]["absolute_error_system_time_integral"],
+               "final_system_time_integral_relative_error": round(
+                   rows[-1]["absolute_error_system_time_integral"] /
+                   max(1.0, rows[-1]["gama_system_time_integral"]), 4),
                "final_weighted_delay_integral_error": rows[-1]["absolute_error_weighted_delay_integral"],
+               "final_weighted_delay_integral_relative_error": round(
+                   rows[-1]["absolute_error_weighted_delay_integral"] /
+                   max(1.0, rows[-1]["gama_weighted_delay_integral"]), 4),
+               "max_queue_time_integral_relative_error": round(max(
+                   r["absolute_error_queue_time_integral"] / max(1.0, r["gama_queue_time_integral"])
+                   for r in rows), 4),
+               "max_system_time_integral_relative_error": round(max(
+                   r["absolute_error_system_time_integral"] / max(1.0, r["gama_system_time_integral"])
+                   for r in rows), 4),
+               "max_weighted_delay_integral_relative_error": round(max(
+                   r["absolute_error_weighted_delay_integral"] / max(1.0, r["gama_weighted_delay_integral"])
+                   for r in rows), 4),
                "final_front_row_max_errors": {arm: rows[-1][f"absolute_error_front_row_max_{arm}"]
                                               for arm in ("NE", "SE", "SW", "NW")}}
     output.with_suffix(".json").write_text(json.dumps(summary, indent=2) + "\n")
@@ -118,7 +136,10 @@ async def main(args):
     if args.enforce:
         passed = (summary["phase_match"] and
                   summary["final_active_relative_error"] <= args.tolerance and
-                  summary["final_passed_error"] <= max(5, int(args.horizon * 0.01)))
+                  summary["final_passed_error"] <= max(5, int(args.horizon * 0.01)) and
+                  summary["final_queue_time_integral_relative_error"] <= args.tolerance and
+                  summary["final_system_time_integral_relative_error"] <= args.tolerance and
+                  summary["final_weighted_delay_integral_relative_error"] <= args.tolerance)
         if not passed:
             raise SystemExit(f"Parity enforcement failed with tolerance {args.tolerance}")
 

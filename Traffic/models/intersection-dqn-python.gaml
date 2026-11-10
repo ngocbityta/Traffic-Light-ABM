@@ -395,16 +395,12 @@ experiment dqn_server_experiment type: gui autorun: false {
 	parameter "Demand CSV" var: demand_file_path;
 	parameter "NS spawn interval" var: spawn_rate_NS;
 	parameter "EW spawn interval" var: spawn_rate_EW;
-	parameter "Bypass spawn interval" var: bypass_spawn_interval;
-	parameter "Enable bypass traffic" var: enable_bypass_traffic;
 	parameter "Python Controlled" var: python_controlled init: true;
 	parameter "Seed" var: seed init: 1093.0;
 	parameter "DQN_RNG_Seed" var: rng_seed init: 1093.0;
 }
 
 experiment dqn_gui_server_experiment type: gui {
-	parameter "Xe cầu vượt và hầm" var: enable_bypass_traffic;
-	parameter "Xem mặt cắt hầm" var: show_tunnel_cutaway;
 	// Opening this experiment manually must remain live without a Python
 	// client. External training/evaluation uses dqn_server_experiment above.
 	parameter "Python Controlled" var: python_controlled init: false;
@@ -412,7 +408,6 @@ experiment dqn_gui_server_experiment type: gui {
 	float minimum_cycle_duration <- 0.033#s; // About 3 model seconds per wall second (step = 0.1 s)
 	output synchronized: true {
 		monitor "Xe hoàn thành mặt đất" value: total_vehicles_passed;
-		monitor "Xe hoàn thành cầu vượt/hầm" value: bypass_vehicles_passed;
 		monitor "Hàng đợi mặt đất" value: current_queue_length;
 		monitor "Pha đèn" value: phase_names[global_phase];
 		monitor "Đếm ngược pha" value: signal_countdown;
@@ -420,14 +415,8 @@ experiment dqn_gui_server_experiment type: gui {
 		display doan_3d type: opengl background: rgb(8,12,22) {
 			camera 'default' location: {820,1210,220} target: {1000,1000,16};
 			species doan_ground aspect: base;
-			species bridge_pillar;
-			species metro_pillar;
-			species tunnel_structure;
-			species flyover_structure;
-			species metro_structure;
 			species traffic_signal_post aspect: doan_3d;
 			species base_vehicle_species aspect: doan_3d;
-			species doan_metro aspect: base;
 		}
 
 		display intersection_view background: rgb(18, 22, 28) {
@@ -451,13 +440,10 @@ experiment dqn_gui_server_experiment type: gui {
 }
 
 experiment dqn_gui_preview type: gui {
-	parameter "Xe cầu vượt và hầm" var: enable_bypass_traffic;
-	parameter "Xem mặt cắt hầm" var: show_tunnel_cutaway;
 	parameter "Python Controlled" var: python_controlled init: false;
 	float minimum_cycle_duration <- 0.033#s; // About 3 model seconds per wall second (step = 0.1 s)
 	output synchronized: true {
 		monitor "Xe hoàn thành mặt đất" value: total_vehicles_passed;
-		monitor "Xe hoàn thành cầu vượt/hầm" value: bypass_vehicles_passed;
 		monitor "Hàng đợi mặt đất" value: current_queue_length;
 		monitor "Pha đèn" value: phase_names[global_phase];
 		monitor "Đếm ngược pha" value: signal_countdown;
@@ -465,14 +451,8 @@ experiment dqn_gui_preview type: gui {
 		display doan_3d type: opengl background: rgb(8,12,22) {
 			camera 'default' location: {820,1210,220} target: {1000,1000,16};
 			species doan_ground aspect: base;
-			species bridge_pillar;
-			species metro_pillar;
-			species tunnel_structure;
-			species flyover_structure;
-			species metro_structure;
 			species traffic_signal_post aspect: doan_3d;
 			species base_vehicle_species aspect: doan_3d;
-			species doan_metro aspect: base;
 		}
 
 		display intersection_view background: rgb(18, 22, 28) {

@@ -303,8 +303,12 @@ class PythonTrafficEnv(GamaTrafficEnv):
             self._advance_maxpressure_controller()
             return
         self._phase_ticks += 1
+        demand = [0, 0, 0, 0]
+        for v in self.vehicles:
+            if v.signal and 0 <= STOP_DISTANCE - v.position <= 150:
+                demand[(0 if v.approach in (5, 7) else 2) + (v.maneuver == "left")] += 1
         for a in range(4):
-            if self._phase == a * 2 and not self._all_red and self._phase % 2 == 0:
+            if demand[a] == 0 or (self._phase == a * 2 and not self._all_red and self._phase % 2 == 0):
                 self._phase_wait[a] = 0
             else:
                 self._phase_wait[a] += 1

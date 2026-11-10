@@ -5,7 +5,6 @@
 model doan_scenery
 
 global {
-	bool show_tunnel_cutaway <- false;
 	// Keep signal state available when this scenery model is validated on its own.
 	int global_phase <- 0;
 	float phase_timer <- 0.0;
@@ -14,17 +13,6 @@ global {
 	list<float> signal_phase_schedule <- [];
 	action init_doan_scenery {
 		create doan_ground;
-		create flyover_structure with: (location: {1000,1000,50});
-		create tunnel_structure with: (location: {1000,1000,-60});
-		create metro_structure with: (location: {1000,1000,95});
-		loop y over: [167,433,700,867,1133,1300,1567,1833] {
-			create bridge_pillar with: (location: {1000,y,0});
-		}
-		loop x over: [200,500,767,1233,1500,1800] {
-			create metro_pillar with: (location: {x,1000,0});
-		}
-		create doan_metro with: (location: {133,995.5,96.5}, direction: 1.0);
-		create doan_metro with: (location: {1867,1004.5,96.5}, direction: -1.0);
 		create traffic_signal_post with: (post_id: 1, direction_axis: 0, location: {967,953}, heading: 180.0);
 		create traffic_signal_post with: (post_id: 2, direction_axis: 0, location: {1033,1047}, heading: 0.0);
 		create traffic_signal_post with: (post_id: 3, direction_axis: 1, location: {953,1033}, heading: 90.0);
@@ -33,31 +21,14 @@ global {
 }
 
 species doan_ground {
-	geometry portals <- (rectangle(160,16) at_location {840,1045}) +
-		(rectangle(160,16) at_location {1160,1045}) +
-		(rectangle(160,16) at_location {840,955}) +
-		(rectangle(160,16) at_location {1160,955});
-	// The cutaway keeps a roof beneath the north/south surface carriageway.
-	geometry tunnel_cut <- (rectangle(170,16) at_location {845,1045}) +
-		(rectangle(170,16) at_location {1155,1045}) +
-		(rectangle(170,16) at_location {845,955}) +
-		(rectangle(170,16) at_location {1155,955});
 	aspect base {
-		geometry opening <- show_tunnel_cutaway ? tunnel_cut : portals;
-		draw ((square(2000) at_location {1000,1000}) - opening) at: {1000,1000,-0.5} color: rgb(15,20,30);
+		draw (square(2000) at_location {1000,1000}) at: {1000,1000,-0.5} color: rgb(15,20,30);
 
-				// Trục Ngang Nguyễn Trãi (Đông - Tây): 4 LÀN XE MỖI CHIỀU (Rộng 60m)
-				draw ((rectangle(2000,60) at_location {1000,1000}) - opening) depth: 0.6 color: rgb(35, 42, 55) border: rgb(0, 242, 254, 100);
+		// Trục Ngang (Đông - Tây): 4 LÀN XE MỖI CHIỀU (Rộng 60m)
+		draw (rectangle(2000,60) at_location {1000,1000}) depth: 0.6 color: rgb(35, 42, 55) border: rgb(0, 242, 254, 100);
 
-				// Trục Dọc Khuất Duy Tiến - Nguyễn Xiển (Bắc - Nam): 4 LÀN XE MỖI CHIỀU (Rộng 60m)
-			draw ((rectangle(60,2000) at_location {1000,1000}) - opening) depth: 0.6 color: rgb(35, 42, 55) border: rgb(0, 242, 254, 100);
-			// Dedicated feeder lanes continue to the scene boundary on each side.
-			loop feeder_y over: [955.0,1045.0] {
-				loop feeder_x over: [385.0,1615.0] {
-					draw box(750.0,8.0,0.6) at: {feeder_x,feeder_y,0.3}
-						color: rgb(35,42,55) border: rgb(94,112,124);
-				}
-			}
+		// Trục Dọc (Bắc - Nam): 4 LÀN XE MỖI CHIỀU (Rộng 60m)
+		draw (rectangle(60,2000) at_location {1000,1000}) depth: 0.6 color: rgb(35, 42, 55) border: rgb(0, 242, 254, 100);
 
 				// VẠCH TIM ĐƯỜNG ĐÔI MÀU VÀNG NÉT LIỀN (DOUBLE YELLOW MEDIAN DIVIDERS)
 				// Đường Nguyễn Trãi (Y = 1000.0)
@@ -176,169 +147,6 @@ species doan_ground {
 	}
 }
 
-species bridge_pillar {
-	float pillar_h <- 49.0;
-
-	aspect default {
-	// 1 Trụ bê tông đơn hình trụ tròn đặt chính giữa
-		draw cylinder(4.5, pillar_h) at: {location.x, location.y, 0.0} color: rgb(90, 100, 115) border: rgb(180, 195, 215);
-		// Xà mũ đỡ ngang dạng chữ T đỡ dưới đáy dầm cầu vượt
-		draw box(28.0, 8.0, 1.0) at: {location.x, location.y, pillar_h} color: rgb(110, 120, 135) border: #white;
-	}
-
-}
-
-species metro_pillar {
-
-	aspect default {
-	// Trụ bê tông cao vút chạm đất Z=0m vươn lên Z=94m đỡ dầm ray Metro Z=95m
-		draw cylinder(4.5, 94.0) at: {location.x, location.y, 0.0} color: rgb(120, 135, 150) border: rgb(200, 215, 230);
-		// Xà đỡ ngang (Cap) nằm ngay dưới đáy dầm đường sắt Metro (Z=94m -> 95m)
-		draw box(12.0, 26.0, 1.0) at: {location.x, location.y, 94.0} color: rgb(130, 145, 160) border: #white;
-	}
-
-}
-
-// =============================================================================
-// SPECIES 2: CẦU VƯỢT VÀNH ĐAI 3 (KẾT NỐI TỪ MẶT ĐẤT QUA DỐC LÊN/XUỐNG VÀ NHỊP CHÍNH Z = +50m)
-// =============================================================================
-// SPECIES 2: CẦU VƯỢT VÀNH ĐAI 3 (CÁC DỐC RAM XA NGÃ TƯ GẤP 3 LẦN, DẦM CHÍNH DÀI 3000m, Z = +50m)
-// =============================================================================
-species flyover_structure {
-
-	aspect default {
-	// 1. DẦM CẦU CẠN CHÍNH VÀNH ĐAI 3 - 2000m (scale 2/3), Rộng 24m, Z=50m
-		draw box(24.0, 2000.0, 1.8) at: {1000, 1000, 50} color: rgb(35, 42, 55) border: rgb(0, 242, 254, 180);
-		draw box(1.8, 2000.0, 1.0) at: {1000, 1000, 51} color: rgb(180, 190, 205);
-		draw box(1.0, 2000.0, 2.0) at: {987.5, 1000, 51.2} color: rgb(255, 60, 100, 220);
-		draw box(1.0, 2000.0, 2.0) at: {1012.5, 1000, 51.2} color: rgb(255, 60, 100, 220);
-		draw box(0.35, 2000.0, 0.1) at: {996, 1000, 52} color: #white;
-		draw box(0.35, 2000.0, 0.1) at: {1004, 1000, 52} color: #white;
-
-		// 2. NHÁNH RAM LÊN PHÍA BẮC (heading 180 đi Nam, bên Tây X < 1000) - chân Y=1520, đỉnh Y=1360
-		point n_on_bL <- {985, 480, 1.5};
-		point n_on_bR <- {991, 480, 1.5};
-		point n_on_tR <- {997, 640, 50};
-		point n_on_tL <- {992, 640, 50};
-		draw polygon([n_on_bL, n_on_bR, n_on_tR, n_on_tL]) color: rgb(35, 42, 55) border: rgb(0, 242, 254, 140);
-		draw polygon([n_on_bL - {0, 0, 1.4}, n_on_bR - {0, 0, 1.4}, n_on_tR - {0, 0, 1.4}, n_on_tL - {0, 0, 1.4}]) color: rgb(25, 30, 42);
-		draw polygon([n_on_bL, n_on_tL, n_on_tL - {0, 0, 1.4}, n_on_bL - {0, 0, 1.4}]) color: rgb(30, 36, 48);
-		draw polygon([n_on_bR, n_on_tR, n_on_tR - {0, 0, 1.4}, n_on_bR - {0, 0, 1.4}]) color: rgb(30, 36, 48);
-		draw polygon([n_on_bL, n_on_tL, n_on_tL + {0, 0, 1.2}, n_on_bL + {0, 0, 1.2}]) color: rgb(0, 242, 254, 220);
-		draw line([{988, 480, 1.6}, {995, 640, 50.1}]) color: #white width: 2.0;
-
-		// 3. NHÁNH RAM XUỐNG PHÍA BẮC (heading 0 đi Bắc, bên Đông X > 1000) - đỉnh Y=1360, chân Y=1520
-		point n_off_tL <- {1003, 640, 50};
-		point n_off_tR <- {1008, 640, 50};
-		point n_off_bR <- {1015, 480, 1.5};
-		point n_off_bL <- {1009, 480, 1.5};
-		draw polygon([n_off_tL, n_off_tR, n_off_bR, n_off_bL]) color: rgb(35, 42, 55) border: rgb(0, 242, 254, 140);
-		draw polygon([n_off_tL - {0, 0, 1.4}, n_off_tR - {0, 0, 1.4}, n_off_bR - {0, 0, 1.4}, n_off_bL - {0, 0, 1.4}]) color: rgb(25, 30, 42);
-		draw polygon([n_off_tL, n_off_bL, n_off_bL - {0, 0, 1.4}, n_off_tL - {0, 0, 1.4}]) color: rgb(30, 36, 48);
-		draw polygon([n_off_tR, n_off_bR, n_off_bR - {0, 0, 1.4}, n_off_tR - {0, 0, 1.4}]) color: rgb(30, 36, 48);
-		draw polygon([n_off_tR, n_off_bR, n_off_bR + {0, 0, 1.2}, n_off_tR + {0, 0, 1.2}]) color: rgb(255, 200, 0, 220);
-		draw line([{1005, 640, 50.1}, {1012, 480, 1.6}]) color: #white width: 2.0;
-
-		// 4. NHÁNH RAM LÊN PHÍA NAM (heading 0 đi Bắc, bên Đông X > 1000) - chân Y=480, đỉnh Y=640
-		point s_on_bL <- {1009, 1520, 1.5};
-		point s_on_bR <- {1015, 1520, 1.5};
-		point s_on_tR <- {1008, 1360, 50};
-		point s_on_tL <- {1003, 1360, 50};
-		draw polygon([s_on_bL, s_on_bR, s_on_tR, s_on_tL]) color: rgb(35, 42, 55) border: rgb(0, 242, 254, 140);
-		draw polygon([s_on_bL - {0, 0, 1.4}, s_on_bR - {0, 0, 1.4}, s_on_tR - {0, 0, 1.4}, s_on_tL - {0, 0, 1.4}]) color: rgb(25, 30, 42);
-		draw polygon([s_on_bL, s_on_tL, s_on_tL - {0, 0, 1.4}, s_on_bL - {0, 0, 1.4}]) color: rgb(30, 36, 48);
-		draw polygon([s_on_bR, s_on_tR, s_on_tR - {0, 0, 1.4}, s_on_bR - {0, 0, 1.4}]) color: rgb(30, 36, 48);
-		draw polygon([s_on_bR, s_on_tR, s_on_tR + {0, 0, 1.2}, s_on_bR + {0, 0, 1.2}]) color: rgb(0, 242, 254, 220);
-		draw line([{1012, 1520, 1.6}, {1005, 1360, 50.1}]) color: #white width: 2.0;
-
-		// 5. NHÁNH RAM XUỐNG PHÍA NAM (heading 180 đi Nam, bên Tây X < 1000) - đỉnh Y=640, chân Y=480
-		point s_off_tL <- {992, 1360, 50};
-		point s_off_tR <- {997, 1360, 50};
-		point s_off_bR <- {991, 1520, 1.5};
-		point s_off_bL <- {985, 1520, 1.5};
-		draw polygon([s_off_tL, s_off_tR, s_off_bR, s_off_bL]) color: rgb(35, 42, 55) border: rgb(0, 242, 254, 140);
-		draw polygon([s_off_tL - {0, 0, 1.4}, s_off_tR - {0, 0, 1.4}, s_off_bR - {0, 0, 1.4}, s_off_bL - {0, 0, 1.4}]) color: rgb(25, 30, 42);
-		draw polygon([s_off_tL, s_off_bL, s_off_bL - {0, 0, 1.4}, s_off_tL - {0, 0, 1.4}]) color: rgb(30, 36, 48);
-		draw polygon([s_off_tR, s_off_bR, s_off_bR - {0, 0, 1.4}, s_off_tR - {0, 0, 1.4}]) color: rgb(30, 36, 48);
-		draw polygon([s_off_tL, s_off_bL, s_off_bL + {0, 0, 1.2}, s_off_tL + {0, 0, 1.2}]) color: rgb(255, 200, 0, 220);
-		draw line([{995, 1360, 50.1}, {988, 1520, 1.6}]) color: #white width: 2.0;
-	}
-
-}
-
-// =============================================================================
-// SPECIES 3: HẦM CHUI NGUYỄN TRÃI
-// =============================================================================
-species tunnel_structure {
-
-	aspect default {
-		// Each direction has its own trench beyond the outer surface lanes.
-		loop tunnel_y over: [955.0,1045.0] {
-			float low_y <- tunnel_y - 8.0;
-			float high_y <- tunnel_y + 8.0;
-			draw polygon([{760,low_y,0},{920,low_y,-60},{920,high_y,-60},{760,high_y,0}])
-				color: rgb(43,49,57) border: rgb(129,137,143);
-			draw box(160.0,16.0,1.5) at: {1000,tunnel_y,-60}
-				color: rgb(39,45,52) border: rgb(129,137,143);
-			draw polygon([{1080,low_y,-60},{1240,low_y,0},{1240,high_y,0},{1080,high_y,-60}])
-				color: rgb(43,49,57) border: rgb(129,137,143);
-			loop edge_y over: [low_y,high_y] {
-				draw polygon([{760,edge_y,0},{920,edge_y,-60},{920,edge_y,-53},{760,edge_y,7}])
-					color: rgb(104,112,119) border: rgb(173,179,181);
-				draw polygon([{1080,edge_y,-60},{1240,edge_y,0},{1240,edge_y,7},{1080,edge_y,-53}])
-					color: rgb(104,112,119) border: rgb(173,179,181);
-				draw box(160.0,1.5,7.0) at: {1000,edge_y,-56.5} color: rgb(86,95,103);
-			}
-			draw line([{760,tunnel_y,0.9},{920,tunnel_y,-59.1},
-				{1080,tunnel_y,-59.1},{1240,tunnel_y,0.9}])
-				color: rgb(235,238,235,185) width: 1.2;
-			loop portal_x over: [760.0,1240.0] {
-				loop wall_y over: [low_y,high_y] {
-					draw box(2.8,3.2,8.0) at: {portal_x,wall_y,4.0}
-						color: rgb(145,150,151) border: rgb(208,211,210);
-				}
-				draw box(3.2,19.0,2.0) at: {portal_x,tunnel_y,8.0}
-					color: rgb(145,150,151) border: rgb(208,211,210);
-			}
-		}
-	}
-
-}
-
-// =============================================================================
-// SPECIES 4: ĐƯỜNG SẮT TRÊN CAO & NHÀ GA METRO CÁT LINH - HÀ ĐÔNG
-// =============================================================================
-species metro_structure {
-
-	aspect default {
-	// METRO - scale 2/3: dài 2000m, tâm {1000, 1000, 95}
-		draw box(2000.0, 18.0, 1.5) at: location color: rgb(30, 40, 55) border: rgb(0, 230, 118, 200);
-		draw box(2000.0, 0.8, 0.4) at: location + {0, 4.5, 0.9} color: #cyan;
-		draw box(2000.0, 0.8, 0.4) at: location + {0, -4.5, 0.9} color: #cyan;
-		// Nhà ga: X=1560 (2340*2/3), dài 133m
-		draw box(133.0, 30.0, 2.5) at: {1560, 1000, 96.2} color: rgb(220, 210, 180) border: rgb(255, 220, 100);
-		draw box(133.0, 32.0, 4.0) at: {1560, 1000, 100} color: rgb(240, 230, 190, 220) border: #white;
-	}
-
-}
-
-// =============================================================================
-// SPECIES 5: CỘT ĐÈN TÍN HIỆU GIAO THÔNG 3D TẠI MẶT ĐẤT (Z = 0m)
-// =============================================================================
-
-species doan_metro {
-	float direction <- 1.0;
-	float train_speed <- 16.0;
-	reflex move_train {
-		location <- location + {direction * train_speed * step,0,0};
-		if (location.x > 1990) { location <- {10,location.y,location.z}; }
-		if (location.x < 10) { location <- {1990,location.y,location.z}; }
-	}
-	aspect base {
-		draw box(75,5,4.5) at: location color: rgb(0,230,118) border: #white;
-		draw box(70,4.5,2.5) at: location + {0,0,3} color: #cyan;
-	}
-}
 
 // =========================================================================
 // LOÀI TÁC TỬ: TRAFFIC SIGNAL POST (ĐÈN THẲNG VÀ RẼ TRÁI RIÊNG)

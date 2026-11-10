@@ -57,6 +57,27 @@ class Vehicle:
     leading_distance: float = math.inf
     leading_speed: float = 0.0
     road: str = ""
+    current_lateral_shift: float = 0.0
+    start_lateral_shift: float = 0.0
+    target_lateral_shift: float = 0.0
+    lane_change_progress: float = 1.0
+    lateral_duration: float = 0.8
+
+    def bezier_control_points(self) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]:
+        """Return (P1, P2, P3, P4) cubic Bezier control points per Naseri et al. (2017) Section 3.1."""
+        speed = max(1.0, self.speed)
+        length = speed * max(0.1, self.lateral_duration)
+        p1 = (0.0, self.start_lateral_shift)
+        p2 = (length / 3.0, self.start_lateral_shift)
+        p3 = (2.0 * length / 3.0, self.target_lateral_shift)
+        p4 = (length, self.target_lateral_shift)
+        return p1, p2, p3, p4
+
+    def bezier_curvature_radius(self) -> float:
+        """Minimum curvature radius r = v^2 / a_allow per Naseri et al. (2017) Section 3.1."""
+        speed = max(1.0, self.speed)
+        a_allow = 2.0  # Comfort acceleration limit (Wu et al. 2009, Naseri et al. 2017)
+        return speed * speed / a_allow
 
 
 class LeVanLuongSimulator:
@@ -193,6 +214,7 @@ class LeVanLuongSimulator:
             raise ValueError("Invalid lane or requested speed")
         approach_end = incoming["length"]
         connector_end = approach_end + connector["length"]
+        initial_shift = (lane + (occupied - 1) / 2.0) * 0.8
         self.vehicles.append(Vehicle(
             arm=arm, to_arm=target, maneuver=turn, lane=lane, occupied=occupied,
             length=4.5 if is_car else 1.9, desired=speed_kmh / 3.6,
@@ -202,7 +224,12 @@ class LeVanLuongSimulator:
             connector_end=connector_end,
             route_end=connector_end + outgoing["length"],
             road=f"{arm}_in",
-            demand_row_id=demand_row_id))
+            demand_row_id=demand_row_id,
+            current_lateral_shift=initial_shift,
+            start_lateral_shift=initial_shift,
+            target_lateral_shift=initial_shift,
+            lane_change_progress=1.0,
+            lateral_duration=0.6 if not is_car else 1.2))
         self.created += 1
 
     def _move(self):
@@ -291,6 +318,10 @@ class LeVanLuongSimulator:
                 next_road = vehicle.road
                 vehicle.lane = min(vehicle.lane,
                                    self.roads[next_road]["num_lanes"] - vehicle.occupied)
+                new_shift = (vehicle.lane + (vehicle.occupied - 1) / 2.0) * 0.8
+                vehicle.start_lateral_shift = vehicle.target_lateral_shift = new_shift
+                vehicle.current_lateral_shift = new_shift
+                vehicle.lane_change_progress = 1.0
                 if next_road not in lane_maps:
                     lane_maps[next_road] = [[] for _ in range(self.roads[next_road]["num_lanes"])]
                 self._neighbor_road_state[id(vehicle)] = (next_road, 0.0)
@@ -339,6 +370,7 @@ class LeVanLuongSimulator:
                     if index < len(entries) and entries[index] == old_entry:
                         entries.pop(index)
                 new_road, new_progress = self._road_state(vehicle)
+                vehicle.road = new_road
                 self._neighbor_road_state[id(vehicle)] = (new_road, new_progress)
                 if new_road not in lane_maps:
                     lane_maps[new_road] = [[] for _ in range(self.roads[new_road]["num_lanes"])]
@@ -353,6 +385,17 @@ class LeVanLuongSimulator:
                     if index < len(entries) and entries[index] == new_entry:
                         entries.pop(index)
             else:
+                if vehicle.lane_change_progress < 1.0:
+                    vehicle.lane_change_progress = min(
+                        1.0, vehicle.lane_change_progress + DT / max(0.001, vehicle.lateral_duration))
+                    u = vehicle.lane_change_progress
+                    # Cubic Bezier curve per Naseri et al. (2017) Section 3.1:
+                    # y(u) = start + (target - start) * (3u^2 - 2u^3)
+                    bezier_u = 3.0 * u * u - 2.0 * u * u * u
+                    vehicle.current_lateral_shift = (vehicle.start_lateral_shift +
+                        (vehicle.target_lateral_shift - vehicle.start_lateral_shift) * bezier_u)
+                else:
+                    vehicle.current_lateral_shift = vehicle.target_lateral_shift
                 survivors.append(vehicle)
         self.vehicles = survivors
 
@@ -411,22 +454,38 @@ class LeVanLuongSimulator:
             vehicle.time_since_lane_change = 0.0
             vehicle.leading_distance = best_front_gap
             vehicle.leading_speed = best_leader.speed if best_leader else 0.0
+            # Smooth Bézier lateral transition per Naseri et al. (2017) Section 3.1
+            vehicle.start_lateral_shift = vehicle.current_lateral_shift
+            vehicle.target_lateral_shift = (best_lane + (vehicle.occupied - 1) / 2.0) * 0.8
+            vehicle.lane_change_progress = 0.0
+            lateral_dist = abs(vehicle.target_lateral_shift - vehicle.start_lateral_shift)
+            # Paper Eq: a_allow = 2.0 m/s^2, r = v^2 / a_allow, T_lc = sqrt(6 * W / a_allow)
+            a_allow = 2.0
+            base_duration = math.sqrt(6.0 * max(0.4, lateral_dist) / a_allow)
+            multiplier = 0.6 if vehicle.occupied == 1 else 1.0
+            vehicle.lateral_duration = max(0.4, base_duration * multiplier)
         else:
             vehicle.time_since_lane_change += DT
 
     def _road_state(self, vehicle):
-        if not getattr(vehicle, "road", ""):
-            if vehicle.position < vehicle.approach_end:
-                return f"{vehicle.arm}_in", vehicle.position
-            if vehicle.position < vehicle.connector_end:
-                return (f"{vehicle.arm}_{vehicle.to_arm}",
-                        vehicle.position - vehicle.approach_end)
-            return f"{vehicle.to_arm}_out", vehicle.position - vehicle.connector_end
-        if vehicle.road == f"{vehicle.arm}_in":
-            return vehicle.road, vehicle.position
-        if vehicle.road == f"{vehicle.arm}_{vehicle.to_arm}":
-            return vehicle.road, vehicle.position - vehicle.approach_end
-        return vehicle.road, vehicle.position - vehicle.connector_end
+        road = getattr(vehicle, "road", "")
+        if road:
+            if road == f"{vehicle.arm}_in" and vehicle.position > vehicle.approach_end:
+                road = vehicle.road = f"{vehicle.arm}_{vehicle.to_arm}"
+            elif road == f"{vehicle.arm}_{vehicle.to_arm}" and vehicle.position > vehicle.connector_end:
+                road = vehicle.road = f"{vehicle.to_arm}_out"
+        if not road:
+            if vehicle.position <= vehicle.approach_end:
+                road = vehicle.road = f"{vehicle.arm}_in"
+            elif vehicle.position <= vehicle.connector_end:
+                road = vehicle.road = f"{vehicle.arm}_{vehicle.to_arm}"
+            else:
+                road = vehicle.road = f"{vehicle.to_arm}_out"
+        if road == f"{vehicle.arm}_in":
+            return road, vehicle.position
+        if road == f"{vehicle.arm}_{vehicle.to_arm}":
+            return road, vehicle.position - vehicle.approach_end
+        return road, vehicle.position - vehicle.connector_end
 
     @staticmethod
     def _overlap(a, a_lane, b):
@@ -546,7 +605,8 @@ class LeVanLuongSimulator:
         for arm in ARMS:
             used = set()
             for v in self.vehicles:
-                if v.arm == arm and 0 <= v.approach_end - v.position <= 1.5:
+                if (v.arm == arm and (v.road == f"{arm}_in" or not v.road)
+                        and 0 <= v.approach_end - v.position <= 1.5):
                     used.update(range(v.lane, v.lane + v.occupied))
             self.front_row_max[arm] = max(self.front_row_max[arm], len(used))
 
