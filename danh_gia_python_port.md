@@ -1,206 +1,160 @@
 # Đánh giá phần chuyển mô phỏng từ GAMA sang Python
 
-Ngày: 10/11/2026 · Mã nguồn: `main` sau commit `1cc5b61`.
+Ngày: 10/11/2026 · Bản đánh giá lần 2, trên `main` tại commit `9fe6a86`.
 
-**Phạm vi:** chỉ đánh giá việc **bản Python có tái hiện đúng mô hình GAMA hay không**, và có thay được GAMA khi train/đánh giá RL hay không. Tôi **không** đánh giá mô hình GAMA gốc đúng hay sai so với giao thông thực, vì đó là giả định chung của cả hai bản.
+**Phạm vi:** chỉ đánh giá việc **bản Python có tái hiện đúng mô hình GAMA hay không**, và có thay được GAMA khi train/đánh giá RL hay không. Không đánh giá mô hình GAMA gốc đúng hay sai so với giao thông thực.
 
 | File | Port từ |
 |---|---|
 | `LeVanLuongIntersection/python_sim.py` | `LeVanLuongIntersection/models/LeVanLuong.gaml` (driving skill GAMA 2025.6.4) |
 | `LeVanLuongIntersection/demand.py` | reflex `spawn` của GAML, đổi sang lịch xe CSV dùng chung |
-| `dqn_py/lvl_env.py` | experiment `dqn_server_experiment`: state/reward giờ dựng bằng Python cho cả hai backend |
-| `dqn_py/python_env.py` | `Traffic/models/intersection-dqn-python.gaml` (bài toán legacy, cầu vượt/hầm) |
-| `scripts/compare_lvl_*`, `compare_python_*`, `diagnose_*` | Công cụ đối chiếu |
+| `dqn_py/lvl_env.py` | experiment `dqn_server_experiment`: state/reward dựng bằng Python cho cả hai backend |
+| `dqn_py/python_env.py` | `Traffic/models/intersection-dqn-python.gaml` (bài toán legacy) |
+| `scripts/compare_lvl_python_gama.py` | Đối chiếu GAMA ↔ Python |
+| `scripts/run_vehicle_behavior_suite.py` (mới) | 30 test hành vi xe trên bản Python |
 
-**Cách làm:** đọc từng hàm Python và so với GAML tương ứng, chạy test, và tự chạy `python_sim.py` 8.000 tick. Máy này **không có GAMA headless**, nên tôi không chạy lại được các script đối chiếu GAMA ↔ Python.
+**Cách làm:** đọc diff `8bda5c5..9fe6a86`, so lại từng hàm với GAML, chạy toàn bộ test và một episode 8.000 tick. Máy này **không có GAMA headless**, nên tôi không chạy lại được các phép đối chiếu với GAMA.
 
 ---
 
 ## 1. Kết luận
 
-**Bản LVL (`python_sim.py`) là bản port nghiêm túc, đúng hướng. Ở mức số xe tạo ra và qua nút, nó đã gần GAMA. Nhưng nó chưa đạt mức “thay thế được GAMA” cho một nghiên cứu, vì:**
-1. Chưa có bằng chứng tương đương ở các chỉ số mà reward và kết quả nghiên cứu thật sự dùng (tích phân hàng chờ, tốc độ, trễ từng xe).
-2. Tôi tìm ra ít nhất một chênh lệch có hệ thống về thứ tự đo giữa hai bản (mục 3.1).
-3. File báo cáo parity mà README dẫn ra đã bị xóa khỏi repo.
-4. Python chậm hơn GAMA, nên lý do tốc độ để chuyển chưa thành hiện thực.
+So với lần đánh giá trước, **nhóm đã sửa phần lớn lỗi**: encoding, thứ tự đo chỉ số, mặt nạ làn C5, tốc độ trung bình C1, tuổi pha xanh, đơn vị thời gian, bộ đếm chờ pha của legacy. Script đối chiếu cũng đã so thêm 3 tích phân reward. MOBIL và cách xe dừng đèn đỏ được port sát GAMA hơn, các test bám sự kiện GAMA vẫn qua, và tổng số xe qua của seed 1 vẫn là 4.066 (README ghi GAMA cũng là 4.066).
 
-**Bản legacy (`python_env.py`) chưa thay được GAMA.** Chính README ghi lệch tới 42,5% số xe vào và 38,7% tốc độ trung bình ở 4.000 tick, và tôi tìm thêm một lỗi logic (mục 4.1).
+**Tuy vậy vẫn chưa đủ để nói “Python thay được GAMA” trong nghiên cứu.** Lý do:
+1. **Lỗi mới:** đặc trưng `green_cycles` giờ khác nhau giữa hai backend (mục 3.1). Agent train trên Python sẽ thấy đầu vào khác hẳn khi chạy trên GAMA.
+2. Bản sửa bộ đếm chờ pha của legacy chưa khớp GAML (mục 3.2).
+3. Script đối chiếu có in sai số tích phân nhưng **không dùng chúng làm tiêu chí đạt/không đạt** (mục 3.3).
+4. Vẫn chưa có bằng chứng parity trong repo và chưa có phép thử chéo train/đánh giá (mục 3.4).
+5. Bộ test mới chỉ kiểm tra Python tự nhất quán với chính nó, không so với GAMA, nhưng lại kết luận “sẵn sàng thay thế hoàn toàn” (mục 3.5).
 
-| Tiêu chí | LVL `python_sim.py` | Legacy `python_env.py` |
+| Tiêu chí | Lần 1 (`1cc5b61`) | Lần 2 (`9fe6a86`) |
 |---|---|---|
-| Logic đèn, lịch quyết định | Khớp | Gần khớp, guard bị lỗi |
-| Phát xe theo CSV | Khớp | Khớp |
-| Tổng số xe qua (theo README) | Lệch 0–2 xe / 4.000+ xe | Lệch 7,1% |
-| Từng xe (làn, tốc độ) | Lệch 18,56% cặp xe-tick về làn | Lệch lớn |
-| Chỉ số dùng cho reward | Chưa đối chiếu trực tiếp, có lệch hệ thống | Lệch 10,7% tích phân hàng chờ |
-| Bằng chứng trong repo | Đã bị xóa | Đã bị xóa |
-| Chạy trên Windows | Lỗi encoding | Chạy được |
-| Tốc độ so với GAMA | Chậm hơn (khoảng 22 s so với 13 s/episode) | Không đo |
-| **Dùng thay GAMA cho nghiên cứu?** | **Chưa, gần được** | **Không** |
+| Chạy được trên Windows | ✗ lỗi encoding | ✓ (trừ in emoji của suite mới) |
+| Thứ tự đo chỉ số giống GAMA | ✗ đo sau khi xe chạy | ✓ đo trước khi xe chạy |
+| State spatial đúng tài liệu | ✗ | Phần lớn ✓, còn C4 và ô 6 m |
+| State giống nhau giữa 2 backend | ✓ | **✗ `green_cycles` khác** |
+| So tích phân reward với GAMA | ✗ | Có in, **chưa dùng để đánh giá** |
+| Bộ đếm chờ pha legacy | ✗ không chạy | Chạy, nhưng thiếu điều kiện “không có xe” |
+| Bằng chứng parity trong repo | ✗ | ✗ |
+| Phép thử chéo train/đánh giá | ✗ | ✗ |
+| **Dùng thay GAMA cho nghiên cứu?** | Chưa | **Chưa, nhưng gần hơn đáng kể** |
 
 ---
 
-## 2. Những chỗ port đúng (LVL)
+## 2. Trạng thái các nhận xét lần trước
 
-### 2.1 Chép đúng tham số
-So từng giá trị trong `vehicle.init` (GAML dòng 219–237) với `_create_vehicle` (Python dòng 172–193):
-
-| Tham số | GAML | Python | |
+| # | Nhận xét lần 1 | Trạng thái | Ghi chú |
 |---|---|---|---|
-| Chiều dài xe | 4,5 / 1,9 m | 4,5 / 1,9 | ✓ |
-| Số sublane chiếm | 2 / 1 | 2 / 1 | ✓ |
-| `max_acceleration` | 2,5 / 2,0 | 2,5 / 2,0 | ✓ |
-| `time_headway` | 1,2 / 0,6 | 1,2 / 0,6 | ✓ |
-| `min_safety_distance` | 1,0 / 0,3 | 1,0 / 0,3 | ✓ |
-| `politeness_factor` | 0,1 | 0,1 (dòng 325) | ✓ |
-| `acc_gain_threshold` | 0,05 | 0,05 (dòng 326) | ✓ |
-| `lane_change_limit <- -1` (đổi sang làn bất kỳ) | -1 | xét mọi làn (dòng 303) | ✓ |
-| `maxspeed` connector / road khác | 40 / 60 km/h | 40 / 60 (dòng 432) | ✓ |
-| Bước mô phỏng | 0,2 s | `DT = 0.2` | ✓ |
-| Hình học | `roads.geojson` | cùng file, tự tính chiều dài polyline | ✓ |
-
-### 2.2 Đèn tín hiệu khớp từng tick
-- Chế độ cố định: `_phase()` dùng `(cycle-1)*DT` để bù việc biến `time` của GAMA trễ một bước trong reflex (dòng 111–112). Chi tiết này rất dễ bỏ sót.
-- Chế độ train: `_advance_signal()` chép đúng reflex `signal` (GAML 73–88): đỏ toàn phần 15 tick, `pending_phase`, cờ chờ action mỗi 50 tick. GAML dùng `(cycle+1) mod 50`, Python dùng `cycle % 50` sau khi đã tăng `cycle` trước, nên hai cách tương đương.
-- README ghi 159/159 quyết định và pha khớp trên 3 seed × 8.000 tick. Code khớp với số liệu đó.
-
-### 2.3 Phát xe theo CSV
-- `demand.py` sinh đúng 6 cột mà reflex `spawn_replay_demand` đọc. Hai bên dùng chung chỉ số `[NE, SE, SW, NW]` và `[left, right, through]`.
-- Điều kiện thời gian `rows[0] > cycle + 1` (GAML) tương đương `row[0] <= self.cycle` (Python, `cycle` đã tăng trước).
-- Cả hai kiểm tra định dạng. Python còn từ chối CSV không sắp xếp.
-- `train.py` chặn `--backend python` khi không dùng demand ghép cặp. Đây là quyết định đúng, vì RNG của GAMA và Python khác nhau.
-
-### 2.4 Bám sát cách driving skill của GAMA cập nhật
-Đây là điểm mạnh nhất của bản port:
-- **Cập nhật tuần tự theo thứ tự tạo xe** (`_move`, dòng 196–290): xe sau thấy vị trí mới của xe trước trong cùng tick, giống cách GAMA duyệt agent. Nếu làm kiểu “tính hết rồi cập nhật đồng loạt” thì không bao giờ khớp được từng xe.
-- **IDM** (`_idm`) theo đúng công thức `IDM.computeAcceleration` của GAMA. Gặp đèn đỏ hay cuối tuyến thì coi như có xe ảo đứng yên, cách thêm `min_safety_distance`.
-- **Qua nút trong tick** (dòng 230–257): đi đến nút bằng tốc độ dự đoán của đường cũ, rồi tính lại IDM với giới hạn tốc độ đường mới cho thời gian còn lại. Đây là chi tiết của `moveAcrossSegments` trong GAMA.
-- **Snap 0,01 m ở cuối tuyến** (dòng 281) giống GAMA. Thiếu chi tiết này thì xe không bao giờ “đến đích”.
-- **Tìm xe trước ở đường kế tiếp khi đèn xanh** và **tìm xe sau xuyên qua nút nguồn khi đang trên connector** (`_neighbors`), theo `findLeader/findFollower`.
-- **MOBIL**: không tính hai lần xe sau đang là follower hiện tại, bỏ qua khi xe sau đã có leader gần hơn, có ngưỡng phanh an toàn −4 m/s², cooldown 4 s, xử lý trường hợp xe đè lên nhau khi vừa sinh (`overlap = old_gap < 0`).
-- Test hồi quy bám vào sự kiện GAMA cụ thể: đổi làn ở tick 37 và tốc độ IDM ở tick 68 của seed 1. Đây là kiểu test đúng cho một bản port.
-
-### 2.5 Đối chiếu observation bằng chung mã
-`lvl_env._observation()` nhận danh sách xe thô `(speed, max_speed, lane, occupied, road, remaining)` từ **cả** GAMA (qua biểu thức `VEHICLES_EXPR`) và Python. Vì vậy chênh lệch state hay reward chỉ đến từ động học, không đến từ cách tính feature. Có thêm kiểm tra `len(vehicles) == created - passed` để phát hiện snapshot GAMA bị thiếu. Đây là thiết kế tốt.
+| 1 | Lỗi encoding UTF-8 trên Windows | ✅ Đã sửa | `read_text`/`open` đều có `encoding="utf-8"`; `test_python_sim.py` qua 10/10 không cần `PYTHONUTF8` |
+| 2 | Python đo chỉ số **sau** khi xe chạy, GAMA đo **trước** | ✅ Đã sửa | `step()` giờ là `signal → spawn → measure → move`, đúng thứ tự reflex global rồi agent của GAMA |
+| 3 | `front_row` định nghĩa khác nhau | ⚠️ Chưa sửa | GAML vẫn dùng `all_agents where distance_to stop_pt <= 1.5` (Euclid, mọi agent). Test EDGE-04 chỉ kiểm tra định nghĩa của Python |
+| 4 | Mốc vị trí xe (tâm/đầu) chưa có test | ⚠️ Chưa có | Không có test nào so ô spatial của cùng một xe trên hai backend |
+| 5 | 18,56% cặp xe-tick lệch làn | ❓ Chưa đo lại | MOBIL được sửa theo GAMA (mục 2.1), nhưng không có số liệu mới |
+| 6 | Script đối chiếu chỉ so số xe, không có ngưỡng | 🟡 Một phần | Đã so 3 tích phân và có `--enforce`, nhưng ngưỡng không gồm tích phân (mục 3.3) |
+| 7 | Thư mục `reports/` (bằng chứng parity) bị xóa | ❌ Chưa sửa | README vẫn trỏ tới các file không tồn tại |
+| 8 | Python chậm hơn GAMA | ❌ Chưa cải thiện | Máy này (Python 3.14): **48 s**/episode 8.000 tick. README (Python 3.11): 22 s; GAMA: 13 s |
+| 9 | `seed or 1` biến seed 0 thành 1 | ✅ Đã sửa | |
+| 10 | Vá `elapsed_seconds` bằng `DT / 0.1` | ✅ Đã sửa | Base class dùng `step_seconds`; `train.py` dùng `env.step_seconds` |
+| 11 | State: ô 6 m thay vì 8 m | ❌ Chưa sửa | Vẫn `/ 6.0` → 20 ô phủ 120 m |
+| 12 | State: C1 ghi đè | ✅ Đã sửa | Lấy trung bình theo số xe trong ô |
+| 13 | State: C4 là hằng số ±1 | ❌ Chưa sửa | Vẫn `1.0 if arm in (0, 2) else -1.0` |
+| 14 | State: C5 không phải mặt nạ làn | ✅ Đã sửa | Đặt 1 trên đúng số sublane của từng nhánh (NW = 14) |
+| 15 | `green_cycles` luôn 0 khi quyết định | 🟡 Sửa một nửa | Đúng trên Python, **sai trên GAMA** (mục 3.1) |
+| 16 | `average_waiting_time`/`average_travel_time` là NaN | 🟡 Đã có số | Nhưng công thức chưa đúng tên gọi (mục 3.6) |
+| 17 | Legacy: `_phase_wait` không bao giờ tăng | 🟡 Sửa một phần | Thiếu điều kiện reset khi pha không có xe (mục 3.2) |
+| 18 | Legacy: `_leader_gaps()` gọi trong vòng lặp từng xe | 🟡 Cải thiện | Tính một lần mỗi tick, nhưng tính lại mỗi khi có xe đổi làn |
+| 19 | Legacy: parity không đạt (lệch 42,5%) | ❓ Chưa đo lại | |
 
 ---
 
-## 3. Những chỗ port chưa đúng hoặc chưa đủ (LVL)
+## 3. Những vấn đề còn lại và vấn đề mới
 
-### 3.1 Thứ tự đo chỉ số lệch một pha so với GAMA (nghiêm trọng với reward)
-Trong GAMA, ở mỗi cycle **agent world (global) chạy reflex trước, sau đó mới đến các agent `vehicle`**. Thứ tự trong một cycle của GAML vì vậy là:
+### 3.1 Lỗi mới: `green_cycles` khác nhau giữa hai backend (nghiêm trọng)
+- `LVLPythonEnv.read_state` truyền `green_cycles=sim.green_ticks`, tức số tick pha hiện tại đã xanh liên tục (có thể lên tới hàng trăm).
+- `LVLGamaEnv.read_state` **không truyền** `green_cycles`, nên `_observation` rơi về giá trị mặc định `cycle % 50`, và giá trị này **luôn bằng 0 tại tick quyết định**. GAML (`LeVanLuong.gaml`) cũng không có biến đếm thời gian xanh để đọc.
+- `featurize` đưa giá trị này vào mạng (`aux[4] = min(1.0, green_cycles / 600)`). Với Python, agent thấy giá trị khác 0. Với GAMA, agent luôn thấy 0.
 
+Hệ quả: **chính sách train trên Python rồi đánh giá trên GAMA (hoặc ngược lại) nhận đầu vào khác nhau**, và `compare_lvl_training_envs.py` có thể không bắt được vì nó chỉ so spatial MAE và reward.
+
+Cách sửa: thêm biến `green_ticks` vào GAML (tăng trong reflex `signal` khi `phase != "none"`, reset khi về `"none"`), đọc nó trong `STATE_EXPR`, rồi truyền vào `_observation` giống bên Python. Thêm một test khẳng định hai backend cho cùng `green_cycles` sau cùng chuỗi action.
+
+Lưu ý thêm: hệ số chuẩn hóa `600` được đặt cho bước 0,1 s của legacy (tối đa 60 s). Với LVL, bước 0,2 s nên 600 tick = 120 s. Nên chuẩn hóa theo giây, không theo tick.
+
+### 3.2 Legacy: bộ đếm chờ pha chưa khớp GAML
+GAML (`intersection-dqn-python.gaml:279-282`):
 ```
-signal → spawn_replay_demand → measure_front_row (đo) → vehicle.choose_path → vehicle.move (đi)
+if (phase_demand[a] = 0 or (global_phase = a * 2 and !dqn_all_red)) { phase_wait_cycles[a] <- 0; }
+else { phase_wait_cycles[a] <- phase_wait_cycles[a] + 1; }
 ```
+Python (`python_env.py:306-310`) chỉ reset khi pha đó đang xanh, **thiếu điều kiện `phase_demand[a] = 0`**. Hệ quả: khi bật `dqn_service_guard`, một pha không có xe nào vẫn tích lũy thời gian chờ. Sau 1.200 tick, mask sẽ **ép agent phục vụ một pha trống**, trong khi GAMA không bao giờ làm vậy. Test `LEGACY-01` không bắt được lỗi này vì không thử trường hợp pha không có xe.
 
-Còn Python (`step`, dòng 471–476) làm:
+### 3.3 Script đối chiếu: có số liệu nhưng tiêu chí chưa đúng
+`compare_lvl_python_gama.py --enforce` chỉ kiểm tra:
+- `phase_match`,
+- `final_active_relative_error <= tolerance`,
+- `final_passed_error <= max(5, 1% horizon)`.
 
-```
-_advance_signal → _spawn → _move (đi) → _measure (đo)
-```
+Sai số `queue_time_integral`, `system_time_integral`, `weighted_delay_integral` **chỉ được in ra** mà không được kiểm tra. Đây lại chính là ba đại lượng tạo ra reward R1, R2, R4. Đề xuất: thêm điều kiện sai số tương đối của từng tích phân ≤ `tolerance`, và kiểm tra ở mọi mốc lấy mẫu chứ không chỉ cuối lượt.
 
-Hệ quả:
-- **GAMA đo trước khi xe chạy:** xe vừa sinh có `speed = 0` nên bị đếm là đang dừng (< 1 km/h) và có trễ 1,0 trong `weighted_delay_integral`. Python đo sau khi xe đã tăng tốc một bước (khoảng 0,4–0,5 m/s ≈ 1,4–1,8 km/h), nên xe đó **không** bị tính là đang dừng.
-- Với khoảng 4.200 xe mỗi episode, ước tính `queue_time_integral` của GAMA lớn hơn Python khoảng **4.200 × 0,2 s ≈ 840 xe·s**. `weighted_delay_integral` cũng lệch tương tự. `system_time_integral` lệch ít hơn vì chỉ dịch thời điểm một tick.
-- `queue_time_integral` → R2 (`stopped_time_integral` = `queue_time_integral` trong `lvl_env`), `weighted_delay_integral` → R4. Hai reward này **có sai lệch hệ thống giữa hai backend**, không chỉ là nhiễu.
-- `front_row_max` cũng đo ở hai thời điểm khác nhau.
+### 3.4 Thiếu bằng chứng và phép thử chéo
+- Thư mục `reports/` vẫn không có trong repo. README vẫn dẫn ra các file trong đó, nên mọi con số parity (4.066/4.054/4.117 xe, MAE reward 0,19, 18,56% lệch làn) không kiểm lại được. Cũng chưa có số liệu đo lại sau các thay đổi MOBIL ở commit này.
+- Chưa có phép thử quan trọng nhất: **train trên Python, đánh giá trên GAMA (và ngược lại), so thứ hạng các chính sách**.
 
-Lưu ý: tôi suy ra điều này từ quy tắc lập lịch của GAMA và từ code, chưa đo được vì không có GAMA. Kiểm tra: so `queue_time_integral` của hai backend ở tick 1–5 của seed 1. **Cách sửa:** trong Python, chuyển `_measure()` lên trước `_move()` (sau `_spawn()`).
+### 3.5 Bộ test hành vi mới: hữu ích nhưng kết luận quá mức
+`scripts/run_vehicle_behavior_suite.py` có 30 test, tôi chạy và qua cả 30. Bộ này hữu ích làm test hồi quy: bảo toàn số xe, không vượt đèn đỏ, cooldown MOBIL, biên sublane, mặt nạ C5, không NaN, kẹt xe nặng vẫn chạy.
 
-### 3.2 Định nghĩa `front_row` khác nhau
-- GAML (dòng 180–188): `all_agents where (distance_to stop_pt <= 1.5)`. Đây là khoảng cách **Euclid** từ `location` tới điểm vạch dừng, tính trên **mọi agent**, kể cả xe của nhánh khác, xe đã qua vạch hay đang trên connector, và các agent không phải xe (`road`, `area`, `intersection`, được ép kiểu `vehicle(v)`).
-- Python (dòng 463–465): chỉ tính xe **của nhánh đó**, **trước vạch**, với `0 <= approach_end - position <= 1.5`.
+Nhưng:
+- **Không test nào so với GAMA.** Bộ này chỉ kiểm tra Python không tự mâu thuẫn, không chứng minh Python giống GAMA. Dòng kết luận cuối script (“sẵn sàng thay thế hoàn toàn cho quá trình huấn luyện RL”) **không được các test này chứng minh**, và không nên đưa vào báo cáo.
+- Script dùng file `.py` riêng thay vì pytest, nên không chạy cùng `pytest`/CI.
+- Trên Windows, script **crash ngay dòng đầu** vì in emoji ra console cp1252 (`UnicodeEncodeError`). Phải chạy với `PYTHONUTF8=1`. Cách sửa: thêm `sys.stdout.reconfigure(encoding="utf-8")` hoặc bỏ emoji.
+- Một số test kiểm tra lại đúng định nghĩa đang có, chứ không kiểm tra định nghĩa đúng. Ví dụ EDGE-04 xác nhận `front_row` của Python, trong khi vấn đề là nó khác GAML (mục 2, dòng 3).
 
-Hai bản đo hai đại lượng khác nhau. Việc “`front_row_max` khớp cả bốn nhánh” trong README có thể chỉ là trùng hợp do giá trị bão hòa (số sublane tối đa). Một trong hai bên cần sửa cho cùng định nghĩa, và có lẽ GAML mới là bên sai.
+### 3.6 Chỉ số thời gian chờ và thời gian di chuyển: tên không đúng nội dung
+`lvl_env._observation`:
+- `average_waiting_time = queue_time_integral / created`: tổng thời gian dừng của **mọi xe đã tạo** (kể cả xe còn trên mạng) chia cho số xe tạo. Đây là “thời gian dừng trung bình tính tới hiện tại”, không phải thời gian chờ trung bình của xe đã đi qua.
+- `average_travel_time = system_time_integral / passed`: tử số gồm cả thời gian của các xe **còn trên mạng**, mẫu số chỉ có xe đã ra. Khi mạng đông, giá trị này bị phóng đại (seed 1: 213.870 / 4.066 ≈ 52,6 s, trong đó có phần của 146 xe chưa ra).
+- `max_waiting_time` vẫn là NaN.
 
-### 3.3 Mốc vị trí xe (tâm hay đầu xe) chưa được làm rõ
-Python coi `position` là **tâm xe** (khoảng cách bumper = khoảng cách tâm − nửa tổng chiều dài, dòng 371). Phía GAMA, `lvl_env` đọc `distance_to_current_target`. Nếu GAMA đo từ một mốc khác (đầu xe hoặc tâm) thì ô DTSE/spatial (6 m) của ô tô 4,5 m có thể lệch 1 ô. README cho spatial MAE khoảng 0,022 nên có vẻ không lệch nhiều, nhưng **nên có một test khẳng định** cùng một xe trên hai backend rơi vào cùng ô.
+Hai backend tính giống nhau nên không ảnh hưởng parity. Nhưng nếu báo cáo dùng các cột này làm “thời gian chờ/di chuyển trung bình” thì sai định nghĩa. Muốn đúng thì phải ghi thời gian vào/ra của từng xe ở cả GAML và Python.
 
-### 3.4 Sai lệch từng xe vẫn đáng kể
-README tự ghi **18,56% cặp xe-tick lệch làn** sau 200 tick. Với MOBIL được phép nhảy mọi làn, một lần chọn khác là quỹ đạo tách hẳn. Nguyên nhân có thể nằm ở các chi tiết chưa port hết như thứ tự xét làn, hòa điểm `gain` hay sai số dấu phẩy động. Về mặt tổng thể (số xe qua) thì khớp vì nút không bão hòa, nhưng **state spatial là ảnh sublane theo từng xe**. Agent train trên Python sẽ thấy phân bố hàng chờ theo làn khác với khi chạy trên GAMA.
+### 3.7 Các thay đổi động học mới: đúng hướng, cần đối chiếu lại
+Commit `9fe6a86` sửa lại một phần lõi `_move`/`_choose_lane`:
+- Xe trong vòng 0,01 m trước vạch khi đèn đỏ được snap vào nút và dừng hẳn, theo `moveAcrossSegments` của GAMA.
+- Xe đi qua nút giờ được đưa vào lane map của đường mới, gọi lại MOBIL trên đường mới rồi mới tính IDM.
+- MOBIL tính `prior_gap = back_gap + vehicle.length + front_gap` và dùng `leading_distance` đã lưu của xe sau, giống cách GAMA lưu thuộc tính `leading_distance`.
+- Thêm thuộc tính `vehicle.road` làm nguồn chính để biết xe đang ở road nào.
 
-### 3.5 Phương pháp đối chiếu còn yếu
-- `compare_lvl_python_gama.py` chỉ so `active`, `created`, `passed`, `front_row_max`, **không** so `queue_time_integral`, `system_time_integral`, `weighted_delay_integral`, tốc độ trung bình. Script cũng **không có ngưỡng đạt/không đạt** (khác `compare_python_gama.py` của legacy, có `--tolerance --enforce`).
-- `created` khớp là đương nhiên vì cùng CSV, không chứng minh gì. Còn `passed` gần như không nhạy với động học khi mọi xe vào đều ra.
-- `compare_lvl_training_envs.py` có so reward R1 và spatial MAE, đây là hướng đúng. Nhưng chỉ có 3 seed và chỉ có MAE trung bình, không có phân phối hay giá trị lớn nhất.
-- **Thiếu phép thử quan trọng nhất:** train trên Python rồi đánh giá trên GAMA (và ngược lại), xem thứ hạng các chính sách có giữ nguyên không. Chính README thừa nhận “chưa chứng minh quá trình cập nhật trọng số khi train hoàn toàn tương đương”.
+Các thay đổi này có chú thích dẫn tới hàm Java tương ứng của GAMA, và 10 test bám sự kiện GAMA vẫn qua. Đây là dấu hiệu tốt. Hai điểm cần lưu ý:
+- Ở nhánh `else` của `_move` (xe không qua nút trong tick), `vehicle.road` **không được cập nhật**. Nếu xe trên connector có quãng phanh vượt qua cuối connector trong lúc `predicted_speed <= 0`, nó sẽ có progress lớn hơn chiều dài road mà vẫn bị coi là đang trên connector. Trường hợp này hiếm nhưng nên có `assert progress <= road length` trong debug.
+- Vì lõi động học đổi, **mọi số liệu parity cũ (kể cả 18,56% lệch làn) đều cần đo lại** trước khi trích dẫn.
 
-### 3.6 Bằng chứng parity đã bị xóa
-README dẫn ra `reports/lvl_python_gama_parity_current_20261110.md`, `reports/python_parity_20261109/…` và `reports/python_parity_20261110/`. Commit `1cc5b61` **xóa toàn bộ thư mục `reports/`**. Mọi con số parity trong README hiện không kiểm lại được từ repo. Với nghiên cứu, đây là vấn đề về tính tái lập.
-
-### 3.7 Lỗi encoding trên Windows
-`python_sim.py:27` gọi `Path(path).read_text()` mà không truyền `encoding`. Trên Windows, Python mặc định dùng cp1252 nên vỡ khi gặp ký tự tiếng Việt trong GeoJSON. Kết quả chạy:
-- `test_python_sim.py`: **10/10 lỗi**, qua 10/10 khi đặt `PYTHONUTF8=1`.
-- `lvl_env.py` gọi `road_lengths()` ngay khi import, nên **`train.py`/`evaluate.py --scenario lvl` hỏng ngay từ đầu** trên Windows.
-
-Cách sửa: thêm `encoding="utf-8"` vào `read_text()` và vào các `open()` ở `python_sim.py`/`demand.py`.
-
-### 3.8 Hiệu năng: lý do để port chưa thành hiện thực
-- README: Python khoảng **21,6–22,1 s** mỗi episode 8.000 tick, GAMA khoảng **13,3–13,4 s**. Bản Python chậm hơn khoảng 1,6 lần.
-- Chạy 2 worker chỉ nhanh hơn 1 worker khoảng 1,24 lần (README).
-- Lợi ích còn lại là không cần JVM hay GAMA Server, dễ chạy song song và dễ chạy trên Colab. Nhưng nếu muốn train hàng triệu bước thì cần vector hóa theo làn (NumPy), dùng PyPy hoặc viết phần lõi bằng Numba hay Cython.
-- Ở cùng lưu lượng, thời gian chạy tăng theo số xe trên mạng (lần chạy của tôi: 1.200 → 8.000 xe/h làm thời gian tăng khoảng 10 lần).
-
-### 3.9 Các điểm nhỏ trong code port
-- `LVLPythonEnv.reset`: `seed or 1` biến seed 0 thành 1. Ở chế độ replay RNG không được dùng nên hiện chưa ảnh hưởng.
-- `_LVLCommon.step` sửa `elapsed_seconds` bằng phép nhân `DT / 0.1`, vì `GamaTrafficEnv.step` tính cứng `advanced * .1`. `train.py` còn viết cứng `.2 if scenario == "lvl" else .1` ở 3 chỗ. Nên để base class dùng `self.step_seconds`, nếu không thì đổi `DT` sẽ làm sai discount mà không báo lỗi.
-- `_free_idm_cache` dùng `id(vehicle)` làm khóa. Hiện an toàn vì xe chỉ bị xóa cuối `_move`, nhưng dễ vỡ khi đổi thứ tự.
-- Chế độ phát xe ngẫu nhiên (không CSV) dùng RNG Python nên không bao giờ khớp GAMA. Điều này đúng như README nói, nhưng `python_sim.py --seed` vẫn cho chạy kiểu này mà không cảnh báo.
-
-### 3.10 State ở `lvl_env.py` khác với state GAMA trước đây
-Trước commit này, khi train `--site lvl`, spatial state được dựng trong GAMA, và README LVL mô tả C5 là mặt nạ theo số sublane thật, ô 8 m. Bản chuyển sang Python dựng lại state trong `_observation()` nhưng **ngữ nghĩa thay đổi**:
-- ô dọc **6 m** thay vì 8 m,
-- C4 là **hằng số ±1 theo trục đường**,
-- C5 là ô có xe, **không còn là mặt nạ làn hợp lệ**,
-- C1 ghi đè bằng xe cuối cùng thay vì lấy trung bình,
-- `green_cycles = cycle % 50` luôn bằng 0 ở tick quyết định,
-- `average_waiting_time`/`average_travel_time` là `NaN`.
-
-Hai backend vẫn khớp nhau vì dùng chung hàm, nhưng **không còn khớp với tài liệu và với state GAMA cũ**. Kết quả train trước và sau commit không so sánh trực tiếp được.
+### 3.8 Hiệu năng
+Một episode 8.000 tick (seed 1, demand CSV) mất **48 giây** trên máy này với Python 3.14. README ghi khoảng 22 s trên máy khác với Python 3.11, còn GAMA khoảng 13 s. Commit này không cải thiện tốc độ. Nếu lý do chuyển sang Python là để train nhanh hơn thì vẫn chưa đạt; lợi ích hiện tại chỉ là không cần JVM hay GAMA Server.
 
 ---
 
-## 4. Bản legacy `python_env.py`
-
-### 4.1 Lỗi: bộ đếm chờ pha không bao giờ tăng
-`self._phase_wait` chỉ được gán `[0]*4` (dòng 138, 184) rồi đọc ở dòng 782. GAML (`intersection-dqn-python.gaml:278–284`) tăng `phase_wait_cycles[a]` mỗi tick và ép phục vụ pha đợi quá 1.200 tick. Khi bật `dqn_service_guard`, **action mask của Python khác GAMA**: pha bị bỏ đói không bao giờ được ép phục vụ.
-
-### 4.2 Port gần đúng, nhiều hằng số khớp cho vừa trace
-- Docstring tự nhận đây là “deliberately explicit approximation”, `fidelity = "approximate-longitudinal-v1"`. Điều này minh bạch, tốt.
-- Nhiều hằng số được chỉnh để trace khớp GAMA thay vì port đúng cơ chế: `FLYOVER_PORTAL_CLEARANCE = 66.0` (GAML là 70 m), các hệ số phanh `2.5`, `3.0`, `2.0` ở dòng 664–667, `ramp_stop_ticks >= 50`. Khớp kiểu này dễ vỡ khi đổi demand hoặc horizon. Đây chính là lý do parity trôi xa ở 4.000 tick.
-- Đổi làn là dịch chuyển tức thời kèm `lateral_peak` giả lập, không phải nội suy như GAMA.
-
-### 4.3 Hiệu năng
-`_choose_lanes` gọi `self._leader_gaps()` (dựng lại và sắp xếp mọi nhóm xe) **bên trong vòng lặp từng xe** (dòng 507), nên mỗi tick tốn khoảng O(n² log n).
-
-### 4.4 Kết quả parity (theo README)
-Seed 1002, 4.000 tick: lệch 42,5% số xe nhận, 7,1% xe qua nút, 38,7% tốc độ trung bình, 10,7% tích phân hàng chờ, và lịch pha đã trôi. **Không đạt ngưỡng 10%.** Không nên dùng `--scenario legacy --backend python` cho bất kỳ kết quả nào.
-
----
-
-## 5. Để Python thay được GAMA cho nghiên cứu
+## 4. Việc nên làm tiếp
 
 | # | Việc | Ưu tiên |
 |---|---|---|
-| 1 | Sửa encoding UTF-8 (`python_sim.py`, `demand.py`) | Ngay |
-| 2 | Sửa thứ tự đo: `_measure()` trước `_move()`, rồi đối chiếu lại `queue_time_integral`/`weighted_delay_integral` ở vài tick đầu | Ngay |
-| 3 | Thống nhất định nghĩa `front_row` giữa GAML và Python | Cao |
-| 4 | Commit lại thư mục `reports/` (hoặc một thư mục bằng chứng parity) cùng CSV gốc | Cao |
-| 5 | Mở rộng `compare_lvl_python_gama.py`: so cả 3 tích phân reward, tốc độ trung bình, hàng chờ theo nhánh; có `--tolerance --enforce`; chạy ≥ 10 seed | Cao |
-| 6 | Test khẳng định một xe cụ thể rơi vào cùng ô spatial trên cả hai backend | Trung bình |
-| 7 | Tìm nguyên nhân 18,56% lệch làn (log từng quyết định MOBIL của hai bên ở tick lệch đầu tiên) | Trung bình |
-| 8 | Phép thử chéo: train trên Python, đánh giá trên GAMA và ngược lại; so thứ hạng chính sách | **Bắt buộc trước khi công bố** |
-| 9 | Ghi lại nghĩa thật của 6 kênh state, hoặc sửa `_observation` cho khớp tài liệu | Trung bình |
-| 10 | Legacy: sửa `_phase_wait`, đưa `_leader_gaps()` ra ngoài vòng lặp; hoặc ghi rõ là không hỗ trợ | Thấp (nếu đã bỏ legacy) |
-| 11 | Tăng tốc (vector hóa hoặc Numba) nếu lý do port là tốc độ | Tùy mục tiêu |
+| 1 | Thêm `green_ticks` vào GAML và `LVLGamaEnv.read_state`; test hai backend cho cùng `green_cycles`; chuẩn hóa theo giây | **Ngay** |
+| 2 | Thêm điều kiện `phase_demand[a] = 0` vào bộ đếm chờ pha của `python_env.py`, kèm test | Ngay |
+| 3 | `--enforce` kiểm tra cả 3 tích phân reward, ở mọi mốc lấy mẫu | Cao |
+| 4 | Chạy lại đối chiếu GAMA ↔ Python sau commit này (≥ 10 seed × 8.000 tick), commit CSV và báo cáo vào repo, sửa link trong README | Cao |
+| 5 | Thống nhất định nghĩa `front_row` giữa GAML và Python | Trung bình |
+| 6 | Sửa ô 6 m → 8 m và C4 cho khớp tài liệu, hoặc sửa tài liệu cho khớp code | Trung bình |
+| 7 | Bỏ câu “sẵn sàng thay thế hoàn toàn” khỏi `run_vehicle_behavior_suite.py`; chuyển sang pytest; sửa lỗi in emoji trên Windows | Trung bình |
+| 8 | Phép thử chéo: train trên Python, đánh giá trên GAMA và ngược lại, so thứ hạng chính sách | **Bắt buộc trước khi công bố** |
+| 9 | Ghi thời điểm vào/ra từng xe để có thời gian chờ và thời gian di chuyển đúng định nghĩa | Trung bình |
+| 10 | Tăng tốc (vector hóa hoặc Numba) nếu cần train dài | Tùy mục tiêu |
 
-**Tiêu chí đề xuất để tuyên bố “Python thay được GAMA”:** trên ≥ 10 seed × 8.000 tick, ba tích phân reward lệch ≤ 2–5%, và chính sách tốt nhất (cùng thứ tự xếp hạng của các baseline) giống nhau khi đánh giá trên hai backend.
+**Tiêu chí đề xuất để tuyên bố “Python thay được GAMA”:** trên ≥ 10 seed × 8.000 tick, mọi đặc trưng đầu vào của mạng giống nhau giữa hai backend khi chạy cùng chuỗi action; ba tích phân reward lệch ≤ 2–5% ở mọi mốc; và thứ hạng các chính sách giống nhau khi đánh giá trên hai backend.
 
 ---
 
-## 6. Phạm vi chưa kiểm tra
+## 5. Phạm vi chưa kiểm tra
 
-- Không chạy GAMA, nên không tự đo lại các con số parity và chưa xác nhận bằng số liệu chênh lệch ở mục 3.1.
-- Không so trực tiếp với mã nguồn Java của GAMA (`DrivingSkill`, `MOBIL`), chỉ so với GAML và các chú thích trong code Python.
-- Không đọc chi tiết `observer.html`, `lvl_observer_server.py` và các script `probe_*`/`prototype_*`, vì không ảnh hưởng kết quả.
+- Không chạy GAMA, nên không đo lại parity sau commit này. Nhận xét 3.1 suy ra từ code (`LVLGamaEnv.read_state` không truyền `green_cycles`, GAML không có biến tương ứng), chưa chạy trên GAMA.
+- Không so trực tiếp với mã Java của GAMA (`DrivingSkill`, `MOBIL`), chỉ so với GAML và các chú thích trong code Python.
+- Thời gian chạy đo trên một máy, một seed, Python 3.14. Không so được với GAMA trên cùng máy.
