@@ -5,10 +5,11 @@
 *              and rich urban road infrastructure visuals.
 */
 
-model intersection_trafficn
+model intersection_traffic
 import "../includes/collision_avoidance.gaml"
 
 global {
+	float step <- 0.1 #s;
 	// Each axis: through green/yellow, then protected left green/yellow.
 	float global_counter <- 0.0;
 	list<float> phase_durations <- [30#s, 3#s, 12#s, 3#s,

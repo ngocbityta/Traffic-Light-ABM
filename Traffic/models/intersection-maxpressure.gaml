@@ -8,6 +8,7 @@ model intersection_maxpressure
 import "../includes/collision_avoidance.gaml"
 
 global {
+	float step <- 0.1 #s;
 	// MAXPRESSURE CONTROLLER PARAMETERS
 	// 0/4: through green, 1/5: through yellow,
 	// 2/6: protected left green, 3/7: left yellow.

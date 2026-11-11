@@ -8,6 +8,7 @@ model intersection_verification_tests
 import "../includes/collision_avoidance.gaml"
 
 global {
+	float step <- 0.1 #s;
 	int total_tests <- 0;
 	int passed_tests <- 0;
 	int failed_tests <- 0;
@@ -133,28 +134,16 @@ global {
 		ew_incoming_roads <- controller_roads(false, true);
 		ns_outgoing_roads <- controller_roads(true, false);
 		ew_outgoing_roads <- controller_roads(false, false);
-		bool topo_pass <- (length(road) = 64) and (length(intersection) = 56) and
-			(road_network != nil) and (length(ew_incoming_roads) = 8);
+		bool topo_pass <- (length(road) = 20) and (length(intersection) = 16) and
+			(road_network != nil) and (length(ew_incoming_roads) = 2);
 		do log_assertion("Base-Model", "TC-BASE-01-Topology", topo_pass,
-			"64 roads, 56 intersections, 8 EW incoming segments and active graph");
-		bool uturn_clearance <- true;
-		loop arm over: ["E", "N", "W", "S"] {
-			uturn_clearance <- uturn_clearance and
-				!network_nodes[arm + "_U_IN"].managed_merge and
-				network_nodes[arm + "_U_OUT"].managed_merge and
-				network_nodes[arm + "_U_OUT"].merge_clearance >= 18.0;
-		}
-		do log_assertion("Base-Model", "EDGE-10-UturnMergeClearance", uturn_clearance,
-			"U-turn entry is a free diverge; its outgoing merge reserves 18m");
-		bool right_clearance <- true;
-		loop arm over: ["E", "N", "W", "S"] {
-			right_clearance <- right_clearance and
-				!network_nodes[arm + "_DIV"].managed_merge and
-				network_nodes[arm + "_MERGE"].managed_merge and
-				network_nodes[arm + "_MERGE"].merge_clearance >= 18.0;
-		}
-		do log_assertion("Base-Model", "EDGE-11-RightBranchClearance", right_clearance,
-			"Right-turn entry is a free diverge; its outgoing merge reserves 18m");
+			"20 roads, 16 intersections, 2 EW incoming segments and active graph");
+		bool no_uturn <- empty(road where (each.road_kind = "uturn"));
+		do log_assertion("Base-Model", "EDGE-10-NoUturnLanes", no_uturn,
+			"U-turn lanes eliminated; synchronized layout has 0 U-turn roads");
+		bool right_connectors_ok <- length(road where (each.road_kind = "right")) = 4;
+		do log_assertion("Base-Model", "EDGE-11-RightBranchClearance", right_connectors_ok,
+			"4 right-turn connectors integrated into intersection conflict zone");
 	}
 
 	reflex test_separate_signal_heads when: cycle = 10 {

@@ -13,10 +13,11 @@ global {
 	list<float> signal_phase_schedule <- [];
 	action init_doan_scenery {
 		create doan_ground;
-		create traffic_signal_post with: (post_id: 1, direction_axis: 0, location: {967,953}, heading: 180.0);
-		create traffic_signal_post with: (post_id: 2, direction_axis: 0, location: {1033,1047}, heading: 0.0);
-		create traffic_signal_post with: (post_id: 3, direction_axis: 1, location: {953,1033}, heading: 90.0);
-		create traffic_signal_post with: (post_id: 4, direction_axis: 1, location: {1047,967}, heading: 270.0);
+		// 4 trụ đèn tín hiệu tại vạch dừng 4 nhánh Lê Văn Lương - Hoàng Đạo Thúy / Hoàng Minh Giám
+		create traffic_signal_post with: (post_id: 1, direction_axis: 0, location: {1015,987}, heading: 143.4);
+		create traffic_signal_post with: (post_id: 2, direction_axis: 0, location: {983,1019}, heading: 322.8);
+		create traffic_signal_post with: (post_id: 3, direction_axis: 1, location: {1019,1022}, heading: 218.5);
+		create traffic_signal_post with: (post_id: 4, direction_axis: 1, location: {981,983}, heading: 46.4);
 	}
 }
 
@@ -24,126 +25,70 @@ species doan_ground {
 	aspect base {
 		draw (square(2000) at_location {1000,1000}) at: {1000,1000,-0.5} color: rgb(15,20,30);
 
-		// Trục Ngang (Đông - Tây): 4 LÀN XE MỖI CHIỀU (Rộng 60m)
-		draw (rectangle(2000,60) at_location {1000,1000}) depth: 0.6 color: rgb(35, 42, 55) border: rgb(0, 242, 254, 100);
+		// 4 Nhánh đường ngã tư Lê Văn Lương - Hoàng Đạo Thúy / Hoàng Minh Giám
+		// Nhánh NE: Lê Văn Lương hướng Láng Hạ (bearing 53.4°)
+		// Rộng 33.8m (vào 13.3m, dải phân cách 7.8m, ra 12.7m)
+		draw (rectangle(1000, 33.8) at_location {1000 + 401.4, 1000 - 298.1})
+			rotate: 53.4 - 90.0 depth: 0.6 color: rgb(35, 42, 55) border: rgb(0, 242, 254, 100);
 
-		// Trục Dọc (Bắc - Nam): 4 LÀN XE MỖI CHIỀU (Rộng 60m)
-		draw (rectangle(60,2000) at_location {1000,1000}) depth: 0.6 color: rgb(35, 42, 55) border: rgb(0, 242, 254, 100);
+		// Nhánh SW: Lê Văn Lương hướng Khuất Duy Tiến (bearing 232.8°)
+		// Rộng 33.1m (vào 12.8m, dải phân cách 7.9m, ra 12.4m)
+		draw (rectangle(1000, 33.1) at_location {1000 - 398.3, 1000 + 302.3})
+			rotate: 232.8 - 90.0 depth: 0.6 color: rgb(35, 42, 55) border: rgb(0, 242, 254, 100);
 
-				// VẠCH TIM ĐƯỜNG ĐÔI MÀU VÀNG NÉT LIỀN (DOUBLE YELLOW MEDIAN DIVIDERS)
-				// Đường Nguyễn Trãi (Y = 1000.0)
-				draw line([{0, 1000.6, 0.72}, {950, 1000.6, 0.72}]) color: rgb(255, 215, 0) width: 2.0;
-				draw line([{0, 999.4, 0.72}, {950, 999.4, 0.72}]) color: rgb(255, 215, 0) width: 2.0;
-				draw line([{1050, 1000.6, 0.72}, {2000, 1000.6, 0.72}]) color: rgb(255, 215, 0) width: 2.0;
-				draw line([{1050, 999.4, 0.72}, {2000, 999.4, 0.72}]) color: rgb(255, 215, 0) width: 2.0;
+		// Nhánh SE: Hoàng Đạo Thúy hướng Nhân Hòa (bearing 128.5°)
+		// Rộng 25.2m (vào 13.5m, dải phân cách 2.5m, ra 9.2m)
+		draw (rectangle(1000, 25.2) at_location {1000 + 391.3, 1000 + 311.3})
+			rotate: 128.5 - 90.0 depth: 0.6 color: rgb(35, 42, 55) border: rgb(0, 242, 254, 100);
 
-				// Đường Khuất Duy Tiến - Nguyễn Xiển (X = 1000.0)
-				draw line([{999.4, 2000, 0.72}, {999.4, 1050, 0.72}]) color: rgb(255, 215, 0) width: 2.0;
-				draw line([{1000.6, 2000, 0.72}, {1000.6, 1050, 0.72}]) color: rgb(255, 215, 0) width: 2.0;
-				draw line([{999.4, 950, 0.72}, {999.4, 0, 0.72}]) color: rgb(255, 215, 0) width: 2.0;
-				draw line([{1000.6, 950, 0.72}, {1000.6, 0, 0.72}]) color: rgb(255, 215, 0) width: 2.0;
+		// Nhánh NW: Hoàng Minh Giám hướng Trung Hòa (bearing 316.4°)
+		// Rộng 24.4m (vào 11.9m, dải phân cách 2.6m, ra 9.9m)
+		draw (rectangle(1000, 24.4) at_location {1000 - 344.8, 1000 - 362.1})
+			rotate: 316.4 - 90.0 depth: 0.6 color: rgb(35, 42, 55) border: rgb(0, 242, 254, 100);
 
-				// 4 VẠCH SƠN DỪNG ĐÈN ĐỎ (STOP BARS) MÀU TRẮNG DÀY SÁT MÉP NGÃ TƯ (ĐÚNG NỬA ĐƯỜNG ĐI VÀO THEO RHT)
-				// Nhánh Tây: vạch X=955, phần xe đi Đông.
-				draw box(1.8, 25.0, 0.2) at: {955, 1015, 0.75} color: #white;
-				// Nhánh Đông: vạch X=1045, phần xe đi Tây.
-				draw box(1.8, 25.0, 0.2) at: {1045, 985, 0.75} color: #white;
-				// Nhánh Bắc: vạch Y=955, phần xe đi Nam.
-				draw box(25.0, 1.8, 0.2) at: {985, 955, 0.75} color: #white;
-				// Nhánh Nam: vạch Y=1045, phần xe đi Bắc.
-				draw box(25.0, 1.8, 0.2) at: {1015, 1045, 0.75} color: #white;
+		// Vùng xung đột giao lộ trung tâm
+		draw circle(35.0) at: {1000, 1000, 0.05} depth: 0.55 color: rgb(35, 42, 55);
 
-				// Subtle dashed guides follow the same cubic Bézier control points
-				// as the four protected left-turn connectors in the road graph.
-				list<point> turn_starts <- [{1040.5,998.0},{998.0,959.5},
-					{959.5,1002.0},{1002.0,1040.5}];
-				list<point> turn_ends <- [{1002.0,1040.5},{1040.5,1002.0},
-					{1002.0,959.5},{959.5,998.0}];
-				list<point> turn_controls_1 <- [{1015.5,998.0},{998.0,984.5},
-					{984.5,1002.0},{1002.0,1015.5}];
-				list<point> turn_controls_2 <- [{1002.0,1015.5},{1015.5,1002.0},
-					{1002.0,984.5},{984.5,998.0}];
-				loop turn_index from: 0 to: 3 {
-					loop dash from: 0 to: 9 {
-						float t0 <- dash / 10.0;
-						float t1 <- t0 + 0.06;
-						point a <- turn_starts[turn_index] * ((1-t0)^3) +
-							turn_controls_1[turn_index] * (3*(1-t0)^2*t0) +
-							turn_controls_2[turn_index] * (3*(1-t0)*t0*t0) +
-							turn_ends[turn_index] * (t0^3);
-						point b <- turn_starts[turn_index] * ((1-t1)^3) +
-							turn_controls_1[turn_index] * (3*(1-t1)^2*t1) +
-							turn_controls_2[turn_index] * (3*(1-t1)*t1*t1) +
-							turn_ends[turn_index] * (t1^3);
-						draw line([a + {0,0,0.95},b + {0,0,0.95}])
-							color: rgb(225,225,210,125) width: 1.2;
-					}
-				}
+		// Dải phân cách cứng (Medians)
+		// Median NE (rộng 7.8m)
+		draw line([{1000 + 17.4 * 0.8028 - 2.1 * -0.5962, 1000 + 17.4 * -0.5962 - 2.1 * -0.8028, 0.72},
+			{1000 + 990.0 * 0.8028 - 2.1 * -0.5962, 1000 + 990.0 * -0.5962 - 2.1 * -0.8028, 0.72}])
+			color: rgb(90, 140, 80) width: 7.8;
 
-				// (Đã bỏ vẽ vạch qua đường cho người đi bộ theo yêu cầu của người dùng)
+		// Median SW (rộng 7.9m)
+		draw line([{1000 + 21.8 * -0.7965 + 1.05 * 0.6046, 1000 + 21.8 * 0.6046 + 1.05 * 0.7965, 0.72},
+			{1000 + 990.0 * -0.7965 + 1.05 * 0.6046, 1000 + 990.0 * 0.6046 + 1.05 * 0.7965, 0.72}])
+			color: rgb(90, 140, 80) width: 7.9;
 
-				// 4 NHÁNH RẼ PHẢI ƯU TIÊN 2 LÀN RIÊNG BIỆT TẠI 4 GÓC PHẦN TƯ (RHT VIỆT NAM)
-				// Góc Tây-Nam (Rẽ từ Nguyễn Trãi đi Đông sang Nguyễn Xiển đi Nam)
-				draw line([{935, 1026, 0.6}, {974, 1065, 0.6}]) color: rgb(35, 42, 55) width: 22.0;
-				draw line([{935, 1026, 0.8}, {974, 1065, 0.8}]) color: #white width: 2.0;
-				draw line([{938, 1029, 0.85}, {971, 1062, 0.85}]) color: rgb(255, 255, 255, 160) width: 1.0;
-				draw line([{932, 1023, 0.85}, {977, 1068, 0.85}]) color: rgb(255, 255, 255, 160) width: 1.0;
+		// Median SE (rộng 2.5m)
+		draw line([{1000 + 28.3 * 0.7826 - 6.11 * 0.6225, 1000 + 28.3 * 0.6225 - 6.11 * -0.7826, 0.72},
+			{1000 + 990.0 * 0.7826 - 6.11 * 0.6225, 1000 + 990.0 * 0.6225 - 6.11 * -0.7826, 0.72}])
+			color: rgb(90, 140, 80) width: 2.5;
 
-				// Góc Tây-Bắc (Rẽ từ Khuất Duy Tiến đi Nam sang Nguyễn Trãi đi Tây)
-				draw line([{974, 935, 0.6}, {935, 974, 0.6}]) color: rgb(35, 42, 55) width: 22.0;
-				draw line([{974, 935, 0.8}, {935, 974, 0.8}]) color: #white width: 2.0;
-				draw line([{971, 938, 0.85}, {938, 971, 0.85}]) color: rgb(255, 255, 255, 160) width: 1.0;
-				draw line([{977, 932, 0.85}, {932, 977, 0.85}]) color: rgb(255, 255, 255, 160) width: 1.0;
+		// Median NW (rộng 2.6m)
+		draw line([{1000 + 23.7 * -0.6896 + 1.4 * -0.7242, 1000 + 23.7 * -0.7242 + 1.4 * 0.6896, 0.72},
+			{1000 + 990.0 * -0.6896 + 1.4 * -0.7242, 1000 + 990.0 * -0.7242 + 1.4 * 0.6896, 0.72}])
+			color: rgb(90, 140, 80) width: 2.6;
 
-				// Góc Đông-Bắc (Rẽ từ Nguyễn Trãi đi Tây sang Khuất Duy Tiến đi Bắc)
-				draw line([{1065, 974, 0.6}, {1026, 935, 0.6}]) color: rgb(35, 42, 55) width: 22.0;
-				draw line([{1065, 974, 0.8}, {1026, 935, 0.8}]) color: #white width: 2.0;
-				draw line([{1062, 971, 0.85}, {1029, 938, 0.85}]) color: rgb(255, 255, 255, 160) width: 1.0;
-				draw line([{1068, 977, 0.85}, {1023, 932, 0.85}]) color: rgb(255, 255, 255, 160) width: 1.0;
+		// 4 VẠCH SƠN DỪNG ĐÈN ĐỎ (STOP BARS) MÀU TRẮNG DÀY SÁT MÉP NGÃ TƯ
+		// Stop bar SE (w_in = 13.5m)
+		draw line([{1019.28, 1021.55, 0.75}, {1019.28 + 0.6225 * 13.5, 1021.55 - 0.7826 * 13.5, 0.75}])
+			color: #white width: 2.0;
 
-				// Góc Đông-Nam (Rẽ từ Nguyễn Xiển đi Bắc sang Nguyễn Trãi đi Đông)
-				draw line([{1026, 1065, 0.6}, {1065, 1026, 0.6}]) color: rgb(35, 42, 55) width: 22.0;
-				draw line([{1026, 1065, 0.8}, {1065, 1026, 0.8}]) color: #white width: 2.0;
-				draw line([{1029, 1062, 0.85}, {1062, 1029, 0.85}]) color: rgb(255, 255, 255, 160) width: 1.0;
-				draw line([{1023, 1068, 0.85}, {1068, 1023, 0.85}]) color: rgb(255, 255, 255, 160) width: 1.0;
+		// Stop bar NE (w_in = 13.3m)
+		draw line([{1014.82, 986.75, 0.75}, {1014.82 - 0.5962 * 13.3, 986.75 - 0.8028 * 13.3, 0.75}])
+			color: #white width: 2.0;
 
-				// 4 VÒNG QUAY ĐẦU CHỮ U VÀNG (ĐẶT NGAY TRƯỚC VẠCH DỪNG 955 & 1045)
-				// 1. U-Turn Bắc (Đón từ Tây X=995 vòng sang Đông X=1005 đi ra hướng Bắc)
-				draw line([{995, 930, 0.72}, {995, 940, 0.72}, {1005, 940, 0.72}, {1005, 930, 0.72}]) color: rgb(255, 215, 0) width: 4.0;
+		// Stop bar NW (w_in = 11.9m)
+		draw line([{980.53, 983.47, 0.75}, {980.53 - 0.7242 * 11.9, 983.47 + 0.6896 * 11.9, 0.75}])
+			color: #white width: 2.0;
 
-				// 2. U-Turn Nam (Đón từ Đông X=1005 vòng sang Tây X=995 đi ra hướng Nam)
-				draw line([{1005, 1070, 0.72}, {1005, 1060, 0.72}, {995, 1060, 0.72}, {995, 1070, 0.72}]) color: rgb(255, 215, 0) width: 4.0;
+		// Stop bar SW (w_in = 12.8m)
+		draw line([{983.19, 1019.04, 0.75}, {983.19 + 0.6046 * 12.8, 1019.04 + 0.7965 * 12.8, 0.75}])
+			color: #white width: 2.0;
 
-				// 3. U-Turn Tây (Đón từ Nam Y=995 vòng sang Bắc Y=1005 đi ra hướng Tây)
-				draw line([{930, 1005, 0.72}, {940, 1005, 0.72}, {940, 995, 0.72}, {930, 995, 0.72}]) color: rgb(255, 215, 0) width: 4.0;
-
-				// 4. U-Turn Đông (Đón từ Bắc Y=1005 vòng sang Nam Y=995 đi ra hướng Đông)
-				draw line([{1070, 995, 0.72}, {1060, 995, 0.72}, {1060, 1005, 0.72}, {1070, 1005, 0.72}]) color: rgb(255, 215, 0) width: 4.0;
-
-				// VẠCH PHÂN LÀN TRẮNG NÉT ĐỨT (LÀN ĐƯỜNG NGUYỄN TRÃI)
-				loop y_off over: [977.0, 984.0, 991.0, 1009.0, 1016.0, 1023.0] {
-					draw line([{0.0, y_off, 0.7}, {2000.0, y_off, 0.7}]) color: rgb(255, 255, 255, 160) width: 1.5;
-				}
-
-				// VẠCH PHÂN LÀN TRẮNG NÉT ĐỨT (LÀN ĐƯỜNG KHUẤT DUY TIẾN - NGUYỄN XIỂN)
-				loop x_off over: [977.0, 984.0, 991.0, 1009.0, 1016.0, 1023.0] {
-					draw line([{x_off, 0.0, 0.7}, {x_off, 2000.0, 0.7}]) color: rgb(255, 255, 255, 160) width: 1.5;
-				}
-
-				// MŨI TÊN CHỈ HƯỚNG TRÊN MẶT ĐƯỜNG (LÀN VÀO HƯỚNG VÀO NGÃ TƯ, LÀN RA HƯỚNG RA KHỎI NGÃ TƯ)
-				// 1. Nhánh Tây (Nguyễn Trãi): Nam đi Đông (vào), Bắc đi Tây (ra khỏi ngã tư)
-				draw line([{880, 1015, 0.72}, {900, 1015, 0.72}]) color: rgb(255, 255, 255, 200) width: 2.0; // Vào
-				draw line([{900, 985, 0.72}, {880, 985, 0.72}]) color: rgb(255, 255, 255, 200) width: 2.0; // Ra khỏi ngã tư
-				// 2. Nhánh Đông (Nguyễn Trãi): Bắc đi Tây (vào), Nam đi Đông (ra khỏi ngã tư)
-				draw line([{1120, 985, 0.72}, {1100, 985, 0.72}]) color: rgb(255, 255, 255, 200) width: 2.0; // Vào
-				draw line([{1100, 1015, 0.72}, {1120, 1015, 0.72}]) color: rgb(255, 255, 255, 200) width: 2.0; // Ra khỏi ngã tư
-				// 3. Nhánh Bắc (Khuất Duy Tiến): Tây đi Nam (vào), Đông đi Bắc (ra khỏi ngã tư)
-				draw line([{985, 880, 0.72}, {985, 900, 0.72}]) color: rgb(255, 255, 255, 200) width: 2.0; // Vào
-				draw line([{1015, 900, 0.72}, {1015, 880, 0.72}]) color: rgb(255, 255, 255, 200) width: 2.0; // Ra khỏi ngã tư
-				// 4. Nhánh Nam (Nguyễn Xiển): Đông đi Bắc (vào), Tây đi Nam (ra khỏi ngã tư)
-				draw line([{1015, 1120, 0.72}, {1015, 1100, 0.72}]) color: rgb(255, 255, 255, 200) width: 2.0; // Vào
-				draw line([{985, 1100, 0.72}, {985, 1120, 0.72}]) color: rgb(255, 255, 255, 200) width: 2.0; // Ra khỏi ngã tư
-
+		// (Làn rẽ phải nằm trong vùng xung đột giao lộ, không vẽ tách nhánh riêng bên ngoài)
+		// (Không có làn quay đầu tại ngã tư)
 	}
 }
 

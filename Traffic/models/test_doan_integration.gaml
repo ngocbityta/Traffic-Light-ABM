@@ -15,9 +15,6 @@ global {
 	int audit_wrong_routes <- 0;
 	int audit_jumps <- 0;
 	int audit_stopbar_violations <- 0;
-	int audit_surface_on_open_ramp <- 0;
-	int audit_uturn_wrong_lane <- 0;
-	int audit_uturn_entries_without_green <- 0;
 	int audit_remote_idle <- 0;
 	bool audit_force_merge_stall <- false;
 	bool audit_force_overtaken_owner <- false;
@@ -219,27 +216,12 @@ global {
 					}
 				}
 				point pos <- v.compute_position();
-				bool open_ramp_x <- (pos.x > 760 and pos.x < 930) or
-					(pos.x > 1070 and pos.x < 1240);
-				bool open_ramp_y <- abs(pos.y - 955) < 8 or abs(pos.y - 1045) < 8;
-				if (v.route_kind = "ground" and open_ramp_x and open_ramp_y) {
-					audit_surface_on_open_ramp <- audit_surface_on_open_ramp + 1;
-				}
-				if ((v.maneuver = "uturn" and (v.uses_signal or v.lowest_lane != 14)) or
-					(v.maneuver = "left" and v.lowest_lane != 12)) {
-					audit_uturn_wrong_lane <- audit_uturn_wrong_lane + 1;
-				}
 				if (audit_last_position contains_key k and distance_to(pos,audit_last_position[k]) > 3.5 #m) {
 					audit_jumps <- audit_jumps + 1;
 					if (audit_jumps <= 10) { write "DOAN_JUMP," + cycle + "," + k + "," + v.route_kind + "," + r.road_key + "," + distance_to(pos,audit_last_position[k]) + "," + audit_last_position[k] + "," + pos + "," + v.heading + "," + v.current_lateral_shift; }
 				}
 				audit_last_position[k] <- pos;
 				if (audit_last_road contains_key k and audit_last_road[k] != r) {
-					if (r.road_kind = "uturn" and
-						!((v.approach_ns and (global_phase = 0 or global_phase = 2)) or
-						  (!v.approach_ns and (global_phase = 4 or global_phase = 6)))) {
-						audit_uturn_entries_without_green <- audit_uturn_entries_without_green + 1;
-					}
 					if (r.is_signal_connector) {
 						bool valid <- v.maneuver = "left" ?
 							((v.approach_ns and (global_phase = 2 or
@@ -257,7 +239,7 @@ global {
 								v.maneuver + "," + global_phase + "," + v.left_committed;
 						}
 					}
-					if (r.road_kind = "through" or r.road_kind = "left" or r.road_kind = "right" or r.road_kind = "uturn") {
+					if (r.road_kind = "through" or r.road_kind = "left" or r.road_kind = "right") {
 						string expected <- v.maneuver = "straight" ? "through" : v.maneuver;
 						if (r.road_kind != expected or r.approach_id != v.approach_id) { audit_wrong_routes <- audit_wrong_routes + 1; }
 						audit_movement_entries[r.road_key] <- (audit_movement_entries contains_key r.road_key ? audit_movement_entries[r.road_key] : 0) + 1;
@@ -348,11 +330,8 @@ global {
 				bool ahead_merge_hold <- false;
 				if (v.next_road != nil) {
 					intersection ahead <- intersection(road(v.next_road).target_node);
-					bool through_uturn_exit <- v.maneuver != "uturn" and
-						(ahead.node_key = "E_U_OUT" or ahead.node_key = "N_U_OUT" or
-						 ahead.node_key = "W_U_OUT" or ahead.node_key = "S_U_OUT");
 					float distance_to_ahead <- v.distance_to_current_target + road(v.next_road).shape.perimeter;
-					ahead_merge_hold <- ahead.managed_merge and !through_uturn_exit and
+					ahead_merge_hold <- ahead.managed_merge and
 						!(ahead.merge_owners contains v) and distance_to_ahead <= ahead.merge_clearance +
 							v.vehicle_length / 2.0 + v.min_safety_distance + 5.0 #m;
 				}
@@ -441,7 +420,7 @@ global {
 				audit_errors <- audit_errors + 1;
 			}
 			if (audit_min_z < -60.001 or audit_max_z > 50.001) { audit_errors <- audit_errors + 1; }
-			write "DOAN_AUDIT," + cycle + "," + audit_errors + "," + failed_route_count + "," + audit_red_entries + "," + audit_overlaps + "," + audit_lane_errors + "," + audit_green_idle + "," + audit_phase_errors + "," + audit_unsafe_merges + "," + audit_empty_changes + "," + audit_wrong_routes + "," + audit_jumps + "," + audit_min_acc + "," + total_vehicles_created + "," + total_vehicles_passed + "," + bypass_vehicles_created + "," + bypass_vehicles_passed + "," + left_turn_completed_count + "," + right_turn_completed_count + "," + uturn_completed_count + "," + audit_phase_changes + "," + audit_min_z + "," + audit_max_z + "," + audit_ramp_samples + "," + audit_stopbar_violations + "," + audit_surface_on_open_ramp + "," + audit_uturn_wrong_lane + "," + audit_uturn_entries_without_green + "," + audit_remote_idle;
+			write "DOAN_AUDIT," + cycle + "," + audit_errors + "," + failed_route_count + "," + audit_red_entries + "," + audit_overlaps + "," + audit_lane_errors + "," + audit_green_idle + "," + audit_phase_errors + "," + audit_unsafe_merges + "," + audit_empty_changes + "," + audit_wrong_routes + "," + audit_jumps + "," + audit_min_acc + "," + total_vehicles_created + "," + total_vehicles_passed + "," + bypass_vehicles_created + "," + bypass_vehicles_passed + "," + left_turn_completed_count + "," + right_turn_completed_count + ",0," + audit_phase_changes + "," + audit_min_z + "," + audit_max_z + "," + audit_ramp_samples + "," + audit_stopbar_violations + ",0,0,0," + audit_remote_idle;
 			write "DOAN_ROUTES," + route_completed;
 			write "DOAN_MOVEMENTS," + audit_movement_entries;
 		}

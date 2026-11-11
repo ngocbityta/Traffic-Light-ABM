@@ -47,6 +47,16 @@ class Observer:
         vehicles = []
         for vehicle in self.sim.vehicles:
             road, progress = self.sim._road_state(vehicle)
+            is_changing = bool(vehicle.lane_change_progress < 1.0)
+            target_shift = getattr(vehicle, "target_lateral_shift", (vehicle.lane + (vehicle.occupied - 1) / 2.0) * 0.8)
+            curr_shift = getattr(vehicle, "current_lateral_shift", target_shift)
+            start_shift = getattr(vehicle, "start_lateral_shift", curr_shift)
+            turn_signal = "none"
+            if is_changing:
+                if target_shift > start_shift + 0.05:
+                    turn_signal = "left"
+                elif target_shift < start_shift - 0.05:
+                    turn_signal = "right"
             vehicles.append({
                 "id": vehicle.demand_row_id,
                 "road": road,
@@ -60,6 +70,13 @@ class Observer:
                 "to_arm": vehicle.to_arm,
                 "turn": vehicle.maneuver,
                 "length": round(vehicle.length, 2),
+                "lateral_shift": round(curr_shift, 4),
+                "start_lateral_shift": round(start_shift, 4),
+                "target_lateral_shift": round(target_shift, 4),
+                "lane_change_progress": round(getattr(vehicle, "lane_change_progress", 1.0), 4),
+                "lateral_duration": round(getattr(vehicle, "lateral_duration", 0.8), 4),
+                "is_changing_lane": is_changing,
+                "turn_signal": turn_signal,
             })
         result["vehicles"] = vehicles
         return result

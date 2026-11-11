@@ -8,6 +8,7 @@ model intersection_qlearning
 import "../includes/collision_avoidance.gaml"
 
 global {
+	float step <- 0.1 #s;
 	// =====================================================
 	// Q-LEARNING REINFORCEMENT LEARNING CONTROLLER
 	// =====================================================

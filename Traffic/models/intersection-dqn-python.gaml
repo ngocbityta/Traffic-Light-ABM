@@ -20,6 +20,7 @@ model intersection_dqn_python
 import "../includes/collision_avoidance.gaml"
 
 global {
+	float step <- 0.1 #s;
 
 	// =====================================================
 	// TIMING & SAFETY CONSTRAINTS

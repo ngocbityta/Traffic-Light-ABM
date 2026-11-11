@@ -20,22 +20,18 @@ import "doan_scenery.gaml"
 global {
 	// Ground network topology and route metadata (no overpass, underpass, or elevated rail).
 	bool enable_bypass_traffic <- false;
-	float right_turn_share <- 0.15;
-	float uturn_share <- 0.05;
+	float right_turn_share <- 0.20;
 	map<string, intersection> network_nodes <- [];
 	map<string, road> network_roads <- [];
 	map<int, intersection> ground_exits <- [];
 	map<int, intersection> ground_exit_entries <- [];
 	map<int, intersection> ground_diverges <- [];
 	map<int, intersection> ground_merges <- [];
-	map<int, intersection> ground_uturn_entries <- [];
-	map<int, intersection> ground_uturn_exits <- [];
 	map<string, int> route_created <- [];
 	map<string, int> route_completed <- [];
 	int bypass_vehicles_created <- 0;
 	int bypass_vehicles_passed <- 0;
 	int right_turn_completed_count <- 0;
-	int uturn_completed_count <- 0;
 	int failed_route_count <- 0;
 	int doan_horizon_cycles <- 8000;
 
@@ -46,6 +42,23 @@ global {
 		loop j from: 0 to: 120 {
 			float t <- j / 120.0;
 			pts <- pts + (start * ((1-t)^3) + c1 * (3*(1-t)^2*t) + c2 * (3*(1-t)*t*t) + finish * (t^3));
+		}
+		return line(pts);
+	}
+
+	geometry doan_connector_curve(point p0, point p1, point d0, point ub) {
+		float den <- d0.x * (-ub.y) - d0.y * (-ub.x);
+		point c <- {0,0};
+		if (abs(den) < 0.2) {
+			c <- (p0 + p1) / 2.0;
+		} else {
+			float lam <- ((p1.x - p0.x) * (-ub.y) - (p1.y - p0.y) * (-ub.x)) / den;
+			c <- p0 + d0 * lam;
+		}
+		list<point> pts <- [];
+		loop j from: 0 to: 30 {
+			float q <- j / 30.0;
+			pts <- pts + (p0 * ((1.0 - q) ^ 2) + c * (2.0 * (1.0 - q) * q) + p1 * (q ^ 2));
 		}
 		return line(pts);
 	}
@@ -75,80 +88,154 @@ global {
 			is_outer_road <- kind = "ground";
 			is_signal_connector <- kind = "through" or kind = "left";
 			level_type <- "ground";
-			maxspeed <- (kind = "uturn" ? 10 #km/#h :
-				(kind = "left" or kind = "right" ? 20 #km/#h : 50 #km/#h));
+			maxspeed <- (kind = "left" or kind = "right" ? 20 #km/#h : 50 #km/#h);
 			network_roads[key] <- self;
 		}
 	}
 
 	action init_doan_network {
-		// Retain the four entry and four source indices used by existing controllers.
-		list<string> arms <- ["E", "N", "W", "S"];
-		list<point> vectors <- [{1,0}, {0,-1}, {-1,0}, {0,1}];
-		list<point> sides <- [{0,-2}, {-2,0}, {0,2}, {2,0}];
-		loop i from: 0 to: 3 {
-			do add_doan_node(key: arms[i] + "_IN", pos: intersection_center + vectors[i] * distance_to_intersection_center + sides[i]);
-		}
-		loop i from: 0 to: 3 {
-			do add_doan_node(key: arms[i] + "_SOURCE", pos: intersection_center + vectors[i] * 990.0 + sides[i]);
-		}
-		loop i from: 0 to: 3 {
-			string arm <- arms[i];
-			point outward <- vectors[i];
-			point side <- sides[i];
-			int approach <- i + 4;
-			float portal_distance <- (i = 1 or i = 3) ? 520.0 : 160.0;
-			do add_doan_node(key: arm + "_OUT", pos: intersection_center + outward * distance_to_intersection_center - side);
-			do add_doan_node(key: arm + "_TARGET", pos: intersection_center + outward * 990.0 - side);
-			do add_doan_node(key: arm + "_PORTAL_IN", pos: intersection_center + outward * portal_distance + side);
-			do add_doan_node(key: arm + "_PORTAL_OUT", pos: intersection_center + outward * portal_distance - side);
-			do add_doan_node(key: arm + "_DIV", pos: intersection_center + outward * 80.0 + side);
-			do add_doan_node(key: arm + "_MERGE", pos: intersection_center + outward * 80.0 - side);
-			do add_doan_node(key: arm + "_U_IN", pos: intersection_center + outward * 70.0 + side);
-			do add_doan_node(key: arm + "_U_OUT", pos: intersection_center + outward * 70.0 - side);
-			ground_exits[approach] <- network_nodes[arm + "_TARGET"];
-			ground_exit_entries[approach] <- network_nodes[arm + "_OUT"];
-			ground_diverges[approach] <- network_nodes[arm + "_DIV"];
-			ground_merges[approach] <- network_nodes[arm + "_MERGE"];
-			ground_uturn_entries[approach] <- network_nodes[arm + "_U_IN"];
-			ground_uturn_exits[approach] <- network_nodes[arm + "_U_OUT"];
-			list<string> ins <- ["_SOURCE", "_PORTAL_IN", "_DIV", "_U_IN", "_IN"];
-			list<string> outs <- ["_OUT", "_U_OUT", "_MERGE", "_PORTAL_OUT", "_TARGET"];
-			loop j from: 0 to: 3 {
-				do add_doan_road(key: arm + "_in_" + j, from_key: arm + ins[j], to_key: arm + ins[j + 1],
-					kind: "ground", approach: approach, incoming: true, lanes: nb_lanes, width: lane_width, via: []);
-				do add_doan_road(key: arm + "_out_" + j, from_key: arm + outs[j], to_key: arm + outs[j + 1],
-					kind: "ground", approach: approach, incoming: false, lanes: nb_lanes, width: lane_width, via: []);
-			}
-			// The U-turn is upstream of the stop bar, on the innermost lane.
-			list<point> upts <- [intersection_center + outward * 63.0 + side,
-				intersection_center + outward * 61.0,
-				intersection_center + outward * 63.0 - side];
-			do add_doan_road(key: arm + "_uturn", from_key: arm + "_U_IN", to_key: arm + "_U_OUT",
-				kind: "uturn", approach: approach, incoming: false, lanes: nb_lanes, width: lane_width, via: upts);
-			geometry ucurve <- doan_turn(network_nodes[arm + "_U_IN"].location,
-				network_nodes[arm + "_U_OUT"].location, outward * -1.0, outward, 13.0);
-			ask network_roads[arm + "_uturn"] { shape <- ucurve; }
-		}
-		list<int> straight_ids <- [2,3,0,1];
-		list<int> left_ids <- [3,0,1,2];
-		list<int> right_ids <- [1,2,3,0];
-		loop i from: 0 to: 3 {
-			string arm <- arms[i];
-			do add_doan_road(key: arm + "_through", from_key: arm + "_IN", to_key: arms[straight_ids[i]] + "_OUT",
-				kind: "through", approach: i + 4, incoming: false, lanes: nb_lanes, width: lane_width, via: []);
-			geometry left_curve <- doan_turn(network_nodes[arm + "_IN"].location,
-				network_nodes[arms[left_ids[i]] + "_OUT"].location, vectors[i] * -1.0, vectors[left_ids[i]], 25.0);
-			do add_doan_road(key: arm + "_left", from_key: arm + "_IN", to_key: arms[left_ids[i]] + "_OUT",
-				kind: "left", approach: i + 4, incoming: false, lanes: nb_lanes, width: lane_width, via: []);
-			ask network_roads[arm + "_left"] { shape <- left_curve; }
-			geometry right_curve <- doan_turn(network_nodes[arm + "_DIV"].location,
-				network_nodes[arms[right_ids[i]] + "_MERGE"].location, vectors[i] * -1.0, vectors[right_ids[i]], 45.0);
-			do add_doan_road(key: arm + "_right", from_key: arm + "_DIV", to_key: arms[right_ids[i]] + "_MERGE",
-				kind: "right", approach: i + 4, incoming: false, lanes: nb_lanes, width: lane_width, via: []);
-			ask network_roads[arm + "_right"] { shape <- right_curve; }
+		// Đồng bộ 4 nhánh chuẩn ngã tư Lê Văn Lương - Hoàng Đạo Thúy / Hoàng Minh Giám
+		// SE: Hoàng Đạo Thúy (hướng Nhân Hòa, bearing 128.5°) - Approach 4
+		// NE: Lê Văn Lương (hướng Láng Hạ, bearing 53.4°) - Approach 5
+		// NW: Hoàng Minh Giám (hướng Trung Hòa, bearing 316.4°) - Approach 6
+		// SW: Lê Văn Lương (hướng Khuất Duy Tiến, bearing 232.8°) - Approach 7
+		list<string> arms <- ["SE", "NE", "NW", "SW"];
+		list<string> legacy_arms <- ["E", "N", "W", "S"];
+		list<float> bearings <- [128.5, 53.4, 316.4, 232.8];
+		list<float> s_stops <- [28.5, 19.8, 25.4, 24.9];
+		list<float> s_exits <- [26.5, 17.7, 23.4, 22.9];
+		list<float> tis <- [-4.86, 1.80, 2.70, 5.00];
+		list<float> tos <- [-7.36, -6.00, 0.10, -2.90];
+		list<int> n_ins <- [16, 16, 14, 16];
+		list<int> n_outs <- [11, 15, 12, 15];
+		list<float> w_ins <- [13.5, 13.3, 11.9, 12.8];
+		list<float> w_outs <- [9.2, 12.7, 9.9, 12.4];
+
+		list<point> vectors <- [];
+		list<point> side_vectors <- [];
+		loop b over: bearings {
+			float rad <- b * #pi / 180.0;
+			float ux <- sin(rad);
+			float uy <- -cos(rad);
+			vectors <- vectors + [{ux, uy}];
+			side_vectors <- side_vectors + [{uy, -ux}];
 		}
 
+		// 1. Tạo các nút giao chính cho 4 nhánh theo đúng thứ tự chỉ số intersection
+		// Chỉ số 0..3: 4 nút dừng đèn đỏ (_IN)
+		loop i from: 0 to: 3 {
+			string arm <- arms[i];
+			point u <- vectors[i];
+			point v <- side_vectors[i];
+			point p_in <- intersection_center + u * s_stops[i] + v * tis[i];
+			do add_doan_node(key: arm + "_IN", pos: p_in);
+		}
+		// Chỉ số 4..7: 4 nút nguồn sinh xe (_SOURCE)
+		loop i from: 0 to: 3 {
+			string arm <- arms[i];
+			point u <- vectors[i];
+			point v <- side_vectors[i];
+			point p_src <- intersection_center + u * 990.0 + v * tis[i];
+			do add_doan_node(key: arm + "_SOURCE", pos: p_src);
+		}
+		// Chỉ số 8..11: 4 nút bắt đầu nhánh ra (_OUT)
+		loop i from: 0 to: 3 {
+			string arm <- arms[i];
+			point u <- vectors[i];
+			point v <- side_vectors[i];
+			point p_out <- intersection_center + u * s_exits[i] + v * tos[i];
+			do add_doan_node(key: arm + "_OUT", pos: p_out);
+		}
+		// Chỉ số 12..15: 4 nút đích đến nhánh ra (_TARGET)
+		loop i from: 0 to: 3 {
+			string arm <- arms[i];
+			point u <- vectors[i];
+			point v <- side_vectors[i];
+			point p_tgt <- intersection_center + u * 990.0 + v * tos[i];
+			do add_doan_node(key: arm + "_TARGET", pos: p_tgt);
+		}
+
+		// Thiết lập bí danh, đường vào/ra và các bảng tra cứu
+		loop i from: 0 to: 3 {
+			string arm <- arms[i];
+			string leg <- legacy_arms[i];
+			int approach <- i + 4;
+
+			network_nodes[leg + "_IN"] <- network_nodes[arm + "_IN"];
+			network_nodes[leg + "_SOURCE"] <- network_nodes[arm + "_SOURCE"];
+			network_nodes[leg + "_OUT"] <- network_nodes[arm + "_OUT"];
+			network_nodes[leg + "_TARGET"] <- network_nodes[arm + "_TARGET"];
+			network_nodes[arm + "_DIV"] <- network_nodes[arm + "_IN"];
+			network_nodes[arm + "_MERGE"] <- network_nodes[arm + "_OUT"];
+			network_nodes[leg + "_DIV"] <- network_nodes[arm + "_IN"];
+			network_nodes[leg + "_MERGE"] <- network_nodes[arm + "_OUT"];
+
+			ground_exits[approach] <- network_nodes[arm + "_TARGET"];
+			ground_exit_entries[approach] <- network_nodes[arm + "_OUT"];
+			ground_diverges[approach] <- network_nodes[arm + "_IN"];
+			ground_merges[approach] <- network_nodes[arm + "_OUT"];
+
+			// Đường vào và đường ra (num_lanes và width theo đúng số đo Lê Văn Lương)
+			do add_doan_road(key: arm + "_in", from_key: arm + "_SOURCE", to_key: arm + "_IN",
+				kind: "ground", approach: approach, incoming: true, lanes: n_ins[i], width: lane_width, via: []);
+			do add_doan_road(key: arm + "_out", from_key: arm + "_OUT", to_key: arm + "_TARGET",
+				kind: "ground", approach: approach, incoming: false, lanes: n_outs[i], width: lane_width, via: []);
+
+			network_roads[leg + "_in"] <- network_roads[arm + "_in"];
+			network_roads[leg + "_out"] <- network_roads[arm + "_out"];
+			loop j from: 0 to: 3 {
+				network_roads[arm + "_in_" + j] <- network_roads[arm + "_in"];
+				network_roads[arm + "_out_" + j] <- network_roads[arm + "_out"];
+				network_roads[leg + "_in_" + j] <- network_roads[arm + "_in"];
+				network_roads[leg + "_out_" + j] <- network_roads[arm + "_out"];
+			}
+		}
+
+		// 2. Tạo 12 đoạn nối trong vùng xung đột (trái / thẳng / phải)
+		list<int> straight_ids <- [2, 3, 0, 1]; // SE->NW, NE->SW, NW->SE, SW->NE
+		list<int> left_ids <- [3, 0, 1, 2];     // SE->SW, NE->SE, NW->NE, SW->NW
+		list<int> right_ids <- [1, 2, 3, 0];    // SE->NE, NE->NW, NW->SW, SW->SE
+
+		loop i from: 0 to: 3 {
+			string arm <- arms[i];
+			string leg <- legacy_arms[i];
+			point u_in <- vectors[i];
+			point d0 <- u_in * -1.0; // hướng đi vào tâm giao lộ
+
+			// Đi thẳng (Through)
+			int s_idx <- straight_ids[i];
+			string s_arm <- arms[s_idx];
+			int n_through <- min([n_ins[i], n_outs[s_idx]]);
+			do add_doan_road(key: arm + "_through", from_key: arm + "_IN", to_key: s_arm + "_OUT",
+				kind: "through", approach: i + 4, incoming: false, lanes: n_through, width: lane_width, via: []);
+			geometry s_curve <- doan_connector_curve(network_nodes[arm + "_IN"].location,
+				network_nodes[s_arm + "_OUT"].location, d0, vectors[s_idx]);
+			ask network_roads[arm + "_through"] { shape <- s_curve; }
+			network_roads[leg + "_through"] <- network_roads[arm + "_through"];
+
+			// Rẽ trái (Left)
+			int l_idx <- left_ids[i];
+			string l_arm <- arms[l_idx];
+			int n_left <- min([n_ins[i], n_outs[l_idx]]);
+			do add_doan_road(key: arm + "_left", from_key: arm + "_IN", to_key: l_arm + "_OUT",
+				kind: "left", approach: i + 4, incoming: false, lanes: n_left, width: lane_width, via: []);
+			geometry l_curve <- doan_connector_curve(network_nodes[arm + "_IN"].location,
+				network_nodes[l_arm + "_OUT"].location, d0, vectors[l_idx]);
+			ask network_roads[arm + "_left"] { shape <- l_curve; }
+			network_roads[leg + "_left"] <- network_roads[arm + "_left"];
+
+			// Rẽ phải (Right): Bắt đầu từ vạch dừng _IN vào đầu nhánh ra _OUT, bo cua theo mép bó vỉa
+			// không vẽ tách nhánh riêng bên ngoài giao lộ
+			int r_idx <- right_ids[i];
+			string r_arm <- arms[r_idx];
+			int n_right <- min([n_ins[i], n_outs[r_idx]]);
+			do add_doan_road(key: arm + "_right", from_key: arm + "_IN", to_key: r_arm + "_OUT",
+				kind: "right", approach: i + 4, incoming: false, lanes: n_right, width: lane_width, via: []);
+			geometry r_curve <- doan_connector_curve(network_nodes[arm + "_IN"].location,
+				network_nodes[r_arm + "_OUT"].location, d0, vectors[r_idx]);
+			ask network_roads[arm + "_right"] { shape <- r_curve; }
+			network_roads[leg + "_right"] <- network_roads[arm + "_right"];
+		}
 	}
 
 	// Batch experiments replace the built-in seed after init. Apply an ordinary
@@ -200,11 +287,11 @@ global {
 	graph road_network;
 
 	point intersection_center <- {1000,1000};
-	float distance_to_intersection_center <- 40.5 #m;
-	// Painted stop bars are 45 m from the centre; signal nodes are 40.5 m out.
-	float signal_node_to_stop_bar <- 4.5 #m;
-	float stop_bar_clearance <- 2.0 #m;
-	float road_length <- 949.5 #m;
+	float distance_to_intersection_center <- 25.0 #m;
+	// Painted stop bars are ~25 m from the centre; signal nodes are placed at the stop bars.
+	float signal_node_to_stop_bar <- 2.0 #m;
+	float stop_bar_clearance <- 1.5 #m;
+	float road_length <- 990.0 #m;
 
 	list<intersection> intersection_target_list;
 	geometry shape <- envelope(2000);
@@ -381,52 +468,38 @@ global {
 				do configure_vehicle(car_only: false);
 
 				location <- start_inter.location;
-				if (start_inter = intersection(5)) { heading <- 90.0; }
-				else if (start_inter = intersection(7)) { heading <- 270.0; }
-				else if (start_inter = intersection(4)) { heading <- 180.0; }
-				else { heading <- 0.0; }
-				approach_id <- start_inter = intersection(5) ? 5 :
-					(start_inter = intersection(7) ? 7 : (start_inter = intersection(4) ? 4 : 6));
+				if (start_inter.node_key in ["NE_SOURCE", "N_SOURCE"]) { heading <- 143.4; approach_id <- 5; }
+				else if (start_inter.node_key in ["SW_SOURCE", "S_SOURCE"]) { heading <- 322.8; approach_id <- 7; }
+				else if (start_inter.node_key in ["SE_SOURCE", "E_SOURCE"]) { heading <- 218.5; approach_id <- 4; }
+				else { heading <- 46.4; approach_id <- 6; }
 				approach_ns <- approach_id = 5 or approach_id = 7;
 				int straight_id <- approach_id = 5 ? 7 : (approach_id = 7 ? 5 : (approach_id = 4 ? 6 : 4));
 				int left_id <- approach_id = 5 ? 4 : (approach_id = 7 ? 6 : (approach_id = 4 ? 7 : 5));
 				int right_id <- approach_id = 5 ? 6 : (approach_id = 7 ? 4 : (approach_id = 4 ? 5 : 7));
 				float choice <- replay_demand or vehicle_type = "bus" ? 2.0 : rnd(1.0);
-				maneuver <- choice < left_turn_share ? "left" : "straight";
-				if (maneuver != "left" and vehicle_type != "bus") {
-					if (choice < left_turn_share + right_turn_share) { maneuver <- "right"; }
-					else if (choice < left_turn_share + right_turn_share + uturn_share) { maneuver <- "uturn"; }
-				}
-				if (replay_demand) { maneuver <- ["straight", "left", "right", "uturn"][replay_maneuver]; }
-				destination_approach <- maneuver = "left" ? left_id : (maneuver = "right" ? right_id :
-					(maneuver = "uturn" ? approach_id : straight_id));
+				maneuver <- choice < left_turn_share ? "left" : (choice < left_turn_share + right_turn_share ? "right" : "straight");
+				if (replay_demand) { maneuver <- ["straight", "left", "right"][min([2, replay_maneuver])]; }
+				destination_approach <- maneuver = "left" ? left_id : (maneuver = "right" ? right_id : straight_id);
 				target <- ground_exits[destination_approach];
 				uses_signal <- maneuver = "straight" or maneuver = "left";
 				intersection entry_node <- intersection(approach_id - 4);
 				intersection exit_node <- ground_exit_entries[destination_approach];
 				list<intersection> waypoints <- [start_inter, entry_node, exit_node, target];
-				if (maneuver = "right") {
-					waypoints <- [start_inter, ground_diverges[approach_id], ground_merges[destination_approach], target];
-				} else if (maneuver = "uturn") {
-					waypoints <- [start_inter, ground_uturn_entries[approach_id], ground_uturn_exits[approach_id], target];
-				}
 				do compute_path graph: road_network nodes: waypoints;
 				if (final_target = nil) { failed_route_count <- failed_route_count + 1; }
 				if (maneuver = "left") { left_turn_selected_count <- left_turn_selected_count + 1; }
-					if (maneuver = "left") {
-						lowest_lane <- 12;
-						allowed_lanes <- [12];
-					} else if (maneuver = "uturn") {
-						// The U-turn pocket stays beside the median; left turns use
-						// the next lane outward so the two paths never cross.
-						lowest_lane <- 14;
-						allowed_lanes <- [14];
-					} else if (maneuver = "right") {
-						lowest_lane <- 0; allowed_lanes <- vehicle_type = "motorcycle" ? [0,1,2,3] : [0,1,2];
-					} else {
-						lowest_lane <- replay_demand ? replay_lane : (vehicle_type = "motorcycle" ? rnd(4,11) : (vehicle_type = "bus" ? 8 : one_of([4,8])));
-						allowed_lanes <- vehicle_type = "motorcycle" ? [4,5,6,7,8,9,10,11] : (vehicle_type = "bus" ? [8] : [4,5,6,7,8,9,10]);
-					}
+				int n_lanes <- road(current_road) != nil ? road(current_road).num_lanes : 16;
+				if (maneuver = "left") {
+					lowest_lane <- n_lanes - 4;
+					allowed_lanes <- [n_lanes - 4, n_lanes - 3, n_lanes - 2];
+				} else if (maneuver = "right") {
+					lowest_lane <- 0;
+					allowed_lanes <- vehicle_type = "motorcycle" ? [0, 1, 2, 3] : [0, 1, 2];
+				} else {
+					lowest_lane <- replay_demand ? min([n_lanes - 2, replay_lane]) :
+						(vehicle_type = "motorcycle" ? rnd(3, n_lanes - 5) : (vehicle_type = "bus" ? min([6, n_lanes - 4]) : one_of([4, 6])));
+					allowed_lanes <- vehicle_type = "motorcycle" ? range(3, n_lanes - 4) : [4, 5, 6, 7];
+				}
 				base_allowed_lanes <- allowed_lanes;
 				// Draw the vehicle in its actual starting lane on its first step.
 				if (current_road != nil) {
@@ -570,13 +643,13 @@ global {
 	}
 
 	reflex spawn_traffic_ns when: !replay_demand and enable_ground_traffic and every(spawn_rate_NS #cycle) {
-		loop start_inter over: [network_nodes["N_SOURCE"], network_nodes["S_SOURCE"]] {
+		loop start_inter over: [network_nodes["NE_SOURCE"], network_nodes["SW_SOURCE"]] {
 			do spawn_vehicle_at(start_inter);
 		}
 	}
 
 	reflex spawn_traffic_ew when: !replay_demand and enable_ground_traffic and every(spawn_rate_EW #cycle) {
-		loop start_inter over: [network_nodes["E_SOURCE"], network_nodes["W_SOURCE"]] {
+		loop start_inter over: [network_nodes["SE_SOURCE"], network_nodes["NW_SOURCE"]] {
 			do spawn_vehicle_at(start_inter);
 		}
 	}
@@ -586,24 +659,20 @@ global {
 		road_network <- as_driving_graph(road, intersection);
 		ask intersection {
 			priority_roads <- roads_in where (road(each).road_kind = "ground");
-			managed_merge <- (length(roads_in) > 1 or length(roads_out) > 1) and
-				!empty((roads_in + roads_out) where (road(each).road_kind = "right" or road(each).road_kind = "uturn"));
-			merge_clearance <- !empty((roads_in + roads_out) where
-				(road(each).road_kind = "uturn" or road(each).road_kind = "right")) ? 18.0 : 8.0;
-		}
-		// Divergences have no crossing traffic to reserve. Holding a slot here
-		// made vehicles stop far upstream of the signal, including U-turns.
-		loop arm over: ["E", "N", "W", "S"] {
-			ask network_nodes[arm + "_U_IN"] { managed_merge <- false; }
-			ask network_nodes[arm + "_DIV"] { managed_merge <- false; }
+			managed_merge <- false;
+			merge_clearance <- 8.0;
 		}
 		intersection_target_list <- ground_exits.values;
 
-		// 4. Cau hinh den tin hieu tai 4 nut giao vao (p1..p4)
-		ask intersection(0) { is_traffic_signal <- true; direction_type <- 1; do init_signal; } // East (p1)
-		ask intersection(1) { is_traffic_signal <- true; direction_type <- 0; do init_signal; } // North (p2)
-		ask intersection(2) { is_traffic_signal <- true; direction_type <- 1; do init_signal; } // West (p3)
-		ask intersection(3) { is_traffic_signal <- true; direction_type <- 0; do init_signal; } // South (p4)
+		// 4. Cấu hình đèn tín hiệu tại 4 nút giao vào (SE, NE, NW, SW)
+		// intersection(0): SE (direction_type: 1 - trục HDT/HMG)
+		// intersection(1): NE (direction_type: 0 - trục LVL)
+		// intersection(2): NW (direction_type: 1 - trục HDT/HMG)
+		// intersection(3): SW (direction_type: 0 - trục LVL)
+		ask intersection(0) { is_traffic_signal <- true; direction_type <- 1; do init_signal; }
+		ask intersection(1) { is_traffic_signal <- true; direction_type <- 0; do init_signal; }
+		ask intersection(2) { is_traffic_signal <- true; direction_type <- 1; do init_signal; }
+		ask intersection(3) { is_traffic_signal <- true; direction_type <- 0; do init_signal; }
 
 		// 5. Khoi tao 4 o xung dot trung tam cho PET sensor
 		if (!fast_training or enable_surrogate_safety) { do init_conflict_zones; }
@@ -1160,11 +1229,10 @@ species base_vehicle_species skills: [driving] parallel: false {
 		if (!uses_signal) {
 			max_speed <- original_max_speed;
 			proba_respect_stops <- [0.0,0.0];
-			if (maneuver = "right" or maneuver = "uturn") {
-				float cap <- maneuver = "uturn" ? 8 #km/#h : 15 #km/#h;
-				float to_turn <- max([0.0, distance_to(location, intersection_center) - (maneuver = "uturn" ? 70.0 : 80.0)]);
-				float turn_decel <- maneuver = "uturn" ? 0.35 * max_deceleration : max_deceleration;
-				max_speed <- min([max_speed, sqrt(cap * cap + 2.0 * turn_decel * to_turn)]);
+			if (maneuver = "right") {
+				float cap <- 20 #km/#h;
+				float to_turn <- max([0.0, distance_to(location, intersection_center) - distance_to_intersection_center]);
+				max_speed <- min([max_speed, sqrt(cap * cap + 2.0 * max_deceleration * to_turn)]);
 			}
 			return;
 		}
@@ -1275,8 +1343,7 @@ species base_vehicle_species skills: [driving] parallel: false {
 	// maxspeed at the edge boundary; anticipating it avoids an instantaneous drop.
 	reflex anticipate_speed_limit when: final_target != nil and current_road != nil and next_road != nil {
 		float next_limit <- road(next_road).maxspeed;
-		float usable <- road(next_road).road_kind = "uturn" ? distance_to_current_target :
-			max([0.0, distance_to_current_target - vehicle_length / 2.0 - min_safety_distance - 5.0]);
+		float usable <- max([0.0, distance_to_current_target - vehicle_length / 2.0 - min_safety_distance - 5.0]);
 		max_speed <- min([max_speed, sqrt(next_limit * next_limit + 2.0 * max_deceleration * usable)]);
 	}
 
@@ -1298,11 +1365,6 @@ species base_vehicle_species skills: [driving] parallel: false {
 			float cap <- nearest_gap <= 0.0 ? 0.01 #km/#h :
 				min([sqrt(leader_speed * leader_speed + 1.2 * max_deceleration * nearest_gap),
 					leader_speed + nearest_gap / (2.5 #s)]);
-			if (maneuver = "uturn" and next_road != nil and
-				road(next_road).shape.perimeter < 30.0 #m and
-				nearest_gap < 8.0 #m) {
-				cap <- min([cap, nearest_gap / (4.0 #s)]);
-			}
 			float decel_allowance <- 2.0 * max_deceleration * step;
 			max_speed <- min([max_speed, max([cap, measured_speed - decel_allowance])]);
 		}
@@ -1341,12 +1403,6 @@ species base_vehicle_species skills: [driving] parallel: false {
 			float cap <- nearest_gap <= 0.0 ? 0.01 #km/#h :
 				min([sqrt(leader_speed * leader_speed + 1.2 * max_deceleration * nearest_gap),
 					leader_speed + nearest_gap / (2.5 #s)]);
-			// A leader on a short next edge can stop before DrivingSkill's
-			// connector transition sees it. Keep a small absolute headway speed
-			// close to that edge, even while the leader is still moving.
-			if (maneuver = "uturn" and road(next_road).shape.perimeter < 30.0 #m and nearest_gap < 8.0 #m) {
-				cap <- min([cap, nearest_gap / (4.0 #s)]);
-			}
 			float decel_allowance <- 2.0 * max_deceleration * step;
 			max_speed <- min([max_speed, max([cap, measured_speed - decel_allowance])]);
 		}
@@ -1354,19 +1410,13 @@ species base_vehicle_species skills: [driving] parallel: false {
 
 	reflex yield_at_merge when: final_target != nil and current_road != nil and current_target != nil {
 		intersection merge <- intersection(current_target);
-		bool through_uturn_exit <- maneuver != "uturn" and
-			(merge.node_key = "E_U_OUT" or merge.node_key = "N_U_OUT" or
-			 merge.node_key = "W_U_OUT" or merge.node_key = "S_U_OUT");
-		if (merge.managed_merge and !through_uturn_exit) {
+		if (merge.managed_merge) {
 			// The explicit reservation replaces the skill's lane-blind right-of-way
 			// check here. Stops at signal nodes still use the existing controller.
 			proba_respect_priorities <- 0.0;
 			if (!(merge.merge_owners contains self)) {
 				float usable <- max([0.0,distance_to_current_target - merge.merge_clearance - vehicle_length / 2.0 - min_safety_distance - 4.0]);
 				float cap <- max([0.01 #km/#h,sqrt(2.0 * max_deceleration * usable)]);
-				// Once the stopping margin is used up, the IDM free-flow term
-				// lets a long queue creep into the portal over thousands of cycles.
-				// Keep GAMA's tiny nonzero speed floor to avoid a zero-speed NaN.
 				max_speed <- min([max_speed,usable <= 0.0 ?
 					max([0.01 #km/#h,measured_speed - max_deceleration * step]) :
 					max([cap,measured_speed - max_deceleration * step,
@@ -1380,10 +1430,7 @@ species base_vehicle_species skills: [driving] parallel: false {
 		}
 		if (next_road != nil) {
 			intersection ahead <- intersection(road(next_road).target_node);
-			bool through_ahead <- maneuver != "uturn" and
-				(ahead.node_key = "E_U_OUT" or ahead.node_key = "N_U_OUT" or
-				 ahead.node_key = "W_U_OUT" or ahead.node_key = "S_U_OUT");
-			if (ahead.managed_merge and !through_ahead and !(ahead.merge_owners contains self)) {
+			if (ahead.managed_merge and !(ahead.merge_owners contains self)) {
 				float usable <- max([0.0,distance_to_current_target + road(next_road).shape.perimeter - ahead.merge_clearance - vehicle_length / 2.0 - min_safety_distance - 4.0]);
 				float cap <- max([0.01 #km/#h,sqrt(2.0 * max_deceleration * usable)]);
 				max_speed <- min([max_speed,usable <= 0.0 ?
@@ -1419,10 +1466,7 @@ species base_vehicle_species skills: [driving] parallel: false {
 	bool test_next_road(agent new_road) {
 		if (current_target != nil) {
 			intersection node <- intersection(current_target);
-			bool through_uturn_exit <- maneuver != "uturn" and
-				(node.node_key = "E_U_OUT" or node.node_key = "N_U_OUT" or
-				 node.node_key = "W_U_OUT" or node.node_key = "S_U_OUT");
-			if (node.managed_merge and !through_uturn_exit and !(node.merge_owners contains self)) { return false; }
+			if (node.managed_merge and !(node.merge_owners contains self)) { return false; }
 		}
 		if (new_road != nil) {
 			road upcoming <- road(new_road);
@@ -1439,11 +1483,8 @@ species base_vehicle_species skills: [driving] parallel: false {
 				if (!permitted and !committed_crossing) { return false; }
 			}
 			intersection ahead <- intersection(upcoming.target_node);
-			bool through_ahead <- maneuver != "uturn" and
-				(ahead.node_key = "E_U_OUT" or ahead.node_key = "N_U_OUT" or
-				 ahead.node_key = "W_U_OUT" or ahead.node_key = "S_U_OUT");
 			float stop_margin <- ahead.merge_clearance + vehicle_length / 2.0 + min_safety_distance + 4.0 #m;
-			if (ahead.managed_merge and !through_ahead and upcoming.shape.perimeter < stop_margin and
+			if (ahead.managed_merge and upcoming.shape.perimeter < stop_margin and
 				!(ahead.merge_owners contains self)) { return false; }
 		}
 		return true;
@@ -1563,10 +1604,7 @@ species base_vehicle_species skills: [driving] parallel: false {
 		// Prevent IDM free-flow creep from drifting into a converging merge while waiting for a reservation
 		if (current_target != nil) {
 			intersection merge_node <- intersection(current_target);
-			bool through_uturn_exit <- maneuver != "uturn" and
-				(merge_node.node_key = "E_U_OUT" or merge_node.node_key = "N_U_OUT" or
-				 merge_node.node_key = "W_U_OUT" or merge_node.node_key = "S_U_OUT");
-			if (merge_node.managed_merge and !through_uturn_exit and !(merge_node.merge_owners contains self)) {
+			if (merge_node.managed_merge and !(merge_node.merge_owners contains self)) {
 				float merge_usable <- distance_to_current_target - merge_node.merge_clearance -
 					vehicle_length / 2.0 - min_safety_distance - 2.0 #m;
 				if (merge_usable <= 0.0 #m and measured_speed < 1.5 #km/#h) {
@@ -1578,10 +1616,7 @@ species base_vehicle_species skills: [driving] parallel: false {
 		}
 		if (next_road != nil) {
 			intersection ahead_node <- intersection(road(next_road).target_node);
-			bool through_ahead <- maneuver != "uturn" and
-				(ahead_node.node_key = "E_U_OUT" or ahead_node.node_key = "N_U_OUT" or
-				 ahead_node.node_key = "W_U_OUT" or ahead_node.node_key = "S_U_OUT");
-			if (ahead_node.managed_merge and !through_ahead and !(ahead_node.merge_owners contains self)) {
+			if (ahead_node.managed_merge and !(ahead_node.merge_owners contains self)) {
 				float ahead_usable <- distance_to_current_target + road(next_road).shape.perimeter -
 					ahead_node.merge_clearance - vehicle_length / 2.0 - min_safety_distance - 2.0 #m;
 				if (ahead_usable <= 0.0 #m and measured_speed < 1.5 #km/#h) {
@@ -1611,7 +1646,6 @@ species base_vehicle_species skills: [driving] parallel: false {
 		if (final_target = nil) {
 			if (maneuver = "left") { left_turn_completed_count <- left_turn_completed_count + 1; }
 			if (maneuver = "right") { right_turn_completed_count <- right_turn_completed_count + 1; }
-			if (maneuver = "uturn") { uturn_completed_count <- uturn_completed_count + 1; }
 			total_vehicles_passed <- total_vehicles_passed + 1;
 			total_travel_time_sum <- total_travel_time_sum + (time - spawn_time);
 			average_travel_time <- total_travel_time_sum / total_vehicles_passed;
