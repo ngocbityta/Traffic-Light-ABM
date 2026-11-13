@@ -75,7 +75,7 @@ class JunctionIntegrationTests(unittest.TestCase):
         self.assertTrue(sim._conflict_map.intervals("NE_SW", "NE_SW"))
 
     def test_train_action_switch_keeps_committed_connector_reserved_on_all_red(self):
-        sim = self.make_sim(train_mode=True)
+        sim = self.make_sim(train_mode=True, junction_model="reservation")
         inside = self.create(sim, "NE", "through")
         inside.road = "NE_SW"
         inside.position = inside.approach_end + 5.0
@@ -115,7 +115,7 @@ class JunctionIntegrationTests(unittest.TestCase):
             for v in sim.vehicles:
                 if (v.road == f"{v.arm}_in" and v.junction_entry_token and
                         v.position <= sim._stop_position(v) + 1e-8):
-                    self.assertTrue(sim._arm_is_green(v.arm),
+                    self.assertTrue(sim._green_for(v),
                                     (sim.cycle, sim.phase, v.arm, v.creation_id))
 
 

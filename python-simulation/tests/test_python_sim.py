@@ -150,9 +150,8 @@ class LeVanLuongTests(unittest.TestCase):
                 if not green:
                     if vehicle.position > sim._stop_position(vehicle) + 1e-8:
                         # Entered on yellow (go decision) and still clearing
-                        # into the next phase: it must keep moving.
+                        # into the next phase: preserve its entry commitment.
                         self.assertTrue(vehicle.junction_entry_token)
-                        self.assertGreater(vehicle.speed, 0.0)
                         continue
                     self.assertLessEqual(vehicle.position + vehicle.length / 2 + 0.5,
                                          vehicle.approach_end + 1e-8)
@@ -321,7 +320,8 @@ class LeVanLuongTests(unittest.TestCase):
         self.assertGreaterEqual(vehicle.speed, 0.0)
 
     def test_high_flow_red_phase_holds_uncommitted_vehicles_and_clears_committed(self):
-        sim = LeVanLuongSimulator(seed=42, flow_per_approach=10000)
+        sim = LeVanLuongSimulator(seed=42, flow_per_approach=10000,
+                                 junction_model="reservation")
         committed_on_green = set()
         for _ in range(500):
             sim.step()
@@ -392,11 +392,13 @@ class LeVanLuongTests(unittest.TestCase):
         self.assertTrue(sim.dqn_waiting_action)
         self.assertEqual(sim.cycle, 50)
         sim.set_action(2)
-        sim.step(14)
+        sim.step(9)
+        self.assertEqual(sim.phase, "none")
+        sim.step(1)
         self.assertEqual(sim.phase, "none")
         sim.step(1)
         self.assertEqual(sim.phase, "HDT")
-        sim.step(35)
+        sim.step(39)
         self.assertTrue(sim.dqn_waiting_action)
         self.assertEqual(sim.cycle, 100)
 

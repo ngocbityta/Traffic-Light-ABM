@@ -39,6 +39,7 @@ from .lvl_env import LVLGamaEnv, LVLPythonEnv
 from .server_manager import GamaServerManager
 from .demand import generate_demand, demand_parameters
 from python_simulation.demand import generate_demand as generate_lvl_demand
+from python_simulation.sim_config import load_sim_config
 from python_simulation.demand import demand_parameters as lvl_demand_parameters
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -99,6 +100,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="Evaluate trained DQN traffic controller")
     p.add_argument("--weights", type=str, required=True,
                    help="File dqn_weights.pt / best_weights.pt tu train.py")
+    p.add_argument("--sim-config", type=str, default=None,
+                   help="Override saved Python simulator configuration")
     p.add_argument("--scenario", choices=("lvl", "legacy"), default="lvl")
     p.add_argument("--episodes", type=int, default=1)
     p.add_argument("--episode-horizon", type=int, default=8000)
@@ -141,7 +144,8 @@ async def amain(args):
                                    "training_summary.json")
         if os.path.exists(run_summary):
             with open(run_summary) as summary_file:
-                trained_scenario = json.load(summary_file).get("scenario", "legacy")
+                training_summary = json.load(summary_file)
+                trained_scenario = training_summary.get("scenario", "legacy")
             if trained_scenario != args.scenario:
                 raise ValueError(f"Checkpoint belongs to scenario {trained_scenario}, "
                                  f"but evaluation requested {args.scenario}")
@@ -160,7 +164,18 @@ async def amain(args):
                              experiment=args.experiment,
                              reward_mode=checkpoint.get("reward_mode", "reference"),
                              state_mode="spatial" if is_spatial else "dtse",
+                             **({"python_sim_mode": training_summary.get("python_sim_mode", "safe")
+                                if os.path.exists(run_summary) else "safe",
+                                "sim_config": load_sim_config(args.sim_config) if args.sim_config else
+                                training_summary.get("training_config", {}).get("simulation_config")
+                                if os.path.exists(run_summary) else None}
+                               if args.scenario == "lvl" and args.backend == "python" else {}),
                              **reward_options)
+        if args.scenario == "lvl" and args.backend == "python":
+            os.makedirs(output_dir, exist_ok=True)
+            with open(args.output + ".sim_config.json", "w") as config_file:
+                json.dump({"python_sim_mode": env.python_sim_mode,
+                           "simulation_config": env.sim_config}, config_file, indent=2)
         await env.setup()
         if args.backend == "python":
             print("[Eval] Python movement is approximate; compare metrics with GAMA before scientific use")

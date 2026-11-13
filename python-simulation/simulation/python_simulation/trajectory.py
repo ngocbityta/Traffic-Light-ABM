@@ -27,7 +27,7 @@ except ImportError:  # flat import
     from python_sim import ARMS, DT
 
 FLOAT_COLUMNS = ("progress", "shift", "x", "y", "heading", "speed", "accel",
-                 "length", "half_width")
+                 "length", "half_width", "sample_dt")
 INT_COLUMNS = ("cycle", "vid", "road", "is_car", "movement", "arm", "maneuver")
 MANEUVERS = ("left", "right", "through")
 PHASES = ("LVL", "HDT", "none")
@@ -74,18 +74,27 @@ class TrajectoryRecorder:
         self._ticks = {"tick_cycle": _Column(np.int64), "tick_phase": _Column(np.int64),
                        "tick_yellow": _Column(np.int64)}
         self._last_speed = {}
+        self._last_cycle = {}
+        self._last_record_cycle = sim.cycle
 
     def record(self):
         sim = self.sim
         rows = {name: [] for name in FLOAT_COLUMNS + INT_COLUMNS}
         last_speed = {}
+        last_cycle = {}
+        interval = max(1, sim.cycle - self._last_record_cycle) * DT
         for v in sim.vehicles:
             road, progress = sim._road_state(v)
             geometry = sim._geometry_roads[road]
             pose = geometry.pose(progress, v.current_lateral_shift)
             previous = self._last_speed.get(v.creation_id)
-            accel = 0.0 if previous is None else (v.speed - previous) / DT
+            previous_cycle = self._last_cycle.get(v.creation_id)
+            elapsed = ((sim.cycle - previous_cycle) * DT
+                       if previous_cycle is not None else interval)
+            accel = (0.0 if previous is None or elapsed <= 0.0 else
+                     (v.speed - previous) / elapsed)
             last_speed[v.creation_id] = v.speed
+            last_cycle[v.creation_id] = sim.cycle
             on_connector = road == f"{v.arm}_{v.to_arm}"
             movement = (self._movement_code.get(sim._lane_movement_id(v, on_connector=True), -1)
                         if on_connector else -1)
@@ -96,6 +105,9 @@ class TrajectoryRecorder:
             rows["heading"].append(pose.heading)
             rows["speed"].append(v.speed)
             rows["accel"].append(accel)
+            rows["sample_dt"].append(min(interval,
+                max(DT, (sim.cycle - v.created_cycle + 1) * DT))
+                if previous is None else elapsed)
             rows["length"].append(v.length)
             rows["half_width"].append(sim._half_width(v))
             rows["cycle"].append(sim.cycle)
@@ -106,6 +118,8 @@ class TrajectoryRecorder:
             rows["arm"].append(ARMS.index(v.arm))
             rows["maneuver"].append(MANEUVERS.index(v.maneuver))
         self._last_speed = last_speed
+        self._last_cycle = last_cycle
+        self._last_record_cycle = sim.cycle
         for name in FLOAT_COLUMNS:
             self._float[name].extend(rows[name])
         for name in INT_COLUMNS:

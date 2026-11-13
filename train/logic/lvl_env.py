@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "python-simulation" / "simulation"))
 from python_simulation.python_sim import ARMS, DT, LeVanLuongSimulator, road_lengths
+from python_simulation.sim_config import load_sim_config
 
 MODEL = ROOT / "gama-simulation/simulation/models/LeVanLuong.gaml"
 ROADS = road_lengths()
@@ -160,7 +161,7 @@ class LVLGamaEnv(_LVLCommon, GamaTrafficEnv):
 class LVLPythonEnv(_LVLCommon, GamaTrafficEnv):
     PYTHON_SIM_MODES = ("safe", "gama_2025_6_4")
 
-    def __init__(self, python_sim_mode="safe", **kwargs):
+    def __init__(self, python_sim_mode="safe", sim_config=None, **kwargs):
         if python_sim_mode not in self.PYTHON_SIM_MODES:
             raise ValueError(
                 f"Unknown Python simulator mode: {python_sim_mode!r}; "
@@ -168,6 +169,7 @@ class LVLPythonEnv(_LVLCommon, GamaTrafficEnv):
         kwargs["model_path"] = kwargs.get("model_path") or str(MODEL)
         super().__init__(**kwargs)
         self.python_sim_mode = python_sim_mode
+        self.sim_config = load_sim_config(config=sim_config)
         self.sim = None
 
     async def setup(self):
@@ -182,7 +184,8 @@ class LVLPythonEnv(_LVLCommon, GamaTrafficEnv):
         if not demand:
             raise ValueError("Le Van Luong training requires a paired demand CSV")
         self.sim = LeVanLuongSimulator(seed=1 if seed is None else seed, demand_file=demand,
-                                      train_mode=True, mode=self.python_sim_mode)
+                                      train_mode=True, mode=self.python_sim_mode,
+                                      **self.sim_config)
         return await self.read_state()
 
     async def read_state(self, force_dtse=False):

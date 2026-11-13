@@ -18,14 +18,16 @@ sys.path.insert(0, str(PYTHON_SIM_ROOT))
 
 from python_simulation.demand import generate_demand
 from python_simulation.python_sim import LeVanLuongSimulator
+from python_simulation.sim_config import load_sim_config
 from python_simulation.vehicle_geometry import SUBLANE_WIDTH
 
 
 class Observer:
-    def __init__(self, seed=1, mode="fixed", junction_model="negotiation",
+    def __init__(self, seed=1, mode="fixed", junction_model=None,
                  sim_kwargs=None):
-        self.junction_model = junction_model
-        self.sim_kwargs = dict(sim_kwargs or {})
+        self.sim_kwargs = load_sim_config(config=sim_kwargs)
+        configured_junction = self.sim_kwargs.pop("junction_model")
+        self.junction_model = junction_model or configured_junction
         self.lock = threading.RLock()
         self.seed = seed
         self._demand_path = None
@@ -54,6 +56,8 @@ class Observer:
         result = self.sim.snapshot()
         result["mode"] = self.mode
         result["junction_model"] = self.junction_model
+        result["simulation_config"] = {"junction_model": self.junction_model,
+                                       **self.sim_kwargs}
         vehicles = []
         for vehicle in self.sim.vehicles:
             road, progress = self.sim._road_state(vehicle)
@@ -217,22 +221,29 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--junction-model", choices=("negotiation", "reservation"),
-                        default="negotiation",
+                        default=None,
                         help="negotiation: vehicles enter, creep and weave (default); "
                              "reservation: the older ConflictEngine time-window arbiter")
     parser.add_argument("--startup-reaction", type=float, default=None,
                         help="max reaction delay (s) of a stopped queue at green onset")
     parser.add_argument("--startup-headway", type=float, default=None,
                         help="release headway (s) between queued vehicles in one sublane")
+    parser.add_argument("--sim-config", type=Path,
+                        help="Shared simulator JSON or calibrate_discharge output")
     args = parser.parse_args()
-    startup = {}
+    simulation = load_sim_config(args.sim_config)
+    if args.junction_model:
+        simulation["junction_model"] = args.junction_model
+    startup = dict(simulation.get("startup_params", {}))
     if args.startup_reaction is not None:
         startup["reaction_delay"] = args.startup_reaction
     if args.startup_headway is not None:
         startup["discharge_headway"] = args.startup_headway
-    observer = Observer(args.seed, junction_model=args.junction_model,
-                        sim_kwargs={"startup_params": startup} if startup else None)
-    print(f"Junction model: {args.junction_model}")
+    simulation["startup_params"] = startup
+    junction_model = simulation.pop("junction_model")
+    observer = Observer(args.seed, junction_model=junction_model,
+                        sim_kwargs=simulation)
+    print(f"Junction model: {junction_model}")
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(observer))
     print(f"LVL observer listening at http://127.0.0.1:{args.port}/")
     try:

@@ -24,6 +24,33 @@ và GeoJSON nằm trong `scripts/`.
 
 Các kiểm thử Python được đặt trong `tests/`.
 
+## Cấu hình dùng chung cho UI và train
+
+Mô phỏng Python mặc định dùng `junction_model="negotiation"`. Có thể dùng cùng
+một file JSON cho giao diện và huấn luyện:
+
+```json
+{
+  "junction_model": "negotiation",
+  "yellow": 4.0,
+  "all_red": 2.0,
+  "vehicle_params": {"motorbike": {"headway": 0.75}},
+  "startup_params": {"reaction_delay": 0.7}
+}
+```
+
+Truyền `--sim-config config.json` cho `scripts/lvl_observer_server.py` và
+`python -m train.logic.train`. Cũng có thể truyền trực tiếp JSON kết quả của
+`calibrate_discharge.py` (trường `kwargs`). Training lưu cấu hình đã áp dụng
+trong `training_config.json` và `training_summary.json`; evaluate đọc lại từ
+summary, hoặc nhận `--sim-config` để ghi đè. Evaluate ghi cấu hình thực dùng
+ra file `<output>.sim_config.json`; file này có thể nạp lại bằng `--sim-config`.
+
+Trong chế độ `safe`, xe rẽ phải được đi khi đèn đỏ nhưng phải được cấp quyền
+vào nút và nhường xe đi thẳng tại vùng nhập làn. Bộ đếm
+`permitted_right_on_red_entries` tách các lượt rẽ phải hợp lệ khỏi
+`entries_during_red`.
+
 ## Hàng chờ và chọn làn
 
 Xe đi thẳng có thể xuất hiện ở bất kỳ sublane hợp lệ nào trên đường vào,
@@ -58,6 +85,7 @@ U = 4,518 + 0,106·v[m/s] − 0,083·x[m] − 1,068·ô tô − 0,923·làn gi�
 1,049·làn sát dải phân cách. Xe không thể dừng với gia tốc ≤ 6 m/s² luôn đi.
 Quyết định "đi" còn hiệu lực trong đỏ toàn phần và hết hiệu lực khi pha kế
 tiếp xanh. Số liệu Ấn Độ; việc áp dụng cho Hà Nội là giả định.
+Xe ở quá xa để tới nút trước pha xanh đối hướng phải chọn dừng.
 
 ## Tham số hành vi và hiệu chỉnh
 

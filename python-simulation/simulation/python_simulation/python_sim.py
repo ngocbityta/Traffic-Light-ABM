@@ -47,10 +47,12 @@ try:
     from .junction_conflicts import (ConflictEngine, ConflictMap, Movement,
                                     MovementRequest)
     from .junction_negotiation import SimulatorAdapter
+    from .vehicle_geometry import footprint as body_polygon, polygons_overlap
 except ImportError:
     from vehicle_geometry import Road as GeometryRoad, SUBLANE_WIDTH
     from junction_conflicts import ConflictEngine, ConflictMap, Movement, MovementRequest
     from junction_negotiation import SimulatorAdapter
+    from vehicle_geometry import footprint as body_polygon, polygons_overlap
 
 
 ROOT = Path(__file__).resolve().parent
@@ -317,7 +319,7 @@ class LeVanLuongSimulator:
                  roads_path=ROOT / "includes" / "roads.geojson",
                  demand_file=None, train_mode=False, mode="safe", yellow=4.0,
                  vehicle_params=None, startup_params=None,
-                 junction_model="reservation", negotiation_params=None):
+                 junction_model="negotiation", negotiation_params=None):
         if mode not in ("safe", "gama_2025_6_4"):
             raise ValueError("mode must be 'safe' or 'gama_2025_6_4'")
         self.mode = mode
@@ -396,6 +398,7 @@ class LeVanLuongSimulator:
         self.yellow_ticks_left = 0
         self.entries_during_yellow = 0
         self.entries_during_red = 0
+        self.permitted_right_on_red_entries = 0
         self.cycle = 0
         self.phase = "LVL"
         self.vehicles = []
@@ -437,6 +440,7 @@ class LeVanLuongSimulator:
         self.next_decision_in_cycles = 50
         self.red_ticks_left = 0
         self.pending_phase = "LVL"
+        self._phase_change_pending = False
         self._rows = []
         self._cursor = 0
         self._replay = demand_file is not None
@@ -521,6 +525,7 @@ class LeVanLuongSimulator:
             if (wanted != self.phase and self.red_ticks_left == 0 and
                     self.yellow_ticks_left == 0):
                 self.pending_phase = wanted
+                self._phase_change_pending = True
                 self._yellow_from = self.phase if self.phase in ("LVL", "HDT") else None
                 self.yellow_ticks_left = (int(round(self._yellow / DT))
                                           if self._yellow_from else 0)
@@ -537,8 +542,10 @@ class LeVanLuongSimulator:
             self.yellow_phase = None
             self.phase = "none"
             self.red_ticks_left -= 1
-            if self.red_ticks_left == 0:
-                self.phase = self.pending_phase
+        elif self._phase_change_pending:
+            self.phase = self.pending_phase
+            self.yellow_phase = None
+            self._phase_change_pending = False
         self._update_last_yellow()
         if self.phase in ("LVL", "HDT"):
             self.green_ticks += 1
@@ -746,6 +753,11 @@ class LeVanLuongSimulator:
         Green for its arm, or yellow with a "go" decision. In GAMA mode (no
         yellow) this is exactly ``_arm_is_green``.
         """
+        # The site's right-turn movement is permissive on red. It still needs
+        # a junction grant and downstream room; signal permission alone never
+        # authorizes entry into a conflicting through stream.
+        if self.mode == "safe" and vehicle.maneuver == "right":
+            return True
         if self._arm_is_green(vehicle.arm):
             return True
         if self.yellow_phase is None or not self._arm_is_yellow(vehicle.arm):
@@ -785,6 +797,21 @@ class LeVanLuongSimulator:
             return True
         x = vehicle.approach_end - vehicle.position - vehicle.length / 2.0
         if x > STOP_GO_MAX_DISTANCE:
+            return False
+        # A permissive yellow decision is only meaningful if the vehicle can
+        # reach the junction before the opposing green. Otherwise a distant
+        # vehicle can keep full speed throughout yellow and all-red, then be
+        # stopped in one tick when its grant expires.
+        clearance_time = self._yellow + self.all_red
+        speed_limit = min(vehicle.desired, 60.0 / 3.6)
+        cruise_speed = max(0.0, min(vehicle.speed, speed_limit))
+        accel_time = min(clearance_time,
+                         max(0.0, speed_limit - cruise_speed) /
+                         max(0.1, vehicle.accel))
+        reachable = (cruise_speed * accel_time +
+                     0.5 * vehicle.accel * accel_time * accel_time +
+                     speed_limit * (clearance_time - accel_time))
+        if x > reachable - 1.0:
             return False
         room = max(0.05, stop - vehicle.position)
         if vehicle.speed * vehicle.speed / (2.0 * room) > STOP_GO_MAX_DECEL:
@@ -862,6 +889,8 @@ class LeVanLuongSimulator:
             green = self._green_for(vehicle)
             stop_position = self._stop_position(vehicle)
             committed_approach = vehicle.position > stop_position + 1e-8
+            physically_entered = (vehicle.position + vehicle.length / 2 >=
+                                  vehicle.approach_end)
             if not (committed_approach or vehicle.junction_entry_token) and not green:
                 vehicle.junction_wait_since = None
                 continue
@@ -900,8 +929,11 @@ class LeVanLuongSimulator:
                 vehicle_id=str(vehicle.creation_id), movement_id=movement_id,
                 approach_distance=distance, speed=max(4.5, approach_speed * 0.9),
                 vehicle_length=vehicle.length, turn=vehicle.maneuver,
-                committed=(committed_approach or vehicle.junction_entry_token or dilemma_hold),
-                downstream_clear=(True if (committed_approach or vehicle.junction_entry_token) else
+                committed=((committed_approach or vehicle.junction_entry_token or dilemma_hold)
+                           and (vehicle.maneuver != "right" or physically_entered)),
+                downstream_clear=(True if (dilemma_hold or
+                                           ((committed_approach or vehicle.junction_entry_token)
+                                            and vehicle.maneuver != "right")) else
                                   self._destination_has_room(vehicle)),
                 arrival_time=arrival, waiting_since=vehicle.junction_wait_since,
                 accel=vehicle.accel, desired_speed=vehicle.desired,
@@ -1026,6 +1058,8 @@ class LeVanLuongSimulator:
         self._dest_groups = None
 
     def _move(self):
+        starting_positions = {v.creation_id: v.position for v in self.vehicles}
+        starting_speeds = {v.creation_id: v.speed for v in self.vehicles}
         # GAMA iterates agents in insertion order. Each agent performs its
         # lane choice and movement before the next agent reads its neighbors.
         lane_maps = {}
@@ -1177,13 +1211,49 @@ class LeVanLuongSimulator:
                     body_leader, body_gap, _, _ = self._neighbors(
                         vehicle, vehicle.lane, lane_maps,
                         shift=vehicle.current_lateral_shift)
-                    if body_gap < gap:
-                        leader, gap = body_leader, body_gap
+                    leader, gap = body_leader, body_gap
             if safe_committed and not green and (leader is None or leader.road != old_road):
                 # A vehicle whose front crossed the stop line on green must
                 # clear the approach during all-red. Connector conflicts are
                 # handled separately; they must not trap it on the stop line.
                 leader, gap = None, math.inf
+            if (self.mode == "safe" and
+                    (is_in_road or old_road == vehicle.conn_road) and
+                    self.junction_model == "negotiation"):
+                # Keep following a same-approach body across the stop-line
+                # seam, even when it takes another connector. Those paths
+                # share the first metres of the junction and only diverge
+                # after their bodies have cleared one another.
+                for ahead in self.vehicles:
+                    if (ahead is vehicle or ahead.arm != vehicle.arm or
+                            ahead.position <= vehicle.position or
+                            ahead.position - vehicle.position > 40.0 or
+                            ahead.road not in (vehicle.in_road, ahead.conn_road) or
+                            abs(ahead.current_lateral_shift -
+                                vehicle.current_lateral_shift) >=
+                            self._half_width(vehicle) + self._half_width(ahead) +
+                            LATERAL_CLEARANCE):
+                        continue
+                    if ahead.conn_road != vehicle.conn_road:
+                        own_band = self._negotiation._band_path(
+                            vehicle, vehicle.conn_road,
+                            old_road == vehicle.conn_road)
+                        lead_band = self._negotiation._band_path(
+                            ahead, ahead.conn_road,
+                            ahead.road == ahead.conn_road)
+                        diverging = self._negotiation.zone_map.zones(
+                            own_band, lead_band)
+                        if not any(z.kind == "diverge" and
+                                   vehicle.position + vehicle.length / 2 -
+                                   vehicle.approach_end <= z.a_out and
+                                   ahead.position - ahead.length / 2 -
+                                   ahead.approach_end <= z.b_out
+                                   for z in diverging):
+                            continue
+                    seam_gap = (ahead.position - vehicle.position -
+                                (ahead.length + vehicle.length) / 2.0)
+                    if seam_gap < gap:
+                        leader, gap = ahead, seam_gap
             vehicle.leading_distance = gap
             vehicle.leading_speed = leader.speed if leader else 0.0
             acceleration = (lane_decision.acceleration if self.mode == "gama_2025_6_4"
@@ -1277,6 +1347,14 @@ class LeVanLuongSimulator:
                           vehicle.junction_entry_token or
                           vehicle.creation_id in self._junction_grants)
                          if is_in_road else True)
+            if (self.mode == "safe" and is_in_road and vehicle.maneuver == "right"
+                    and vehicle.position + vehicle.length / 2 < vehicle.approach_end):
+                cannot_stop_before_line = (
+                    vehicle.junction_entry_token and vehicle.speed >= 4.0 and
+                    vehicle.speed ** 2 / (2.0 * max(1.0, vehicle.decel)) >=
+                    max(0.0, self._stop_position(vehicle) - vehicle.position))
+                can_cross = can_cross and (
+                    cannot_stop_before_line or self._destination_has_room(vehicle))
             # Hold the stop-line buffer clear before a fixed phase ends or a
             # training decision can switch phase. This avoids a red-phase
             # rollback when downstream traffic blocks entry.
@@ -1310,6 +1388,8 @@ class LeVanLuongSimulator:
                     if not self._arm_is_green(vehicle.arm):
                         if self._arm_is_yellow(vehicle.arm):
                             self.entries_during_yellow += 1
+                        elif self.mode == "safe" and vehicle.maneuver == "right":
+                            self.permitted_right_on_red_entries += 1
                         else:
                             self.entries_during_red += 1
                     vehicle.road = f"{vehicle.arm}_{vehicle.to_arm}"
@@ -1325,7 +1405,8 @@ class LeVanLuongSimulator:
                         old_road, next_road, vehicle.current_lateral_shift)
                     # Polyline seams may place the projected point slightly
                     # behind the boundary; never move the vehicle backwards.
-                    seam_progress = max(seam_progress, vehicle.position - boundary)
+                    seam_progress = max(0.0, seam_progress,
+                                        vehicle.position - boundary)
                     vehicle.seam_from_road = old_road
                     vehicle.seam_to_road = next_road
                     vehicle.seam_progress = seam_progress
@@ -1359,7 +1440,9 @@ class LeVanLuongSimulator:
                     # predicted speed; new-road IDM starts from the stored speed.
                     vehicle.speed = pre_transition_speed
                 new_lane_decision = self._choose_lane(vehicle, lane_maps)
-                new_leader, new_gap, _, _ = self._neighbors(vehicle, vehicle.lane, lane_maps)
+                new_leader, new_gap, _, _ = self._neighbors(
+                    vehicle, vehicle.lane, lane_maps,
+                    shift=(vehicle.current_lateral_shift if self.mode == "safe" else None))
                 vehicle.leading_distance = new_gap
                 vehicle.leading_speed = new_leader.speed if new_leader else 0.0
                 crossing_gap = new_gap if new_leader else math.inf
@@ -1501,24 +1584,47 @@ class LeVanLuongSimulator:
                     hi = max(vehicle.current_lateral_shift, next_shift)
                     lateral_blocked = False
                     reach_long = (vehicle.length + self._max_vehicle_length) / 2 + max(
-                        1.2, vehicle.gap, self._max_vehicle_gap)
-                    for other in self._nearby(new_road, road_progress - reach_long,
-                                              road_progress + reach_long):
+                        1.2, vehicle.gap, self._max_vehicle_gap) + 20.0 * vehicle.lateral_duration
+                    nearby = list(self._nearby(new_road, road_progress - reach_long,
+                                               road_progress + reach_long))
+                    if new_road.endswith("_out"):
+                        nearby.extend(other for other in self.vehicles
+                                      if other.to_arm == vehicle.to_arm and
+                                      other.road == other.conn_road and
+                                      abs(other.position - other.connector_end -
+                                          road_progress) <= reach_long)
+                    for other in nearby:
                         if other is vehicle:
                             continue
                         other_road, other_progress = self._road_state(other)
+                        other_shift = other.current_lateral_shift
                         if other_road != new_road:
-                            continue
+                            if (not new_road.endswith("_out") or
+                                    other_road != other.conn_road or
+                                    other.to_arm != vehicle.to_arm):
+                                continue
+                            seam_progress, other_shift = self._continuous_seam_pose(
+                                other.conn_road, new_road, other_shift)
+                            other_progress = (other.position - other.connector_end +
+                                              seam_progress)
                         separation = abs(other_progress - road_progress) - (
                             vehicle.length + other.length) / 2
-                        if separation >= max(1.2, vehicle.gap, other.gap):
+                        remaining_change = max(0.0, (1.0 - vehicle.lane_change_progress)
+                                               * vehicle.lateral_duration)
+                        closing = max(0.0, (other.speed - vehicle.speed)
+                                      if other_progress < road_progress else
+                                      (vehicle.speed - other.speed))
+                        moving_gap = (other.gap + min(8.0, other.speed * other.headway)
+                                      if other_progress < road_progress else
+                                      vehicle.gap + min(8.0, vehicle.speed * vehicle.headway))
+                        if (separation - closing * remaining_change >=
+                                max(1.2, vehicle.gap, other.gap, moving_gap)):
                             continue
                         if self._moving_away(vehicle.current_lateral_shift, next_shift,
-                                             other.current_lateral_shift,
-                                             other.current_lateral_shift):
+                                             other_shift, other_shift):
                             continue
-                        lateral_gap = max(lo - other.current_lateral_shift,
-                                          other.current_lateral_shift - hi, 0.0)
+                        lateral_gap = max(lo - other_shift,
+                                          other_shift - hi, 0.0)
                         if lateral_gap < (self._half_width(vehicle) +
                                           self._half_width(other) + LATERAL_CLEARANCE):
                             lateral_blocked = True
@@ -1535,6 +1641,55 @@ class LeVanLuongSimulator:
         self._exited_this_tick = []
         if self.mode == "safe":
             self._resolve_road_conflicts()
+            self._resolve_connector_overlaps(starting_positions, starting_speeds)
+
+    def _resolve_connector_overlaps(self, starting_positions, starting_speeds):
+        """Stop a following connector body before it enters an occupied footprint.
+
+        The negotiation model works with sampled centerline bands. Curved,
+        offset connector lanes can still bring two rectangles together.
+        This final geometry check only retreats within the distance travelled
+        in the current tick and never rewinds to an earlier tick.
+        """
+        groups = {}
+        for vehicle in self.vehicles:
+            road, progress = self._road_state(vehicle)
+            if not road.endswith(("_in", "_out")):
+                groups.setdefault(road, []).append((progress, vehicle))
+        for road, entries in groups.items():
+            entries.sort(key=lambda item: item[0], reverse=True)
+            placed = []
+            geometry = self._geometry_roads[road]
+            def make_polygon(item):
+                return body_polygon(geometry.pose(
+                    item.position - item.approach_end,
+                    item.current_lateral_shift), length=item.length,
+                    width=2 * self._half_width(item))
+            for progress, vehicle in entries:
+                blockers = [other for ahead, _, other in placed
+                            if ahead - progress < 8.0]
+                if blockers and any(polygons_overlap(make_polygon(vehicle), other, 0.0)
+                                    for other in blockers):
+                    end = vehicle.position
+                    start = min(end, starting_positions.get(vehicle.creation_id, end))
+                    vehicle.position = start
+                    if not any(polygons_overlap(make_polygon(vehicle), other, 0.0)
+                               for other in blockers):
+                        lo, hi = start, end
+                        for _ in range(18):
+                            mid = (lo + hi) / 2
+                            vehicle.position = mid
+                            if any(polygons_overlap(make_polygon(vehicle), other, 0.0)
+                                   for other in blockers):
+                                hi = mid
+                            else:
+                                lo = mid
+                        vehicle.position = lo
+                    distance = vehicle.position - start
+                    vehicle.speed = max(0.0, min(vehicle.speed,
+                        2.0 * distance / DT - starting_speeds.get(vehicle.creation_id, 0.0)))
+                placed.append((vehicle.position - vehicle.approach_end,
+                               vehicle, make_polygon(vehicle)))
 
     def _resolve_road_conflicts(self):
         """Keep vehicle bodies and their minimum clearance apart on road links.
@@ -1696,7 +1851,7 @@ class LeVanLuongSimulator:
             hi_lat = max(vehicle.current_lateral_shift, cand_shift)
             sweep_conflict = False
             reach_long = (vehicle.length + self._max_vehicle_length) / 2 + max(
-                1.5, vehicle.gap, self._max_vehicle_gap)
+                1.5, vehicle.gap, self._max_vehicle_gap) + 20.0 * max(vehicle.lateral_duration, DT)
             for other in self._nearby(road, progress - reach_long, progress + reach_long):
                 if other is vehicle:
                     continue
@@ -1704,6 +1859,10 @@ class LeVanLuongSimulator:
                 if other_road != road:
                     continue
                 long_sep = abs(other_pos - progress) - (vehicle.length + other.length) / 2
+                closing = max(0.0, (other.speed - vehicle.speed)
+                              if other_pos < progress else
+                              (vehicle.speed - other.speed))
+                long_sep -= closing * max(vehicle.lateral_duration, DT)
                 # Impatient mergers accept the smaller of the two jam gaps.
                 if long_sep >= ((1.0 - urgency) * max(1.5, vehicle.gap, other.gap) +
                                 urgency * (min(vehicle.gap, other.gap) - 0.05)):
@@ -1886,6 +2045,14 @@ class LeVanLuongSimulator:
 
     def _neighbors(self, vehicle, lane, lane_maps, shift=None):
         road, position = self._neighbor_road_state[id(vehicle)]
+        candidate_shift = ((lane + (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
+                           if shift is None else shift)
+        def lateral_interacts(other):
+            if self.mode != "safe":
+                return True
+            reach = self._half_width(vehicle) + self._half_width(other) + LATERAL_CLEARANCE
+            return (abs(candidate_shift - other.current_lateral_shift) < reach or
+                    abs(candidate_shift - other.merge_claim_shift) < reach)
         leader = follower = None
         front = back = math.inf
         front_distance = back_distance = math.inf
@@ -1893,7 +2060,8 @@ class LeVanLuongSimulator:
             entries = lane_maps[road][sublane]
             index = bisect.bisect_left(entries, (position, -1))
             ahead = index
-            while ahead < len(entries) and entries[ahead][2] is vehicle:
+            while ahead < len(entries) and (entries[ahead][2] is vehicle or
+                                            not lateral_interacts(entries[ahead][2])):
                 ahead += 1
             if ahead < len(entries):
                 other_position, _, other = entries[ahead]
@@ -1903,7 +2071,8 @@ class LeVanLuongSimulator:
                     leader = other
                     front = distance - (vehicle.length + other.length) / 2
             behind = index - 1
-            while behind >= 0 and entries[behind][2] is vehicle:
+            while behind >= 0 and (entries[behind][2] is vehicle or
+                                   not lateral_interacts(entries[behind][2])):
                 behind -= 1
             if behind >= 0:
                 other_position, _, other = entries[behind]
@@ -2028,16 +2197,27 @@ class LeVanLuongSimulator:
                 front = self.roads[road]["length"] - position + vehicle.gap
             if next_road in lane_maps:
                 next_lane = self._mapped_lane(vehicle, lane, road, next_road)
+                seam_shift = (self._continuous_seam_pose(
+                    road, next_road, vehicle.current_lateral_shift)[1]
+                    if self.mode == "safe" else 0.0)
                 for sublane in range(next_lane, next_lane + vehicle.occupied):
                     entries = lane_maps[next_road][sublane]
-                    if entries:
-                        other_position, _, other = entries[0]
+                    for other_position, _, other in entries:
+                        if self.mode == "safe":
+                            reach = (self._half_width(vehicle) +
+                                     self._half_width(other) + LATERAL_CLEARANCE)
+                            claim_interacts = (math.isfinite(other.merge_claim_shift) and
+                                               abs(seam_shift - other.merge_claim_shift) < reach)
+                            if (abs(seam_shift - other.current_lateral_shift) >= reach and
+                                    not claim_interacts):
+                                continue
                         distance = (self.roads[road]["length"] - position +
                                     other_position)
                         if distance < front_distance:
                             front_distance = distance
                             leader = other
                             front = distance - (vehicle.length + other.length) / 2
+                        break
         return leader, front, follower, back
 
     def _idm(self, vehicle, gap, leader_speed):
@@ -2111,7 +2291,8 @@ class LeVanLuongSimulator:
         result.update({f"front_row_max_{arm}": self.front_row_max[arm] for arm in ARMS})
         result.update(yellow_phase=self.yellow_phase or "",
                       entries_during_yellow=self.entries_during_yellow,
-                      entries_during_red=self.entries_during_red)
+                      entries_during_red=self.entries_during_red,
+                      permitted_right_on_red_entries=self.permitted_right_on_red_entries)
         return result
 
     def _phase_remaining(self):

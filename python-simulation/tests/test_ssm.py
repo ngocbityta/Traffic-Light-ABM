@@ -80,6 +80,17 @@ class PetTests(unittest.TestCase):
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_decimated_recording_uses_elapsed_time_for_acceleration(self):
+        sim = LeVanLuongSimulator(seed=1, flow_per_approach=0)
+        sim._create_vehicle("NE", "through", False, 0, 30)
+        recorder = trajectory.record_run(sim, 10, every=5)
+        data = recorder.arrays()
+        self.assertEqual(data["cycle"].tolist(), [5, 10])
+        self.assertAlmostEqual(data["sample_dt"][1], 5 * float(data["dt"]))
+        self.assertAlmostEqual(data["accel"][1],
+                               (data["speed"][1] - data["speed"][0]) /
+                               (5 * float(data["dt"])))
+
     def test_recorded_run_has_no_body_overlap_and_summarises(self):
         sim = LeVanLuongSimulator(seed=1)
         recorder = trajectory.record_run(sim, 300)

@@ -253,10 +253,10 @@ class SimulatorIntegrationTests(unittest.TestCase):
             from python_sim import LeVanLuongSimulator
         return LeVanLuongSimulator(**kw)
 
-    def test_default_is_reservation(self):
+    def test_default_is_negotiation(self):
         sim = self._sim(seed=1)
-        self.assertEqual(sim.junction_model, "reservation")
-        self.assertIsNone(sim._negotiation)
+        self.assertEqual(sim.junction_model, "negotiation")
+        self.assertIsNotNone(sim._negotiation)
 
     def test_negotiation_runs_and_discharges(self):
         sim = self._sim(seed=1, junction_model="negotiation", flow_per_approach=1500.0)

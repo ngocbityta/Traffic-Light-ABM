@@ -150,8 +150,9 @@ def exposure(ttc_values, dt, threshold=DEFAULT_TTC_THRESHOLD):
     ttc_values = np.asarray(ttc_values, float)
     threshold = np.broadcast_to(np.asarray(threshold, float), ttc_values.shape)
     hit = (ttc_values > 0) & (ttc_values <= threshold)
-    tet = float(hit.sum() * dt)
-    tit = float(np.sum((threshold - ttc_values)[hit]) * dt)
+    weights = np.broadcast_to(np.asarray(dt, float), ttc_values.shape)
+    tet = float(np.sum(weights[hit]))
+    tit = float(np.sum((threshold - ttc_values)[hit] * weights[hit]))
     return tet, tit
 
 
@@ -298,9 +299,12 @@ def summarize(data, conflict_points=None, ttc_threshold=DEFAULT_TTC_THRESHOLD):
     dt = float(data["dt"])
     re = rear_end_pairs(data)
     finite = np.isfinite(re["mttc"])
-    tet, tit = exposure(re["ttc"], dt, ttc_threshold)
-    tet_m, tit_m = exposure(re["mttc"], dt, ttc_threshold)
-    vehicle_seconds = len(data["vid"]) * dt
+    sample_dt = data.get("sample_dt")
+    weights = (sample_dt[re["row_follower"]] if sample_dt is not None else dt)
+    tet, tit = exposure(re["ttc"], weights, ttc_threshold)
+    tet_m, tit_m = exposure(re["mttc"], weights, ttc_threshold)
+    vehicle_seconds = (float(np.sum(sample_dt)) if sample_dt is not None else
+                       len(data["vid"]) * dt)
     yellow_ticks = set(data["tick_cycle"][data["tick_yellow"] >= 0].tolist())
     in_yellow = np.isin(data["cycle"], list(yellow_ticks))
     hard = data["accel"] <= HARD_BRAKE

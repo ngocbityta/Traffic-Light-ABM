@@ -34,6 +34,7 @@ from .evaluate import evaluate_episode
 from .demand import generate_demand, demand_parameters
 from python_simulation.demand import generate_demand as generate_lvl_demand
 from python_simulation.demand import demand_parameters as lvl_demand_parameters
+from python_simulation.sim_config import load_sim_config
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = Path(__file__).resolve().parents[2]
@@ -61,6 +62,8 @@ def parse_args(argv=None):
     p.add_argument("--python-sim-mode", choices=("safe", "gama_2025_6_4"),
                    default="safe",
                    help="LVL Python backend only: safe (default) or GAMA 2025.6.4 parity mode; ignored on GAMA backend")
+    p.add_argument("--sim-config", type=str, default=None,
+                   help="Shared simulator JSON or calibrate_discharge output")
     p.add_argument("--host", type=str, default="localhost")
     p.add_argument("--start-server", action="store_true",
                    help="Tu khoi dong gama-server (neu chua chay)")
@@ -117,6 +120,9 @@ def parse_args(argv=None):
     p.add_argument("--device", choices=("cpu", "mps", "cuda"), default=None,
                    help="Device for PyTorch learner (default: cpu on Mac, cuda if available)")
     args = p.parse_args(argv)
+    if args.sim_config and (args.backend != "python" or args.scenario != "lvl"):
+        p.error("--sim-config requires --backend python --scenario lvl")
+    args.simulation_config = load_sim_config(args.sim_config)
     spatial_algorithm = args.algorithm in ("rainbow", "hybrid")
     if args.reward_mode is None:
         args.reward_mode = "r1" if spatial_algorithm else "reference"
@@ -175,6 +181,7 @@ def training_config(args):
               "pressure_lambda", "demand_mode", "max_delay_sq", "buffer_size", "warmup", "batch_size",
               "tau", "eps_start", "eps_decay_steps", "eps_min", "model_path")
     config = {name: getattr(args, name) for name in fields}
+    config["simulation_config"] = args.simulation_config
     if args.algorithm == "rainbow":
         config.update({name: getattr(args, name) for name in
                        ("n_step", "per_alpha", "per_beta_start", "per_beta_steps",
@@ -201,6 +208,8 @@ def training_config(args):
                   # Include safety helpers that may be imported by the safe
                   # simulator as its collision and junction logic evolves.
                   "python-simulation/simulation/python_simulation/junction_conflicts.py",
+                  "python-simulation/simulation/python_simulation/junction_negotiation.py",
+                  "python-simulation/simulation/python_simulation/sim_config.py",
                   "python-simulation/simulation/python_simulation/safe_collision_guard.py")
     config["code_sha256"] = {name: hashlib.sha256(
         (REPO_DIR / name).read_bytes()).hexdigest() for name in files}
@@ -303,6 +312,7 @@ def collect_python_rollout_process(actor_payload, args, seed, decision_limit,
         _PYTHON_PROCESS_ENV = LVLPythonEnv(
             model_path=args.model_path, reward_mode=args.reward_mode,
             python_sim_mode=args.python_sim_mode,
+            sim_config=args.simulation_config,
             max_delay_sq=args.max_delay_sq,
             state_mode="spatial" if args.algorithm in ("rainbow", "hybrid") else "dtse",
             reset_mode="fresh", fast_training=args.fast_simulation,
@@ -399,6 +409,8 @@ async def amain(args):
                                  reset_mode="fresh" if args.workers > 1 else "reload",
                                  fast_training=args.fast_simulation,
                                  **({"python_sim_mode": args.python_sim_mode}
+                                    if args.scenario == "lvl" and args.backend == "python" else {}),
+                                 **({"sim_config": args.simulation_config}
                                     if args.scenario == "lvl" and args.backend == "python" else {}),
                                  **reward_settings(args))
             await env.setup()

@@ -449,6 +449,19 @@ def build():
                 pts = [((1 - q) ** 2 * p0[0] + 2 * (1 - q) * q * c[0] + q * q * p1[0],
                         (1 - q) ** 2 * p0[1] + 2 * (1 - q) * q * c[1] + q * q * p1[1])
                        for q in (x / 12 for x in range(13))]
+                # Match the approach tangent at the first polyline segment.
+                # A sampled Bezier otherwise cuts across adjacent sublanes
+                # immediately after the stop line, even when its analytic
+                # tangent is correct at p0.
+                first_length = math.dist(pts[0], pts[1])
+                pts[1] = (p0[0] + first_length * d0[0],
+                          p0[1] + first_length * d0[1])
+                # The final polyline segment must share the exit tangent.
+                # Otherwise an offset sublane projects behind the exit start
+                # and the simulator has to jump the body sideways at the seam.
+                final_length = math.dist(pts[-2], pts[-1])
+                pts[-2] = (p1[0] - final_length * ub[0],
+                           p1[1] - final_length * ub[1])
             roads.append(feature(LineString(pts), id=f'{a}_{b}', kind='connector', arm=a, to_arm=b, turn=turn, num_lanes=n,
                                  width=round(n * SUBLANE_W, 2), name=''))
     return roads, areas, conflict, paved

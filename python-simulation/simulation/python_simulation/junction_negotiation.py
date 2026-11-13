@@ -279,7 +279,10 @@ class JunctionNegotiator:
 
     @staticmethod
     def is_minor(ag: Agent):
-        return ag.turn == "left" and ag.arm_green
+        # Permissive right turns must yield at their merge conflict just as
+        # left turns yield to opposing traffic. Signal permission alone does
+        # not give the right turn priority over the through stream.
+        return ag.arm_green and ag.turn in ("left", "right")
 
     @staticmethod
     def arrival(ag: Agent, z_in):
@@ -775,7 +778,7 @@ class SimulatorAdapter:
         self._conflict_held: set[int] = set()
         self.hard_caps = 0
         self.creep_min = 0.2
-        self.sweep_car = 0.15
+        self.sweep_car = 0.75
         self.sweep_moto = 0.0
         self.box_clear = False
         self.filter_enabled = True
@@ -908,6 +911,24 @@ class SimulatorAdapter:
                 self.commit[vid] = now  # clearing after the phase ended
                 ag.commit_time = now
         stop, commits = self.negotiator.decide(agents, now)
+        # A seam follower is longitudinal traffic, not a crossing foe. The
+        # negotiator's fixed seam stop can appear only after its leader enters
+        # the connector, forcing an impossible one-tick stop. Follow the
+        # leader's moving rear bumper instead, including its next-tick speed.
+        for decision in self.negotiator.last_decisions:
+            if decision.reason != "seam_follow":
+                continue
+            leader = by_vid.get(decision.first)
+            follower = by_vid.get(decision.second)
+            if (leader is None or follower is None or
+                    leader.arm != follower.arm or leader.to_arm != follower.to_arm or
+                    leader.position <= follower.position):
+                continue
+            stopping_front = (leader.position - leader.length / 2.0 -
+                              follower.gap)
+            stop[decision.second] = (stopping_front - follower.approach_end +
+                                     self._seam_off.get(follower.creation_id, 0.0),
+                                     leader.speed)
         for vid in commits:
             self.commit.setdefault(int(vid), now)
         sim._junction_stop = {}
@@ -945,7 +966,15 @@ class SimulatorAdapter:
             if ag.on_junction or v.road != f"{v.arm}_in":
                 continue
             committed = (v.position > sim._stop_position(v) + 1e-8) or v.junction_entry_token
-            room_ok = committed or sim._destination_has_room(v)
+            # An earlier grant cannot be revoked only metres from the stop
+            # line after the vehicle has passed its braking point. The
+            # connector provides storage while it yields at the exit merge.
+            dilemma_hold = (v.creation_id in sim._junction_grants and
+                            v.speed >= 4.0 and
+                            sim._stop_position(v) - v.position <=
+                            v.speed ** 2 / (2.0 * max(1.0, v.decel)))
+            room_ok = ((committed and v.maneuver != "right") or
+                       dilemma_hold or sim._destination_has_room(v))
             # Enter only if the whole body fits before the wait point, and
             # (for left turns) while waiting storage inside the junction is left.
             store_ok = (ag.turn != "left" or not math.isfinite(s) or
@@ -982,7 +1011,11 @@ class SimulatorAdapter:
                 blockers.setdefault(d.second, []).append(d.first)
         ag_by_vid = {ag.vid: ag for ag in agents}
         for ag in agents:
-            if not ag.motorbike or not ag.on_junction or ag.vid not in blockers:
+            # A permissive right turn merges with a through stream. A lateral
+            # filtering move changes its conflict band after the through
+            # vehicle has committed, so keep it in its curb corridor here.
+            if (not ag.motorbike or ag.turn != "left" or
+                    not ag.on_junction or ag.vid not in blockers):
                 continue
             v = by_vid[ag.vid]
             road = f"{v.arm}_{v.to_arm}"
