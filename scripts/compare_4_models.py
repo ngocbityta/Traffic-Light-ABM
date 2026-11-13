@@ -5,7 +5,7 @@ Benchmark 4 thuật toán điều khiển đèn giao thông trên GAMA:
     Fixed-Time       -> GAMA headless batch (my_batch_experiment, 8000 cycles)
     MaxPressure      -> như trên
     Q-Learning       -> như trên
-    Deep Q-Learning  -> gama-server (port 6868) + dqn_py/evaluate.py,
+    Deep Q-Learning  -> gama-server (port 6868) + train/logic/evaluate.py,
                         chính sách greedy (eps=0) với weights đã train
 
 Quy trình:
@@ -22,7 +22,7 @@ Kết quả (thư mục comparison_results/):
     - bảng mean ± std in ra console
 
 Cách chạy:
-    python3 scripts/compare_4_models.py --runs 5 --weights dqn_py/run/train_<timestamp>/best_weights.pt
+    python3 scripts/compare_4_models.py --runs 5 --weights train/results/train_<timestamp>/best_weights.pt
     python3 scripts/compare_4_models.py --plot-only   # tổng hợp + vẽ từ CSV cũ
 """
 
@@ -61,11 +61,11 @@ BATCH_MODELS = {
 DQN_NAME = "Deep Q-Learning"
 MODEL_NAMES = [*BATCH_MODELS, DQN_NAME]
 
-DQN_DIR = os.path.join(BASE_DIR, "dqn_py")
+DQN_DIR = os.path.join(BASE_DIR, "train")
 DQN_PYTHON = (os.path.join(DQN_DIR, "venv", "bin", "python")
               if os.path.isfile(os.path.join(DQN_DIR, "venv", "bin", "python"))
               else sys.executable)
-DQN_EVAL = os.path.join(DQN_DIR, "evaluate.py")
+DQN_EVAL = None
 DQN_PORT = 6868              # gama-server chạy sẵn (kiểm tra: lsof -i :6868)
 
 # Dòng "METRIC_CSV,cycle,passed,avg_wait,queue,speed,travel,max_wait" mà
@@ -159,7 +159,7 @@ def run_dqn(n_episodes, weights_path):
     print(f"🚀 [{DQN_NAME}] greedy (eps=0) qua gama-server :{DQN_PORT}, "
           f"{n_episodes} episodes (seed {FIRST_SEED}..{FIRST_SEED + n_episodes - 1})...",
           flush=True)
-    cmd = [DQN_PYTHON, DQN_EVAL,
+    cmd = [DQN_PYTHON, "-m", "train.logic.evaluate",
            "--scenario", "legacy", "--backend", "gama",
            "--weights", weights_path,
            "--episodes", str(n_episodes),
@@ -168,7 +168,7 @@ def run_dqn(n_episodes, weights_path):
            "--port", str(DQN_PORT),
            "--host", "localhost",
            "--output", os.path.join(OUTPUT_DIR, "dqn_metrics.csv")]
-    process = subprocess.Popen(cmd, cwd=DQN_DIR, stdout=subprocess.PIPE,
+    process = subprocess.Popen(cmd, cwd=BASE_DIR, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True, bufsize=1)
     for line in iter(process.stdout.readline, ""):
         print(f"   [DQN] {line.rstrip()}", flush=True)
@@ -368,9 +368,9 @@ def main(argv=None):
         # observations. Comparing them with newly simulated controllers would
         # produce a misleading benchmark.
         model_sources = [
-            os.path.join(BASE_DIR, "Traffic/includes/collision_avoidance.gaml"),
-            os.path.join(BASE_DIR, "Traffic/includes/doan_scenery.gaml"),
-            os.path.join(BASE_DIR, "Traffic/models/intersection-dqn-python.gaml"),
+            os.path.join(BASE_DIR, "train/benchmarks/gama/includes/collision_avoidance.gaml"),
+            os.path.join(BASE_DIR, "train/benchmarks/gama/includes/doan_scenery.gaml"),
+            os.path.join(BASE_DIR, "train/benchmarks/gama/models/intersection-dqn-python.gaml"),
             os.path.join(DQN_DIR, "gama_env.py"),
             os.path.join(DQN_DIR, "train.py"),
         ]
@@ -383,7 +383,7 @@ def main(argv=None):
             )
         reps = {name: [] for name in MODEL_NAMES}
         for name, (model_file, csv_stem) in BATCH_MODELS.items():
-            model_path = os.path.join(BASE_DIR, "Traffic/models", model_file)
+            model_path = os.path.join(BASE_DIR, "train/benchmarks/gama/models", model_file)
             reps[name] = []
             for i in range(n_runs):
                 reps[name].append(run_batch(model_path, name, FIRST_SEED + i))

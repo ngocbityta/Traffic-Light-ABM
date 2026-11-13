@@ -12,12 +12,13 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "dqn_py"))
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "train" / "logic"))
 
-from demand import demand_parameters, generate_demand
-from gama_env import GamaTrafficEnv
-from python_env import PythonTrafficEnv
-from server_manager import GamaServerManager
+from train.logic.demand import demand_parameters, generate_demand
+from train.logic.gama_env import GamaTrafficEnv
+from train.logic.python_env import PythonTrafficEnv
+from train.logic.server_manager import GamaServerManager
 
 
 SNAPSHOT_EXPR = ('"" + (active_vehicles collect ("" + each.demand_row_id + ":" + '
@@ -74,7 +75,7 @@ async def main(args):
         try:
             manager.start(reuse_running=False)
             gama = GamaTrafficEnv(port=args.port,
-                                  model_path=str(ROOT / "Traffic/models" /
+                                  model_path=str(ROOT / "train/benchmarks/gama/models" /
                                       ("intersection-fixed-time.gaml" if args.controller == "fixed"
                                        else "intersection-dqn-python.gaml")),
                                   experiment=("python_parity" if args.controller == "fixed"

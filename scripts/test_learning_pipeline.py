@@ -11,9 +11,9 @@ import torch
 
 from scripts.fair_benchmark import EXTRA_FIELDS, Learners, run_episode
 from scripts.benchmark_3dqn_vs_4 import run_three_episode, run_job, evaluation_signature
-from dqn_py.evaluate import evaluate_episode
-from dqn_py.gama_env import GamaTrafficEnv
-from dqn_py.three_dqn_agent import ThreeDQNAgent
+from train.logic.evaluate import evaluate_episode
+from train.logic.gama_env import GamaTrafficEnv
+from train.logic.three_dqn_agent import ThreeDQNAgent
 
 
 class ClearanceEnv:

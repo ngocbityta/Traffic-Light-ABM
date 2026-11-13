@@ -14,8 +14,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from dqn_py.gama_env import GamaTrafficEnv
-from dqn_py.server_manager import GamaServerManager
+from train.logic.gama_env import GamaTrafficEnv
+from train.logic.server_manager import GamaServerManager
 
 
 async def measure(port, horizon, seed, repetitions):

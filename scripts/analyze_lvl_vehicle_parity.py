@@ -15,8 +15,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from LeVanLuongIntersection.demand import generate_demand
-from LeVanLuongIntersection.python_sim import LeVanLuongSimulator, road_lengths
+PYTHON_SIM_ROOT = ROOT / "python-simulation" / "simulation"
+sys.path.insert(0, str(PYTHON_SIM_ROOT))
+from python_simulation.demand import generate_demand
+from python_simulation.python_sim import LeVanLuongSimulator, road_lengths
 
 
 def summarize(trace, seed, horizon, replay_current_python=False):
@@ -47,7 +49,9 @@ def summarize(trace, seed, horizon, replay_current_python=False):
 
     rows = [json.loads(line) for line in Path(trace).read_text().splitlines() if line.strip()]
     python_source = "replayed" if replay_current_python else "embedded"
-    simulator_sha256 = hashlib.sha256((ROOT / "LeVanLuongIntersection/python_sim.py").read_bytes()).hexdigest()
+    simulator_sha256 = hashlib.sha256((ROOT / "python-simulation/simulation/python_simulation/python_sim.py").read_bytes()).hexdigest()
+    model_sha256 = hashlib.sha256((ROOT / "gama-simulation/simulation/models/LeVanLuong.gaml").read_bytes()).hexdigest()
+    demand_source_sha256 = hashlib.sha256((ROOT / "python-simulation/simulation/python_simulation/demand.py").read_bytes()).hexdigest()
     replay_dir = tempfile.TemporaryDirectory(prefix="lvl_replay_") if replay_current_python else None
     replay_demand = None
     if replay_dir is not None:
@@ -77,13 +81,14 @@ def summarize(trace, seed, horizon, replay_current_python=False):
                      python_lane=current.lane if current else None)
         if not g or x.get("python_lane") is None:
             continue
-        pos = road_position(rid, g["road"], g["remaining"])
-        if x.get("python_position") is None:
-            continue
-        dp = float(x["python_position"]) - pos
+        pos = (None if g["road"] in (None, "nil") else
+               road_position(rid, g["road"], g["remaining"]))
+        dp = (None if pos is None or x.get("python_position") is None else
+              float(x["python_position"]) - pos)
         ds = float(x["python_speed"]) - float(g["speed"])
         lane_bad = int(x["python_lane"] != g["lane"])
-        rec = (abs(dp), abs(ds), lane_bad)
+        road_bad = int(x.get("python_road") is not None and x["python_road"] != g["road"])
+        rec = (abs(dp) if dp is not None else None, abs(ds), lane_bad, road_bad)
         by_tick[x["tick"]].append((rid, rec, dp, ds, g["road"], "car" if int(demand[rid][2]) else "motorbike"))
         by_road[g["road"]].append(rec)
         kind = "car" if int(demand[rid][2]) else "motorbike"
@@ -93,10 +98,15 @@ def summarize(trace, seed, horizon, replay_current_python=False):
 
     def agg(vals):
         if not vals:
-            return {"n": 0, "lane_mismatch_rate": None, "speed_mae_mps": None, "position_mae_m": None}
+            return {"n": 0, "lane_mismatch_rate": None, "road_mismatch_rate": None,
+                    "speed_mae_mps": None, "position_mae_m": None,
+                    "position_sample_n": 0}
         return {"n": len(vals), "lane_mismatch_rate": sum(v[2] for v in vals)/len(vals),
+                "road_mismatch_rate": sum(v[3] for v in vals)/len(vals),
                 "speed_mae_mps": statistics.fmean(v[1] for v in vals),
-                "position_mae_m": statistics.fmean(v[0] for v in vals)}
+                "position_mae_m": statistics.fmean(v[0] for v in vals if v[0] is not None)
+                    if any(v[0] is not None for v in vals) else None,
+                "position_sample_n": sum(v[0] is not None for v in vals)}
     allvals = [v[1] for bucket in by_tick.values() for v in bucket]
     first_tick = next((t for t in sorted(by_tick) if any(v[1][2] for v in by_tick[t])), None)
     first = None if first_tick is None else next({"tick": first_tick, "row_id": v[0], "road": v[4], "type": v[5]}
@@ -104,12 +114,16 @@ def summarize(trace, seed, horizon, replay_current_python=False):
     result = {"trace": str(trace), "seed": seed, "horizon": horizon, "demand_sha256": digest,
             "python_state_source": python_source,
             "python_simulator_sha256": simulator_sha256,
+            "gama_model_sha256": model_sha256,
+            "demand_source_sha256": demand_source_sha256,
             "sample_ticks": sorted(by_tick),
             "position_method": "GAMA route offset + current-road length - distance_to_current_target; Python cumulative route position",
             "sample_count": len(allvals), "first_lane_mismatch": first,
             "vehicles_with_lane_mismatch": len(first_by_vehicle),
             "first_lane_mismatch_by_vehicle": first_by_vehicle,
             "overall": agg(allvals),
+            "by_milestone": {str(tick): agg([record[1] for record in bucket])
+                             for tick, bucket in sorted(by_tick.items())},
             "by_road": {k: agg(v) for k, v in sorted(by_road.items())},
             "by_vehicle_type": {k: agg(v) for k, v in sorted(by_kind.items())}}
     if replay_dir is not None:

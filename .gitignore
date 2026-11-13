@@ -1,5 +1,5 @@
 # Environments and dependencies
-dqn_py/venv/
+train/venv/
 venv/
 env/
 .venv/
@@ -23,37 +23,23 @@ __pycache__/
 .cache/
 .built_in_models_*
 .gama_application_workspace
-Traffic/models/snapshots/
+train/benchmarks/gama/models/snapshots/
 tmp_ws/
 **/server_ws/
 test_vehicle_behavior_batch/
 
 # Logs and runtime outputs
+.worktrees/
+/gama/
+/sumo/
 *.log
 comparison_results/
 diagnostics/
-dqn_py/run/
+train/results/*
+!train/results/.gitkeep
 .Rhistory
 *.bak
-Traffic/models/tmp_*.gaml
-
-# Independent Python research data and outputs
-python/data/
-python/results/
-python/*.egg-info/
-python/build/
-python/dist/
-/legacy_archives/python_sim_20261104/
-
-# Standalone GAMA UI runtime artifacts
-gama_ui/validation_results/
-gama_ui/TrafficUI/models/snapshots/
-gama_ui/TrafficUI/models/tmp_*.gaml
-
-# Historical coupled pipeline runtime artifacts
-legacy/gama_training/dqn_py/venv/
-legacy/gama_training/dqn_py/run/
-legacy/gama_training/comparison_results/
+train/benchmarks/gama/models/tmp_*.gaml
 
 # Local presentation material and research papers
 seminar/
@@ -66,3 +52,5 @@ Traffic_Papers/
 ._*
 .Spotlight-V100
 .Trashes
+gama-simulation/simulation/models/snapshots/
+gama-simulation/simulation/models/tmp_*.gaml

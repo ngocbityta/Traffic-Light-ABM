@@ -10,10 +10,11 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "dqn_py"))
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "train" / "logic"))
 
-from demand import demand_parameters, generate_demand
-from python_env import PythonTrafficEnv
+from train.logic.demand import demand_parameters, generate_demand
+from train.logic.python_env import PythonTrafficEnv
 
 
 FIELDS = ("cycle", "global_phase", "total_vehicles_created",

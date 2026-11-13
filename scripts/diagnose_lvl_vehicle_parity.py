@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import hashlib
 import json
 import re
 import sys
@@ -11,12 +12,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "dqn_py"))
+PYTHON_SIM_ROOT = ROOT / "python-simulation" / "simulation"
+sys.path.insert(0, str(PYTHON_SIM_ROOT))
+sys.path.insert(0, str(ROOT / "train" / "logic"))
 
-from gama_env import GamaTrafficEnv
-from server_manager import GamaServerManager
-from LeVanLuongIntersection.python_sim import LeVanLuongSimulator
-from LeVanLuongIntersection.demand import generate_demand, demand_parameters
+from train.logic.gama_env import GamaTrafficEnv
+from train.logic.server_manager import GamaServerManager
+from python_simulation.python_sim import LeVanLuongSimulator
+from python_simulation.demand import generate_demand, demand_parameters
 
 
 SNAPSHOT_EXPR = ('"" + (vehicle collect ("" + each.demand_row_id + ":" + '
@@ -46,7 +49,7 @@ async def main(args):
         try:
             manager.start(reuse_running=False)
             gama = GamaTrafficEnv(port=args.port,
-                                  model_path=str(ROOT / "LeVanLuongIntersection/models/LeVanLuong.gaml"),
+                                  model_path=str(ROOT / "gama-simulation/simulation/models/LeVanLuong.gaml"),
                                   experiment="python_parity", verbose=False)
             await gama.setup()
             await gama.load_experiment(parameters=[
@@ -73,6 +76,7 @@ async def main(args):
                             python_position=v.position if v else None,
                             python_speed=v.speed if v else None,
                             python_lane=v.lane if v else None,
+                            python_road=v.road if v else None,
                             gama=ga)) + "\n")
                     if tick < args.horizon:
                         python.step(args.sample_every)
@@ -84,8 +88,16 @@ async def main(args):
                     gama.disconnect()
                 except Exception:
                     pass
-    print(json.dumps(dict(output=str(output), seed=args.seed,
-                          horizon=args.horizon, demand_sha256=digest)))
+    manifest = dict(output=str(output), seed=args.seed, horizon=args.horizon,
+                    sample_every=args.sample_every, demand_sha256=digest,
+                    python_sim_sha256=hashlib.sha256(
+                        (ROOT / "python-simulation/simulation/python_simulation/python_sim.py").read_bytes()).hexdigest(),
+                    demand_source_sha256=hashlib.sha256(
+                        (ROOT / "python-simulation/simulation/python_simulation/demand.py").read_bytes()).hexdigest(),
+                    gama_model_sha256=hashlib.sha256(
+                        (ROOT / "gama-simulation/simulation/models/LeVanLuong.gaml").read_bytes()).hexdigest())
+    output.with_suffix(".manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(json.dumps(manifest))
 
 
 if __name__ == "__main__":

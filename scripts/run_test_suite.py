@@ -24,7 +24,7 @@ GAMA_HEADLESS = os.environ.get(
     "GAMA_HEADLESS", "/Applications/Gama.app/Contents/headless/gama-headless.sh"
 )
 BASE_DIR = str(Path(__file__).resolve().parents[1])
-TEST_MODEL = os.path.join(BASE_DIR, "Traffic/models/test_traffic_controllers.gaml")
+TEST_MODEL = os.path.join(BASE_DIR, "train/benchmarks/gama/models/test_traffic_controllers.gaml")
 
 def run_test_suite():
     print("=" * 90)

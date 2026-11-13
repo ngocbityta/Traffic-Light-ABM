@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 
 
 BASE_URL = os.environ.get("LVL_OBSERVER_URL", "http://127.0.0.1:8765").rstrip("/")
-HTML_PATH = Path(__file__).resolve().parents[1] / "LeVanLuongIntersection" / "observer.html"
+HTML_PATH = Path(__file__).resolve().parents[1] / "python-simulation" / "ui" / "observer.html"
 
 
 def request(path, method="GET", payload=None):

@@ -1,0 +1,1542 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Điều phối giao thông · Lê Văn Lương</title>
+<style>
+:root{color-scheme:dark;--bg:#090f15;--panel:#101a24;--line:#223342;--text:#edf4f6;--muted:#9aadb9;--teal:#53d8c4;--orange:#ffb65e;--red:#ff6878;--green:#62d79a;--amber:#ffbe3b}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font:14px/1.4 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+body{display:flex;flex-direction:column}
+.topbar{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 16px;background:linear-gradient(180deg,#121d28,#0d161f);border-bottom:1px solid var(--line);flex-wrap:wrap;z-index:10}
+.bar-group{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.bar-title{font-size:14px;font-weight:800;letter-spacing:.01em;margin-right:4px;color:var(--text);white-space:nowrap}
+.button{height:34px;padding:0 13px;border:1px solid #314553;border-radius:8px;background:#182630;color:var(--text);font:inherit;font-size:13px;font-weight:700;cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:background .15s,border-color .15s,transform .12s;white-space:nowrap}
+.button:hover{background:#213541;border-color:#557080}
+.button:active{transform:scale(.98)}
+.button:disabled{opacity:.45;cursor:not-allowed}
+.button.primary{background:var(--teal);border-color:var(--teal);color:#06211d}
+.button.primary:hover{background:#6ae3d1;border-color:#6ae3d1}
+.speed-wrap{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);margin-left:4px;white-space:nowrap}
+.speed-wrap select{height:34px;border-radius:8px;border:1px solid #314553;background:#0b131b;color:var(--text);padding:0 10px;font:inherit;font-size:13px;font-weight:600;cursor:pointer}
+.speed-wrap select:focus{outline:2px solid #53d8c455;border-color:var(--teal)}
+.chk{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:#bdd0db;cursor:pointer;padding:0 4px;white-space:nowrap}
+.chk input{accent-color:var(--teal);cursor:pointer}
+.phase-pill{display:inline-flex;align-items:center;gap:7px;height:30px;padding:0 10px;border-radius:8px;background:#0b131b;border:1px solid #243646;font-size:12px}
+.phase-light{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 12px currentColor;color:var(--green);transition:all .2s}
+.phase-light.hdt{background:var(--green);color:var(--green)}
+.phase-light.red{background:var(--red);color:var(--red)}
+.phase-light.yellow{background:var(--amber);color:var(--amber)}
+.phase-timer{color:var(--amber);font-variant-numeric:tabular-nums;min-width:36px;text-align:right}
+.badge-fps{background:#182e38;color:var(--teal);border:1px solid #28555e;font-size:11px;font-weight:700;padding:3px 7px;border-radius:6px;font-variant-numeric:tabular-nums}
+.connection{display:inline-flex;align-items:center;gap:7px;color:var(--muted);font-size:12px;white-space:nowrap}
+.dot{width:8px;height:8px;border-radius:50%;background:#667681;box-shadow:0 0 0 3px #66768122;transition:all .2s}
+.dot.ok{background:var(--green);box-shadow:0 0 0 3px #62d79a22}
+.dot.err{background:var(--red);box-shadow:0 0 0 3px #ff687822}
+.viewport{position:relative;flex:1 1 auto;min-height:0;width:100%;background:radial-gradient(ellipse at center,#13202b,#090f15 80%);overflow:hidden}
+canvas{display:block;width:100%;height:100%;touch-action:none;cursor:grab}
+#overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1}
+canvas:active{cursor:grabbing}
+canvas:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
+.zoom-hud{position:absolute;top:12px;right:12px;display:flex;align-items:center;gap:4px;background:rgba(11,17,24,0.86);backdrop-filter:blur(8px);border:1px solid #2b3f4f;border-radius:10px;padding:4px;box-shadow:0 8px 24px #0006;z-index:2}
+.zoom-hud button{height:28px;min-width:28px;padding:0 8px;border:1px solid #304554;border-radius:6px;background:#162430;color:var(--text);font:600 12px/1 inherit;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;transition:background .15s,border-color .15s}
+.zoom-hud button:hover{background:#213646;border-color:var(--teal)}
+.zoom-hud .zoom-badge{font-size:11px;font-weight:700;color:var(--teal);padding:0 6px;min-width:42px;text-align:center;font-variant-numeric:tabular-nums}
+.legend-hud{position:absolute;top:12px;left:12px;display:flex;flex-wrap:wrap;gap:10px;padding:6px 10px;background:rgba(11,17,24,0.78);backdrop-filter:blur(6px);border:1px solid rgba(43,63,79,0.7);border-radius:8px;font-size:11px;color:#b9cad4;pointer-events:none;z-index:2}
+.signal-hud{position:absolute;top:52px;left:12px;display:flex;align-items:center;gap:10px;padding:8px 11px;border:1px solid #344b5a;border-radius:10px;background:rgba(8,14,20,.9);box-shadow:0 8px 24px #0007;pointer-events:none;z-index:3;min-width:180px}
+.signal-head{width:22px;padding:4px 3px;display:flex;flex-direction:column;gap:4px;background:#18232b;border:1px solid #52616a;border-radius:8px}
+.lamp{width:12px;height:12px;border-radius:50%;background:#34414a;box-shadow:inset 0 1px 2px #0008}
+.lamp.on.red{background:#ff5365;box-shadow:0 0 10px #ff5365aa}
+.lamp.on.yellow{background:#ffc247;box-shadow:0 0 10px #ffc247bb}
+.lamp.on.green{background:#55df91;box-shadow:0 0 10px #55df91bb}
+.signal-copy{display:flex;flex:1;flex-direction:column;gap:1px;min-width:0}
+.signal-copy strong{font-size:12px;white-space:nowrap}
+.signal-copy span{font-size:10px;color:var(--muted);white-space:nowrap}
+.signal-count{font-size:20px;line-height:1;font-weight:800;font-variant-numeric:tabular-nums;color:#fff;min-width:52px;text-align:right}
+.legend-item{display:flex;align-items:center;gap:5px}
+.swatch{width:9px;height:9px;border-radius:50%;display:inline-block}
+.swatch.car{border-radius:2px;width:12px;height:7px;background:var(--orange)}
+.swatch.bike{background:var(--teal)}
+.swatch.blinker{background:var(--amber);box-shadow:0 0 5px var(--amber)}
+.signal{width:16px;height:5px;border-radius:4px;background:var(--green)}
+.signal.red{background:var(--red)}
+.signal.yellow{background:var(--amber);box-shadow:0 0 6px #ffbe3b88}
+.zoom-hint{position:absolute;bottom:12px;left:12px;font-size:11px;color:rgba(190,210,220,0.72);background:rgba(11,17,24,0.76);padding:5px 10px;border-radius:7px;pointer-events:none;border:1px solid rgba(43,63,79,0.6);z-index:2}
+.vehicle-info{position:absolute;bottom:12px;right:12px;max-width:min(520px,calc(100vw - 24px));padding:7px 12px;color:#d8e7ec;font-size:12px;border:1px solid #2b3f4f;border-radius:8px;background:rgba(11,17,24,0.84);backdrop-filter:blur(8px);pointer-events:none;z-index:2;line-height:1.4}
+.vehicle-info .tag-bezier{display:inline-block;background:#183c2e;color:#54e79b;border:1px solid #2e7552;padding:1px 6px;border-radius:4px;font-weight:700;margin-left:6px;font-size:11px}
+.floating-stack{position:absolute;top:54px;left:50%;transform:translateX(-50%);display:flex;flex-direction:column;gap:8px;align-items:center;z-index:5;max-width:min(540px,calc(100vw - 24px))}
+.message{display:none;padding:9px 14px;border-radius:8px;background:rgba(43,25,28,0.94);color:#ffb6bd;border:1px solid #67343b;font-size:12px;box-shadow:0 8px 24px #0008}
+.message.show{display:block}
+.decision{display:none;padding:9px 14px;border:1px solid #8a6636;background:rgba(48,39,25,0.94);color:#ffd79a;border-radius:8px;font-size:12px;box-shadow:0 8px 24px #0008}
+.decision.show{display:block}
+.actions{display:none;gap:8px;background:rgba(11,17,24,0.9);padding:6px;border-radius:10px;border:1px solid #314553}
+.actions.show{display:flex}
+@media(max-width:720px){.legend-hud,.zoom-hint{display:none}.topbar{padding:8px 10px}}
+</style>
+</head>
+<body>
+<header class="topbar">
+ <div class="bar-group">
+  <span class="bar-title">Nút giao Lê Văn Lương</span>
+  <button id="run" class="button primary">▶ Chạy</button>
+  <button id="pause" class="button" disabled>Ⅱ Tạm dừng</button>
+  <button id="reset" class="button">↺ Đặt lại</button>
+  <label class="speed-wrap" for="speedMult">
+   <span>Tốc độ quan sát</span>
+   <select id="speedMult">
+    <option value="0.5">0.5x · Chậm</option>
+    <option value="1.0" selected>1.0x · Thực tế</option>
+    <option value="1.5">1.5x · Nhanh vừa</option>
+    <option value="2.0">2.0x · Nhanh 2x</option>
+   </select>
+  </label>
+ </div>
+ <div class="bar-group">
+  <label class="chk"><input type="checkbox" id="toggleBlinkers" checked><span>Xi-nhan</span></label>
+  <label class="chk"><input type="checkbox" id="toggleSublanes"><span>Sublane</span></label>
+  <span class="phase-pill" title="Trạng thái đèn và thời gian còn lại"><i id="phaseLight" class="phase-light"></i><strong id="phaseName">—</strong><span id="phaseTimer" class="phase-timer">—</span></span>
+  <span id="fpsBadge" class="badge-fps">60 FPS</span>
+  <span class="connection"><i id="connectionDot" class="dot"></i><span id="connectionText">Đang kết nối…</span></span>
+ </div>
+</header>
+<main class="viewport">
+ <canvas id="map" tabindex="0" aria-label="Sơ đồ các đoạn đường và xe. Cuộn chuột để zoom, kéo để di chuyển, bấm vào xe để xem thông tin."></canvas>
+ <canvas id="overlay" aria-hidden="true"></canvas>
+ <div class="signal-hud" role="status" aria-live="polite" aria-label="Trạng thái đèn giao thông">
+  <div class="signal-head" aria-hidden="true"><i id="lampRed" class="lamp red"></i><i id="lampYellow" class="lamp yellow"></i><i id="lampGreen" class="lamp green"></i></div>
+  <div class="signal-copy"><strong id="signalHudPhase">Đang tải đèn</strong><span id="signalHudDirection">—</span></div>
+  <strong id="signalHudTimer" class="signal-count">—</strong>
+ </div>
+ <div class="legend-hud" aria-hidden="true">
+  <span class="legend-item"><i class="swatch bike"></i>Xe máy</span>
+  <span class="legend-item"><i class="swatch car"></i>Ô tô</span>
+  <span class="legend-item"><i class="swatch blinker"></i>Xi-nhan</span>
+  <span class="legend-item"><i class="signal"></i>Đèn xanh</span>
+  <span class="legend-item"><i class="signal yellow"></i>Đèn vàng</span>
+  <span class="legend-item"><i class="signal red"></i>Đèn đỏ</span>
+ </div>
+ <div class="zoom-hud" aria-label="Điều khiển thu phóng">
+  <button type="button" id="zoomIn" title="Phóng to (+)">＋</button>
+  <button type="button" id="zoomOut" title="Thu nhỏ (-)">－</button>
+  <span id="zoomBadge" class="zoom-badge">1.0x</span>
+  <button type="button" id="zoomCenter" title="Phóng to vào tâm ngã tư">🎯 Ngã tư</button>
+  <button type="button" id="zoomReset" title="Xem toàn cảnh">⛶ Toàn cảnh</button>
+ </div>
+ <div class="floating-stack">
+  <div id="message" class="message" role="alert"></div>
+  <div class="decision" id="decisionStatus" role="status">Đang chờ quyết định điều khiển.</div>
+  <div class="actions" id="trainActions">
+   <button id="actionLvl" class="button">LVL · hành động 0</button>
+   <button id="actionHdt" class="button">HDT · hành động 2</button>
+  </div>
+ </div>
+ <div class="zoom-hint">Cuộn chuột để zoom · Kéo để di chuyển · Đúp chuột để phóng to</div>
+ <div id="vehicleInfo" class="vehicle-info" aria-live="polite">Di chuột hoặc bấm vào xe để xem thông tin.</div>
+</main>
+<div hidden aria-hidden="true">
+ <select id="mode"><option value="fixed" selected>fixed</option><option value="train">train</option></select>
+ <select id="rate"><option value="1" selected>1</option><option value="5">5</option><option value="20">20</option></select>
+ <input id="seed" type="number" step="1" value="1">
+ <button id="step1" type="button"></button>
+ <button id="step50" type="button"></button>
+ <span id="phaseDesc"></span><span id="roadCount"></span><span id="activeLanesCount"></span>
+ <span id="cycle"></span><span id="time"></span><span id="created"></span><span id="passed"></span>
+ <span id="active"></span><span id="queue"></span><span id="vehicleCount"></span>
+ <span id="frNe"></span><span id="frSe"></span><span id="frSw"></span><span id="frNw"></span>
+ <span id="queueIntegral"></span><span id="delayIntegral"></span><span id="passRate"></span><span id="nextDecision"></span>
+</div>
+<script>
+(()=>{
+ 'use strict';
+ const el=id=>document.getElementById(id);
+ const setTxt=(id,text)=>{const node=el(id);if(node)node.textContent=text};
+ const canvas=document.getElementById('map');
+ const overlay=el('overlay');
+ const octx=overlay?.getContext?.('2d')||null;
+ let gl=null,ctx=null;
+ if(typeof WebGLRenderingContext!=='undefined'){
+  gl=canvas.getContext('webgl',{antialias:true,alpha:false,powerPreference:'high-performance'})||
+     canvas.getContext('experimental-webgl',{antialias:true,alpha:false});
+ }
+ if(!gl) ctx=canvas.getContext('2d');
+
+ // Data stores
+ let roads=[],roadById=new Map(),areas=[],vehicles=[],state=null;
+ let running=false,runToken=0,busy=false,resetting=false,waitingAction=false;
+ let hoveredVehicle=null,selectedVehicle=null,vehiclePoints=[];
+ let bounds=null,view={w:0,h:0,dpr:1},cachedBaseScale=1,cachedBaseOx=0,cachedBaseOy=0;
+ const cam={zoom:1.0,panX:0,panY:0};
+ let dragging=false,dragMoved=false,dragStart={x:0,y:0},panStart={x:0,y:0};
+
+ // Interpolation state for smooth 60 FPS animation
+ const getNow=()=>(typeof performance!=='undefined'&&performance.now?performance.now():Date.now());
+ let prevVehiclesMap=new Map();
+ let currVehiclesMap=new Map();
+ let lastTickTime=getNow();
+ let tickIntervalMs=200;
+ let snapshotDelta=1;
+ let displayedVehicles=[];
+ let fpsFrames=0,lastFpsUpdate=getNow(),currentFps=60;
+
+ const colors={LVL:'#61dca0',HDT:'#61dca0',YELLOW:'#ffbe3b','ALL-RED':'#ff6878',ALL_RED:'#ff6878',RED:'#ff6878'};
+ const SUBLANE_W=1.05,SUBLANES_PER_MAJOR=3;
+
+ function showError(msg){const box=el('message');box.textContent=msg;box.classList.add('show')}
+ function clearError(){el('message').classList.remove('show')}
+ function setConnection(ok,label){el('connectionDot').className='dot '+(ok?'ok':'err');el('connectionText').textContent=label}
+
+ function parseRoads(data){
+  const list=Array.isArray(data)?data:(data?.features||data?.roads||[]);
+  return list.map((item,i)=>{
+   const p=item.properties||item;
+   let coordinates=item.coordinates||item.geometry?.coordinates||item.points||[];
+   if(item.geometry?.type==='MultiLineString')coordinates=coordinates[0]||[];
+   const coords=coordinates.map(pt=>[Number(pt[0]),Number(pt[1])]).filter(pt=>pt.every(Number.isFinite));
+   const lengths=[],segTangents=[];let total=0;
+   for(let k=1;k<coords.length;k++){
+    const dx=coords[k][0]-coords[k-1][0],dy=coords[k][1]-coords[k-1][1];
+    const d=Math.hypot(dx,dy);
+    lengths.push(d);total+=d;
+    segTangents.push(d>0?[dx/d,dy/d]:[1,0]);
+   }
+   const vTangents=[];
+   for(let k=0;k<coords.length;k++){
+    if(k===0)vTangents.push(segTangents[0]||[1,0]);
+    else if(k===coords.length-1)vTangents.push(segTangents.at(-1)||[1,0]);
+    else{
+     const sx=segTangents[k-1][0]+segTangents[k][0],sy=segTangents[k-1][1]+segTangents[k][1];
+     const m=Math.hypot(sx,sy);
+     vTangents.push(m>1e-6?[sx/m,sy/m]:segTangents[k]);
+    }
+   }
+   return{
+    id:p.id||item.id||`road-${i}`,name:p.name||'',kind:p.kind||'',arm:p.arm||'',to_arm:p.to_arm||'',turn:p.turn||'',
+    num_lanes:p.num_lanes||1,width:Number(p.width)||(Number(p.num_lanes||1)*SUBLANE_W),
+    coordinates:coords,lengths,totalLength:total,vTangents
+   };
+  }).filter(r=>r.coordinates.length>=2);
+ }
+
+ function parseAreas(data){
+  const list=Array.isArray(data)?data:(data?.features||data?.areas||[]);
+  return list.map((item,i)=>{
+   const p=item.properties||item;
+   let coordinates=item.coordinates||item.geometry?.coordinates||[];
+   return{id:`area-${i}`,kind:p.kind||'',arm:p.arm||'',type:item.geometry?.type||'Polygon',coordinates};
+  }).filter(a=>a.coordinates.length>0);
+ }
+
+ function updateBaseTransform(){
+  if(!bounds){cachedBaseScale=1;cachedBaseOx=0;cachedBaseOy=0;return;}
+  const pad=34,dx=bounds.maxX-bounds.minX||1,dy=bounds.maxY-bounds.minY||1;
+  cachedBaseScale=Math.min((view.w-pad*2)/dx,(view.h-pad*2)/dy);
+  cachedBaseOx=(view.w-dx*cachedBaseScale)/2;
+  cachedBaseOy=(view.h-dy*cachedBaseScale)/2;
+ }
+
+ function resize(){
+  const rect=canvas.getBoundingClientRect(),dpr=Math.min(devicePixelRatio||1,2);
+  view={w:rect.width,h:rect.height,dpr};
+  const pw=Math.max(1,Math.round(rect.width*dpr)),ph=Math.max(1,Math.round(rect.height*dpr));
+  canvas.width=pw;
+  canvas.height=ph;
+  if(gl) gl.viewport(0,0,pw,ph);
+  else if(ctx) ctx.setTransform(dpr,0,0,dpr,0,0);
+  if(overlay&&octx){
+   overlay.width=pw;overlay.height=ph;
+   octx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  updateBaseTransform();
+ }
+
+ function getBaseScale(){
+  return cachedBaseScale;
+ }
+
+ function getWorldScale(){
+  return cachedBaseScale*cam.zoom;
+ }
+
+ function updateZoomBadge(){
+  setTxt('zoomBadge',`${cam.zoom.toFixed(1)}x`);
+ }
+
+ function project(point){
+  const scale=cachedBaseScale;
+  const bx=cachedBaseOx+(point[0]-bounds.minX)*scale;
+  const by=view.h-(cachedBaseOy+(point[1]-bounds.minY)*scale);
+  return{
+   x:(bx-view.w/2)*cam.zoom+view.w/2+cam.panX,
+   y:(by-view.h/2)*cam.zoom+view.h/2+cam.panY
+  };
+ }
+
+ function zoomAt(nextZoom,sx,sy){
+  const oldZoom=cam.zoom;
+  const clamped=Math.max(0.5,Math.min(14.0,nextZoom));
+  if(Math.abs(clamped-oldZoom)<1e-4)return;
+  const cx=sx!=null?sx:view.w/2,cy=sy!=null?sy:view.h/2;
+  const k=clamped/oldZoom;
+  cam.panX=cx-view.w/2-(cx-view.w/2-cam.panX)*k;
+  cam.panY=cy-view.h/2-(cy-view.h/2-cam.panY)*k;
+  cam.zoom=clamped;
+  updateZoomBadge();
+  draw();
+ }
+
+ function focusIntersection(){
+  if(!bounds)return;
+  const conflict=areas.find(a=>a.kind==='conflict');
+  let wx=(bounds.minX+bounds.maxX)/2,wy=(bounds.minY+bounds.maxY)/2;
+  if(conflict&&conflict.coordinates[0]?.length){
+   const ring=conflict.coordinates[0];
+   wx=ring.reduce((s,p)=>s+p[0],0)/ring.length;
+   wy=ring.reduce((s,p)=>s+p[1],0)/ring.length;
+  }
+  const bx=cachedBaseOx+(wx-bounds.minX)*cachedBaseScale;
+  const by=view.h-(cachedBaseOy+(wy-bounds.minY)*cachedBaseScale);
+  cam.zoom=3.2;
+  cam.panX=-(bx-view.w/2)*cam.zoom;
+  cam.panY=-(by-view.h/2)*cam.zoom;
+  updateZoomBadge();
+  draw();
+ }
+
+ function resetZoom(){
+  cam.zoom=1.0;cam.panX=0;cam.panY=0;
+  updateZoomBadge();
+  draw();
+ }
+
+ function roadPosition(r,progress){
+  const pts=r.coordinates,lengths=r.lengths,total=r.totalLength,vt=r.vTangents;
+  let t=Math.max(0,Math.min(total,Number(progress)||0));
+  for(let i=0;i<lengths.length;i++){
+   const length=lengths[i];
+   if(t<=length||i===lengths.length-1){
+    const a=pts[i],b=pts[i+1],f=length?t/length:0;
+    let tx,ty;
+    if(vt&&vt.length===pts.length){
+     const lx=vt[i][0]+(vt[i+1][0]-vt[i][0])*f,ly=vt[i][1]+(vt[i+1][1]-vt[i][1])*f;
+     const lm=Math.hypot(lx,ly)||1;
+     tx=lx/lm;ty=ly/lm;
+    }else{
+     tx=length?(b[0]-a[0])/length:1;ty=length?(b[1]-a[1])/length:0;
+    }
+    return{point:[a[0]+(b[0]-a[0])*f,a[1]+(b[1]-a[1])*f],tangent:[tx,ty]};
+   }
+   t-=length;
+  }
+  const a=pts.at(-2),b=pts.at(-1),length=lengths.at(-1)||1;
+  return{point:b,tangent:vt&&vt.length?vt.at(-1):[(b[0]-a[0])/length,(b[1]-a[1])/length]};
+ }
+
+ function vehicleWorldPoint(v){
+  const r=roadById.get(v.road);
+  if(!r)return null;
+  const at=roadPosition(r,v.progress);
+  const shift=v.lateral_shift!=null?Number(v.lateral_shift):
+    (Number(v.lane||0)+(Number(v.occupied||1)-1)/2)*SUBLANE_W;
+  const dist=Number(r.num_lanes||1)*SUBLANE_W-shift-SUBLANE_W*0.5;
+  return [at.point[0]+at.tangent[1]*dist,at.point[1]-at.tangent[0]*dist];
+ }
+
+ function signalFor(road){
+  if(road.kind!=='approach')return '#5d7280';
+  const phase=String(state?.phase||'').toUpperCase().replace('_','-');
+  const yellow=String(state?.yellow_phase||'').toUpperCase();
+  const yellowArms=yellow==='LVL'?['NE','SW']:yellow==='HDT'?['SE','NW']:[];
+  const lvlArms=['NE','SW'],hdtArms=['SE','NW'];
+  if(yellowArms.includes(road.arm))return colors.YELLOW;
+  if(phase==='LVL'&&lvlArms.includes(road.arm))return colors.LVL;
+  if(phase==='HDT'&&hdtArms.includes(road.arm))return colors.HDT;
+  return colors['ALL-RED'];
+ }
+
+ function drawGrid(){
+  if(!bounds)return;
+  const step=20;
+  const startX=Math.floor(bounds.minX/step)*step,endX=Math.ceil(bounds.maxX/step)*step;
+  const startY=Math.floor(bounds.minY/step)*step,endY=Math.ceil(bounds.maxY/step)*step;
+  ctx.save();
+  ctx.strokeStyle='rgba(255,255,255,0.025)';
+  ctx.lineWidth=1;
+  ctx.beginPath();
+  for(let x=startX;x<=endX;x+=step){
+   const a=project([x,startY]),b=project([x,endY]);
+   ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);
+  }
+  for(let y=startY;y<=endY;y+=step){
+   const a=project([startX,y]),b=project([endX,y]);
+   ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);
+  }
+  ctx.stroke();
+  ctx.restore();
+ }
+
+ function drawRoad(r){
+  if(r.kind==='connector')return;
+  const pts=r.coordinates.map(project);
+  const hasAreas=areas.length>0;
+  const worldScale=getWorldScale();
+  ctx.save();
+  ctx.beginPath();
+  pts.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));
+  ctx.lineCap='round';ctx.lineJoin='round';
+  if(hasAreas){
+   ctx.strokeStyle='rgba(148,175,195,0.24)';
+   ctx.lineWidth=1;
+  }else{
+   ctx.strokeStyle='#3e505e';
+   ctx.lineWidth=8;
+  }
+  ctx.stroke();
+  ctx.restore();
+
+  if(hasAreas && (r.kind==='approach'||r.kind==='exit')){
+   const numLanes=Number(r.num_lanes||1);
+   const a0=r.coordinates[0],a1=r.coordinates.at(-1);
+   const dx=a1[0]-a0[0],dy=a1[1]-a0[1],len=Math.hypot(dx,dy)||1;
+   const tx=dx/len,ty=dy/len;
+   ctx.save();
+   ctx.strokeStyle='rgba(255,255,255,0.11)';
+   ctx.lineWidth=Math.max(0.8,0.15*worldScale);
+   ctx.setLineDash([Math.max(4,2.8*worldScale),Math.max(4,2.8*worldScale)]);
+   for(let l=SUBLANES_PER_MAJOR;l<numLanes;l+=SUBLANES_PER_MAJOR){
+    const subDist=(numLanes-l)*SUBLANE_W;
+    const pA=project([a0[0]+ty*subDist,a0[1]-tx*subDist]);
+    const pB=project([a1[0]+ty*subDist,a1[1]-tx*subDist]);
+    ctx.beginPath();ctx.moveTo(pA.x,pA.y);ctx.lineTo(pB.x,pB.y);ctx.stroke();
+   }
+   ctx.restore();
+
+   // Painted directional arrows on asphalt
+   if(worldScale>=1.5){
+    ctx.save();
+    ctx.strokeStyle='rgba(255,255,255,0.22)';
+    ctx.lineWidth=Math.max(1.1,0.22*worldScale);
+    ctx.lineCap='round';ctx.lineJoin='round';
+    const midDist=(numLanes*SUBLANE_W)*0.5;
+    for(const sProg of [45,95]){
+     if(sProg>=len-8)continue;
+     const at=roadPosition(r,sProg);
+     const cx=at.point[0]+at.tangent[1]*midDist,cy=at.point[1]-at.tangent[0]*midDist;
+     const tip=project([cx+at.tangent[0]*2.2,cy+at.tangent[1]*2.2]);
+     const tail=project([cx-at.tangent[0]*2.2,cy-at.tangent[1]*2.2]);
+     const w1=project([cx+at.tangent[0]*0.6+at.tangent[1]*1.1,cy+at.tangent[1]*0.6-at.tangent[0]*1.1]);
+     const w2=project([cx+at.tangent[0]*0.6-at.tangent[1]*1.1,cy+at.tangent[1]*0.6+at.tangent[0]*1.1]);
+     ctx.beginPath();
+     ctx.moveTo(tail.x,tail.y);ctx.lineTo(tip.x,tip.y);
+     ctx.moveTo(w1.x,w1.y);ctx.lineTo(tip.x,tip.y);ctx.lineTo(w2.x,w2.y);
+     ctx.stroke();
+    }
+    ctx.restore();
+   }
+  }
+
+  const toggleSub=el('toggleSublanes');
+  const hasAreaSublanes=areas.some(a=>a.kind==='sublane');
+  if(toggleSub && toggleSub.checked && !hasAreaSublanes && r.kind!=='connector'){
+   const numLanes=r.num_lanes||1;
+   for(let l=1;l<numLanes;l++){
+    const subDist=(numLanes-l)*SUBLANE_W;
+    ctx.beginPath();
+    for(let i=0;i<r.coordinates.length;i++){
+     const at=roadPosition(r,i===0?0:(i===r.coordinates.length-1?9999:(i*r.width/2)));
+     const [tx,ty]=at.tangent;
+     const pt=[at.point[0]+ty*subDist,at.point[1]-tx*subDist];
+     const p=project(pt);
+     i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y);
+    }
+    ctx.strokeStyle='rgba(255,255,255,0.06)';ctx.lineWidth=1;ctx.stroke();
+   }
+  }
+
+  if(r.kind==='approach'||r.kind==='exit'){
+   const mid=roadPosition(r,58);
+   const curbDist=(Number(r.num_lanes||1)*SUBLANE_W)+4.2;
+   const lblPt=[mid.point[0]+mid.tangent[1]*curbDist,mid.point[1]-mid.tangent[0]*curbDist];
+   const p=project(lblPt);
+   if(p&&p.x>18&&p.x<view.w-18&&p.y>16&&p.y<view.h-16){
+    ctx.font=`600 ${cam.zoom>=2?11:10}px system-ui`;
+    ctx.fillStyle='#9eb4c2';ctx.textAlign='center';ctx.fillText(r.id,p.x,p.y);
+   }
+  }
+ }
+
+ function drawAreas(){
+  if(!areas.length)return;
+  const worldScale=getWorldScale();
+  for(const a of areas){
+   if(a.kind==='asphalt'){
+    const ring=a.coordinates[0];if(!ring)continue;
+    ctx.beginPath();ring.forEach((pt,i)=>{const p=project(pt);i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)});
+    ctx.closePath();ctx.fillStyle='#172430';ctx.fill();
+    ctx.strokeStyle='#3c5468';ctx.lineWidth=Math.max(1.2,0.3*worldScale);ctx.stroke();
+   }
+  }
+  for(const a of areas){
+   if(a.kind==='conflict'){
+    const ring=a.coordinates[0];if(!ring)continue;
+    ctx.save();
+    ctx.beginPath();ring.forEach((pt,i)=>{const p=project(pt);i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)});
+    ctx.closePath();ctx.fillStyle='#1b2c3b';ctx.fill();
+    ctx.strokeStyle='rgba(83,216,196,0.22)';ctx.lineWidth=1;ctx.setLineDash([5,5]);ctx.stroke();
+    ctx.restore();
+   }
+  }
+  const toggleSub=el('toggleSublanes');
+  if(toggleSub && toggleSub.checked){
+   ctx.save();
+   ctx.strokeStyle='rgba(83,216,196,0.18)';
+   ctx.lineWidth=Math.max(0.8,0.12*worldScale);
+   for(const a of areas){
+    if(a.kind==='sublane'){
+     const pts=a.coordinates;if(!pts||pts.length<2)continue;
+     ctx.beginPath();pts.forEach((pt,i)=>{const p=project(pt);i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)});
+     ctx.stroke();
+    }
+   }
+   ctx.restore();
+  }
+  for(const a of areas){
+   if(a.kind==='crosswalk'){
+    const ring=a.coordinates[0];if(!ring)continue;
+    ctx.beginPath();ring.forEach((pt,i)=>{const p=project(pt);i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)});
+    ctx.closePath();ctx.fillStyle='rgba(255,255,255,0.17)';ctx.fill();ctx.strokeStyle='rgba(255,255,255,0.32)';ctx.lineWidth=1;ctx.stroke();
+   }
+  }
+  for(const a of areas){
+   if(a.kind==='stopline'){
+    const pts=a.coordinates;if(!pts||pts.length<2)continue;
+    ctx.beginPath();pts.forEach((pt,i)=>{const p=project(pt);i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)});
+    ctx.strokeStyle='rgba(255,255,255,0.45)';ctx.lineWidth=Math.max(1.5,0.35*worldScale);ctx.stroke();
+   }
+  }
+  for(const a of areas){
+   if(a.kind==='median'){
+    const ring=a.coordinates[0];if(!ring)continue;
+    ctx.beginPath();ring.forEach((pt,i)=>{const p=project(pt);i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)});
+    ctx.closePath();ctx.fillStyle='#1c4732';ctx.fill();ctx.strokeStyle='#38825b';ctx.lineWidth=Math.max(1.2,0.28*worldScale);ctx.stroke();
+   }
+  }
+ }
+
+ const glState={
+  ready:false,prog:null,aPos:-1,aCol:-1,uView:null,uScale:null,uOffset:null,uCam:null,
+  staticVbo:null,staticCount:0,sublaneVbo:null,sublaneCount:0,
+  dynVbo:null,dynBuf:new Float32Array(240000),dynLen:0,dynCap:240000,vboCap:240000,
+  originX:0,originY:0
+ };
+
+ function ensureDyn(extraFloats){
+  if(glState.dynLen+extraFloats<=glState.dynCap)return;
+  let nextCap=glState.dynCap;
+  while(nextCap<glState.dynLen+extraFloats)nextCap*=2;
+  const next=new Float32Array(nextCap);
+  next.set(glState.dynBuf.subarray(0,glState.dynLen));
+  glState.dynBuf=next;glState.dynCap=nextCap;
+ }
+
+ function pushVert(buf,off,x,y,c){
+  buf[off]=x-glState.originX;buf[off+1]=y-glState.originY;
+  buf[off+2]=c[0];buf[off+3]=c[1];buf[off+4]=c[2];buf[off+5]=c[3];
+ }
+
+ function pushTriDyn(x1,y1,x2,y2,x3,y3,c){
+  ensureDyn(18);
+  const b=glState.dynBuf;let o=glState.dynLen;
+  pushVert(b,o,x1,y1,c);pushVert(b,o+6,x2,y2,c);pushVert(b,o+12,x3,y3,c);
+  glState.dynLen=o+18;
+ }
+
+ function pushQuadDyn(cx,cy,fx,fy,rx,ry,hw,hh,c){
+  const x1=cx+fx*hw+rx*hh,y1=cy+fy*hw+ry*hh;
+  const x2=cx-fx*hw+rx*hh,y2=cy-fy*hw+ry*hh;
+  const x3=cx-fx*hw-rx*hh,y3=cy-fy*hw-ry*hh;
+  const x4=cx+fx*hw-rx*hh,y4=cy+fy*hw-ry*hh;
+  ensureDyn(36);
+  const b=glState.dynBuf;let o=glState.dynLen;
+  pushVert(b,o,x1,y1,c);pushVert(b,o+6,x2,y2,c);pushVert(b,o+12,x3,y3,c);
+  pushVert(b,o+18,x1,y1,c);pushVert(b,o+24,x3,y3,c);pushVert(b,o+30,x4,y4,c);
+  glState.dynLen=o+36;
+ }
+
+ function pushSegDyn(x1,y1,x2,y2,halfW,c){
+  const dx=x2-x1,dy=y2-y1,L=Math.hypot(dx,dy);
+  if(L<1e-6)return;
+  const nx=(dy/L)*halfW,ny=-(dx/L)*halfW;
+  ensureDyn(36);
+  const b=glState.dynBuf;let o=glState.dynLen;
+  pushVert(b,o,x1+nx,y1+ny,c);pushVert(b,o+6,x2+nx,y2+ny,c);pushVert(b,o+12,x2-nx,y2-ny,c);
+  pushVert(b,o+18,x1+nx,y1+ny,c);pushVert(b,o+24,x2-nx,y2-ny,c);pushVert(b,o+30,x1-nx,y1-ny,c);
+  glState.dynLen=o+36;
+ }
+
+ function pushCircleDyn(cx,cy,r,segs,c){
+  ensureDyn(segs*18);
+  const b=glState.dynBuf;let o=glState.dynLen;
+  for(let i=0;i<segs;i++){
+   const a0=(i/segs)*Math.PI*2,a1=((i+1)/segs)*Math.PI*2;
+   pushVert(b,o,cx,cy,c);
+   pushVert(b,o+6,cx+Math.cos(a0)*r,cy+Math.sin(a0)*r,c);
+   pushVert(b,o+12,cx+Math.cos(a1)*r,cy+Math.sin(a1)*r,c);
+   o+=18;
+  }
+  glState.dynLen=o;
+ }
+
+ function pushRingDyn(cx,cy,rIn,rOut,segs,c){
+  ensureDyn(segs*36);
+  const b=glState.dynBuf;let o=glState.dynLen;
+  for(let i=0;i<segs;i++){
+   const a0=(i/segs)*Math.PI*2,a1=((i+1)/segs)*Math.PI*2;
+   const c0=Math.cos(a0),s0=Math.sin(a0),c1=Math.cos(a1),s1=Math.sin(a1);
+   pushVert(b,o,cx+c0*rIn,cy+s0*rIn,c);
+   pushVert(b,o+6,cx+c0*rOut,cy+s0*rOut,c);
+   pushVert(b,o+12,cx+c1*rOut,cy+s1*rOut,c);
+   pushVert(b,o+18,cx+c0*rIn,cy+s0*rIn,c);
+   pushVert(b,o+24,cx+c1*rOut,cy+s1*rOut,c);
+   pushVert(b,o+30,cx+c1*rIn,cy+s1*rIn,c);
+   o+=36;
+  }
+  glState.dynLen=o;
+ }
+
+ function pointInTri2D(px,py,ax,ay,bx,by,cx,cy){
+  const c1=(bx-ax)*(py-ay)-(by-ay)*(px-ax);
+  const c2=(cx-bx)*(py-by)-(cy-by)*(px-bx);
+  const c3=(ax-cx)*(py-cy)-(ay-cy)*(px-cx);
+  return (c1>=0&&c2>=0&&c3>=0)||(c1<=0&&c2<=0&&c3<=0);
+ }
+
+ function triangulateRing(ring,ox,oy){
+  const pts=ring.map(p=>[p[0]-ox,p[1]-oy]);
+  if(pts.length>2&&Math.hypot(pts[0][0]-pts.at(-1)[0],pts[0][1]-pts.at(-1)[1])<1e-6)pts.pop();
+  if(pts.length<3)return[];
+  let area=0;
+  for(let i=0,j=pts.length-1;i<pts.length;j=i++)area+=(pts[j][0]*pts[i][1]-pts[i][0]*pts[j][1]);
+  if(area<0)pts.reverse();
+  const idx=pts.map((_,i)=>i),tris=[];
+  let guard=0;
+  while(idx.length>3&&guard<pts.length*pts.length){
+   guard++;let found=false;
+   for(let k=0;k<idx.length;k++){
+    const i0=idx[(k-1+idx.length)%idx.length],i1=idx[k],i2=idx[(k+1)%idx.length];
+    const a=pts[i0],b=pts[i1],c=pts[i2];
+    if((b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])<=1e-9)continue;
+    let inside=false;
+    for(let m=0;m<idx.length;m++){
+     const im=idx[m];
+     if(im===i0||im===i1||im===i2)continue;
+     if(pointInTri2D(pts[im][0],pts[im][1],a[0],a[1],b[0],b[1],c[0],c[1])){inside=true;break;}
+    }
+    if(!inside){tris.push(a[0],a[1],b[0],b[1],c[0],c[1]);idx.splice(k,1);found=true;break;}
+   }
+   if(!found)break;
+  }
+  if(idx.length===3){
+   const a=pts[idx[0]],b=pts[idx[1]],c=pts[idx[2]];
+   tris.push(a[0],a[1],b[0],b[1],c[0],c[1]);
+  }
+  return tris;
+ }
+
+ function initGL(){
+  if(!gl)return false;
+  const vs=`
+   attribute vec2 a_pos;
+   attribute vec4 a_color;
+   uniform vec2 u_view;
+   uniform float u_scale;
+   uniform vec2 u_offset;
+   uniform vec3 u_cam;
+   varying vec4 v_color;
+   void main(){
+    float bx=u_offset.x+a_pos.x*u_scale;
+    float by=u_view.y-(u_offset.y+a_pos.y*u_scale);
+    float sx=(bx-u_view.x*0.5)*u_cam.x+u_view.x*0.5+u_cam.y;
+    float sy=(by-u_view.y*0.5)*u_cam.x+u_view.y*0.5+u_cam.z;
+    gl_Position=vec4((sx/u_view.x)*2.0-1.0,1.0-(sy/u_view.y)*2.0,0.0,1.0);
+    v_color=a_color;
+   }`;
+  const fs=`
+   precision mediump float;
+   varying vec4 v_color;
+   void main(){gl_FragColor=v_color;}`;
+  const comp=(type,src)=>{const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))return null;return s;};
+  const s1=comp(gl.VERTEX_SHADER,vs),s2=comp(gl.FRAGMENT_SHADER,fs);
+  if(!s1||!s2)return false;
+  const p=gl.createProgram();
+  gl.attachShader(p,s1);gl.attachShader(p,s2);gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS))return false;
+  glState.prog=p;
+  glState.aPos=gl.getAttribLocation(p,'a_pos');
+  glState.aCol=gl.getAttribLocation(p,'a_color');
+  glState.uView=gl.getUniformLocation(p,'u_view');
+  glState.uScale=gl.getUniformLocation(p,'u_scale');
+  glState.uOffset=gl.getUniformLocation(p,'u_offset');
+  glState.uCam=gl.getUniformLocation(p,'u_cam');
+  glState.staticVbo=gl.createBuffer();
+  glState.sublaneVbo=gl.createBuffer();
+  glState.dynVbo=gl.createBuffer();
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+  return true;
+ }
+
+ function buildStaticGL(){
+  if(!gl||!bounds||!glState.prog&&!initGL())return;
+  glState.originX=bounds.minX;glState.originY=bounds.minY;
+  const out=[];
+  const addVert=(x,y,c)=>out.push(x-glState.originX,y-glState.originY,c[0],c[1],c[2],c[3]);
+  const addSeg=(x1,y1,x2,y2,hw,c)=>{
+   const dx=x2-x1,dy=y2-y1,L=Math.hypot(dx,dy);if(L<1e-6)return;
+   const nx=(dy/L)*hw,ny=-(dx/L)*hw;
+   addVert(x1+nx,y1+ny,c);addVert(x2+nx,y2+ny,c);addVert(x2-nx,y2-ny,c);
+   addVert(x1+nx,y1+ny,c);addVert(x2-nx,y2-ny,c);addVert(x1-nx,y1-ny,c);
+  };
+  const addPoly=(ring,c)=>{
+   const tris=triangulateRing(ring,glState.originX,glState.originY);
+   for(let i=0;i<tris.length;i+=6){
+    out.push(tris[i],tris[i+1],c[0],c[1],c[2],c[3],
+             tris[i+2],tris[i+3],c[0],c[1],c[2],c[3],
+             tris[i+4],tris[i+5],c[0],c[1],c[2],c[3]);
+   }
+  };
+  const addRingStroke=(ring,hw,c,dash)=>{
+   for(let i=0;i<ring.length;i++){
+    const a=ring[i],b=ring[(i+1)%ring.length];
+    if(!dash){addSeg(a[0],a[1],b[0],b[1],hw,c);}
+    else{
+     const dx=b[0]-a[0],dy=b[1]-a[1],L=Math.hypot(dx,dy);if(L<1e-6)continue;
+     for(let d=0;d<L;d+=dash*2){
+      const d1=Math.min(L,d+dash);
+      addSeg(a[0]+dx*(d/L),a[1]+dy*(d/L),a[0]+dx*(d1/L),a[1]+dy*(d1/L),hw,c);
+     }
+    }
+   }
+  };
+
+  // 20m grid
+  const step=20,cGrid=[1,1,1,0.03];
+  const sx=Math.floor(bounds.minX/step)*step,ex=Math.ceil(bounds.maxX/step)*step;
+  const sy=Math.floor(bounds.minY/step)*step,ey=Math.ceil(bounds.maxY/step)*step;
+  for(let x=sx;x<=ex;x+=step) addSeg(x,sy,x,ey,0.12,cGrid);
+  for(let y=sy;y<=ey;y+=step) addSeg(sx,y,ex,y,0.12,cGrid);
+
+  const hasAreas=areas.length>0;
+  if(hasAreas){
+   for(const a of areas){
+    if(a.kind==='asphalt'&&a.coordinates[0]){
+     addPoly(a.coordinates[0],[0.09,0.141,0.188,1]);
+     addRingStroke(a.coordinates[0],0.22,[0.235,0.329,0.408,1],0);
+    }
+   }
+   for(const a of areas){
+    if(a.kind==='conflict'&&a.coordinates[0]){
+     addPoly(a.coordinates[0],[0.106,0.173,0.231,1]);
+     addRingStroke(a.coordinates[0],0.12,[0.325,0.847,0.769,0.22],2.2);
+    }
+   }
+   for(const a of areas){
+    if(a.kind==='crosswalk'&&a.coordinates[0]){
+     addPoly(a.coordinates[0],[1,1,1,0.17]);
+     addRingStroke(a.coordinates[0],0.1,[1,1,1,0.32],0);
+    }
+   }
+   for(const a of areas){
+    if(a.kind==='stopline'&&a.coordinates.length>=2){
+     for(let i=1;i<a.coordinates.length;i++)
+      addSeg(a.coordinates[i-1][0],a.coordinates[i-1][1],a.coordinates[i][0],a.coordinates[i][1],0.22,[1,1,1,0.45]);
+    }
+   }
+   for(const a of areas){
+    if(a.kind==='median'&&a.coordinates[0]){
+     addPoly(a.coordinates[0],[0.11,0.278,0.196,1]);
+     addRingStroke(a.coordinates[0],0.2,[0.22,0.51,0.357,1],0);
+    }
+   }
+  }
+
+  for(const r of roads){
+   if(r.kind==='connector')continue;
+   const pts=r.coordinates;
+   for(let i=1;i<pts.length;i++){
+    addSeg(pts[i-1][0],pts[i-1][1],pts[i][0],pts[i][1],hasAreas?0.12:1.6,hasAreas?[0.58,0.686,0.765,0.24]:[0.243,0.314,0.369,1]);
+   }
+   if(hasAreas&&(r.kind==='approach'||r.kind==='exit')){
+    const numLanes=Number(r.num_lanes||1),a0=pts[0],a1=pts.at(-1);
+    const dx=a1[0]-a0[0],dy=a1[1]-a0[1],len=Math.hypot(dx,dy)||1,tx=dx/len,ty=dy/len;
+    for(let l=SUBLANES_PER_MAJOR;l<numLanes;l+=SUBLANES_PER_MAJOR){
+     const dLat=(numLanes-l)*SUBLANE_W;
+     const sx0=a0[0]+ty*dLat,sy0=a0[1]-tx*dLat,ex0=a1[0]+ty*dLat,ey0=a1[1]-tx*dLat;
+     for(let s=0;s<len;s+=6.0){
+      const s1=Math.min(len,s+3.0);
+      addSeg(sx0+tx*s,sy0+ty*s,sx0+tx*s1,sy0+ty*s1,0.08,[1,1,1,0.12]);
+     }
+    }
+    const midDist=(numLanes*SUBLANE_W)*0.5;
+    for(const sProg of [45,95]){
+     if(sProg>=len-8)continue;
+     const at=roadPosition(r,sProg);
+     const cx=at.point[0]+at.tangent[1]*midDist,cy=at.point[1]-at.tangent[0]*midDist;
+     const fx=at.tangent[0],fy=at.tangent[1],rx=fy,ry=-fx;
+     addSeg(cx-fx*2.2,cy-fy*2.2,cx+fx*2.2,cy+fy*2.2,0.12,[1,1,1,0.22]);
+     addSeg(cx+fx*0.6+rx*1.1,cy+fy*0.6+ry*1.1,cx+fx*2.2,cy+fy*2.2,0.12,[1,1,1,0.22]);
+     addSeg(cx+fx*0.6-rx*1.1,cy+fy*0.6-ry*1.1,cx+fx*2.2,cy+fy*2.2,0.12,[1,1,1,0.22]);
+    }
+   }
+  }
+
+  const staticArr=new Float32Array(out);
+  gl.bindBuffer(gl.ARRAY_BUFFER,glState.staticVbo);
+  gl.bufferData(gl.ARRAY_BUFFER,staticArr,gl.STATIC_DRAW);
+  glState.staticCount=staticArr.length/6;
+
+  const subOut=[];
+  const addSubSeg=(x1,y1,x2,y2)=>{
+   const dx=x2-x1,dy=y2-y1,L=Math.hypot(dx,dy);if(L<1e-6)return;
+   const nx=(dy/L)*0.06,ny=-(dx/L)*0.06,c=[0.325,0.847,0.769,0.20];
+   subOut.push(x1+nx-glState.originX,y1+ny-glState.originY,c[0],c[1],c[2],c[3],
+               x2+nx-glState.originX,y2+ny-glState.originY,c[0],c[1],c[2],c[3],
+               x2-nx-glState.originX,y2-ny-glState.originY,c[0],c[1],c[2],c[3],
+               x1+nx-glState.originX,y1+ny-glState.originY,c[0],c[1],c[2],c[3],
+               x2-nx-glState.originX,y2-ny-glState.originY,c[0],c[1],c[2],c[3],
+               x1-nx-glState.originX,y1-ny-glState.originY,c[0],c[1],c[2],c[3]);
+  };
+  for(const a of areas){
+   if(a.kind==='sublane'&&a.coordinates.length>=2){
+    for(let i=1;i<a.coordinates.length;i++)
+     addSubSeg(a.coordinates[i-1][0],a.coordinates[i-1][1],a.coordinates[i][0],a.coordinates[i][1]);
+   }
+  }
+  const subArr=new Float32Array(subOut);
+  gl.bindBuffer(gl.ARRAY_BUFFER,glState.sublaneVbo);
+  gl.bufferData(gl.ARRAY_BUFFER,subArr,gl.STATIC_DRAW);
+  glState.sublaneCount=subArr.length/6;
+
+  gl.bindBuffer(gl.ARRAY_BUFFER,glState.dynVbo);
+  gl.bufferData(gl.ARRAY_BUFFER,glState.dynCap*4,gl.DYNAMIC_DRAW);
+  glState.ready=true;
+ }
+
+ function hexToRGBA(hex,a=1){
+  const v=parseInt(hex.slice(1),16);
+  return [((v>>16)&255)/255,((v>>8)&255)/255,(v&255)/255,a];
+ }
+
+ function drawSignals(){
+  const entries=roads.filter(r=>r.kind==='approach');
+  const worldScale=getWorldScale();
+  const useGL=gl&&glState.ready;
+  for(const r of entries){
+   const pts=r.coordinates,lastPt=pts.at(-1),prevPt=pts.at(-2)||pts[0];
+   const dx=lastPt[0]-prevPt[0],dy=lastPt[1]-prevPt[1],len=Math.hypot(dx,dy)||1;
+   const tx=dx/len,ty=dy/len,w=r.width||12.8;
+   const curbPt=[lastPt[0]+ty*w,lastPt[1]-tx*w];
+   const sigColor=signalFor(r);
+   if(useGL){
+    const col=hexToRGBA(sigColor,1);
+    const hw=Math.max(0.45,1.2/Math.max(0.5,cam.zoom*0.6));
+    pushSegDyn(lastPt[0],lastPt[1],curbPt[0],curbPt[1],hw,col);
+    const mx=(lastPt[0]+curbPt[0])*0.5,my=(lastPt[1]+curbPt[1])*0.5;
+    const rad=Math.max(1.0,2.2/Math.max(0.6,cam.zoom*0.6));
+    pushCircleDyn(mx,my,rad+0.35,12,[1,1,1,1]);
+    pushCircleDyn(mx,my,rad,12,col);
+    continue;
+   }
+   const c=project(lastPt),c2=project(curbPt);
+   ctx.save();
+   ctx.strokeStyle=sigColor;
+   ctx.lineWidth=Math.max(3,Math.min(6,1.2*worldScale));ctx.lineCap='round';
+   ctx.beginPath();ctx.moveTo(c.x,c.y);ctx.lineTo(c2.x,c2.y);ctx.stroke();
+   const midX=(c.x+c2.x)/2,midY=(c.y+c2.y)/2;
+   ctx.fillStyle=sigColor;ctx.beginPath();ctx.arc(midX,midY,Math.max(4,Math.min(7,1.4*worldScale)),0,Math.PI*2);ctx.fill();
+   ctx.strokeStyle='#ffffff';ctx.lineWidth=1;ctx.stroke();
+   ctx.restore();
+  }
+ }
+
+ const COL_CAR=[1.0,0.62,0.259,1],COL_CAR_ACT=[1.0,0.894,0.627,1],COL_CAR_CABIN=[0.071,0.133,0.176,1];
+ const COL_HEAD=[1.0,0.988,0.902,1],COL_BRAKE_ON=[1.0,0.133,0.2,1],COL_BRAKE_OFF=[0.6,0.082,0.125,1];
+ const COL_BLINK=[1.0,0.718,0.012,1],COL_BIKE=[0.243,0.902,0.808,1],COL_BIKE_ACT=[0.494,0.957,0.886,1];
+ const COL_WHITE=[1,1,1,1];
+
+ function drawVehicles(labelsOut){
+  vehiclePoints=[];
+  const now=getNow();
+  const worldScale=getWorldScale();
+  const useGL=gl&&glState.ready;
+  const alpha=Math.max(0,Math.min(1.0,(now-lastTickTime)/Math.max(50,tickIntervalMs)));
+  const showBlinkers=Boolean(el('toggleBlinkers')?.checked);
+  let changingCount=0;
+
+  displayedVehicles=[];
+   for(const [id, currV] of currVehiclesMap.entries()){
+    const prevV=prevVehiclesMap.get(id);
+    let prog=currV.progress;
+    let lateral=currV.lateral_shift!=null?currV.lateral_shift:(Number(currV.lane||0)*SUBLANE_W);
+    let speed=currV.speed||0;
+    let lcProg=currV.lane_change_progress!=null?Number(currV.lane_change_progress):1.0;
+    let world=null,interpTangent=null;
+
+    const canInterpolate=snapshotDelta===1 && Boolean(prevV) &&
+     !(prevV.road===currV.road && Number(currV.progress||0)<Number(prevV.progress||0)-1.0);
+    if(canInterpolate && prevV.road===currV.road){
+     prog=prevV.progress + (currV.progress - prevV.progress)*alpha;
+     const prevLat=prevV.lateral_shift!=null?prevV.lateral_shift:lateral;
+     lateral=prevLat + (lateral - prevLat)*alpha;
+     speed=prevV.speed + (currV.speed - prevV.speed)*alpha;
+     const prevLc=prevV.lane_change_progress!=null?Number(prevV.lane_change_progress):lcProg;
+     if(lcProg>=prevLc) lcProg=prevLc + (lcProg - prevLc)*alpha;
+    }else if(canInterpolate){
+     const a=vehicleWorldPoint(prevV),b=vehicleWorldPoint(currV);
+     if(a&&b)world=[a[0]+(b[0]-a[0])*alpha,a[1]+(b[1]-a[1])*alpha];
+     const pr=roadById.get(prevV.road),cr=roadById.get(currV.road);
+     if(pr&&cr){
+      const pa=roadPosition(pr,prevV.progress),ca=roadPosition(cr,currV.progress);
+      const bx=pa.tangent[0]+(ca.tangent[0]-pa.tangent[0])*alpha;
+      const by=pa.tangent[1]+(ca.tangent[1]-pa.tangent[1])*alpha;
+      const bm=Math.hypot(bx,by);
+      if(bm>1e-6) interpTangent=[bx/bm,by/bm];
+     }
+    }
+
+    const isChanging=Number(currV.speed||0)>=3.0 &&
+     Boolean(currV.is_changing_lane || (currV.lane_change_progress!=null && currV.lane_change_progress<1.0));
+    if(isChanging) changingCount++;
+
+    displayedVehicles.push({
+     ...currV,
+     interp_progress: prog,
+     interp_lateral: lateral,
+     interp_speed: speed,
+     interp_lc_progress: lcProg,
+     interp_world: world,
+     interp_tangent: interpTangent,
+     is_changing: isChanging
+    });
+   }
+
+  setTxt('activeLanesCount', `${changingCount} xe đang chuyển làn`);
+
+  const listToDraw=displayedVehicles.length?displayedVehicles:vehicles;
+  const sorted=[...listToDraw].sort((a,b)=>Number(a.is_car)-Number(b.is_car));
+  const blinkOn=Math.floor(now/180)%2===0;
+
+  for(const v of sorted){
+   const r=roadById.get(v.road);if(!r)continue;
+   const prog=v.interp_progress!=null?v.interp_progress:v.progress;
+   const at=roadPosition(r,prog);
+   const [tx,ty]=v.interp_tangent||at.tangent;
+   const numLanes=Number(r.num_lanes||1);
+
+   let dist;
+   if(v.interp_lateral!=null){
+    dist=(numLanes*SUBLANE_W) - v.interp_lateral - SUBLANE_W*0.5;
+   }else if(v.lateral_shift!=null){
+    dist=(numLanes*SUBLANE_W) - v.lateral_shift - SUBLANE_W*0.5;
+   }else{
+    const lane=Number(v.lane)||0,occupied=Number(v.occupied)||1;
+    dist=(numLanes - lane - (occupied-1)/2 - 0.5)*SUBLANE_W;
+   }
+
+   const point=v.interp_world||[at.point[0]+ty*dist,at.point[1]-tx*dist];
+   const p=project(point);
+   vehiclePoints.push({vehicle:v,x:p.x,y:p.y});
+
+   const active=v.id===hoveredVehicle?.id||v.id===selectedVehicle?.id;
+   const blinkerLeft=v.turn_signal==='left'||(v.target_lateral_shift>v.start_lateral_shift+0.1);
+   const blinkerRight=v.turn_signal==='right'||(v.target_lateral_shift<v.start_lateral_shift-0.1);
+   const braking=(v.interp_speed!=null?v.interp_speed:v.speed)<0.5;
+
+   let steerAngle=0;
+   if(v.is_changing && v.lateral_duration && v.target_lateral_shift!=null && v.start_lateral_shift!=null){
+    const u=Math.max(0,Math.min(1.0,v.interp_lc_progress!=null?v.interp_lc_progress:(v.lane_change_progress||0)));
+    const dy_du=6*u*(1-u)*(v.target_lateral_shift - v.start_lateral_shift);
+    const vy=dy_du / Math.max(0.1, v.lateral_duration);
+    const vx=Math.max(1.5, v.interp_speed||v.speed||2.0);
+    steerAngle=Math.atan(vy/vx);
+   }
+
+   if(useGL){
+    // World-space unit forward (fx, fy) and right (rx, ry) with steerAngle
+    const cs=Math.cos(steerAngle),sn=Math.sin(steerAngle);
+    const fx=tx*cs-ty*sn,fy=tx*sn+ty*cs;
+    const rx=fy,ry=-fx;
+    const cx=point[0],cy=point[1];
+    if(v.is_car){
+     const hw=2.25,hh=0.7;
+     pushQuadDyn(cx,cy,fx,fy,rx,ry,hw,hh,active?COL_CAR_ACT:COL_CAR);
+     pushQuadDyn(cx+fx*0.09,cy+fy*0.09,fx,fy,rx,ry,1.08,0.53,COL_CAR_CABIN);
+     const lw=0.22,lh=0.16,ly=0.36;
+     pushQuadDyn(cx+fx*(hw-lw)+rx*ly,cy+fy*(hw-lw)+ry*ly,fx,fy,rx,ry,lw,lh,COL_HEAD);
+     pushQuadDyn(cx+fx*(hw-lw)-rx*ly,cy+fy*(hw-lw)-ry*ly,fx,fy,rx,ry,lw,lh,COL_HEAD);
+     const bc=braking?COL_BRAKE_ON:COL_BRAKE_OFF;
+     pushQuadDyn(cx-fx*(hw-lw)+rx*ly,cy-fy*(hw-lw)+ry*ly,fx,fy,rx,ry,lw,lh,bc);
+     pushQuadDyn(cx-fx*(hw-lw)-rx*ly,cy-fy*(hw-lw)-ry*ly,fx,fy,rx,ry,lw,lh,bc);
+     if(showBlinkers&&v.is_changing&&blinkOn){
+      const bw=0.3,bh=0.18;
+      if(blinkerLeft){
+       pushQuadDyn(cx+fx*(hw-bw)-rx*(hh+0.1),cy+fy*(hw-bw)-ry*(hh+0.1),fx,fy,rx,ry,bw,bh,COL_BLINK);
+       pushQuadDyn(cx-fx*(hw-bw)-rx*(hh+0.1),cy-fy*(hw-bw)-ry*(hh+0.1),fx,fy,rx,ry,bw,bh,COL_BLINK);
+      }
+      if(blinkerRight){
+       pushQuadDyn(cx+fx*(hw-bw)+rx*(hh+0.1),cy+fy*(hw-bw)+ry*(hh+0.1),fx,fy,rx,ry,bw,bh,COL_BLINK);
+       pushQuadDyn(cx-fx*(hw-bw)+rx*(hh+0.1),cy-fy*(hw-bw)+ry*(hh+0.1),fx,fy,rx,ry,bw,bh,COL_BLINK);
+      }
+     }
+    }else{
+     const hw=0.95,hh=0.31;
+     pushQuadDyn(cx,cy,fx,fy,rx,ry,hw,hh,active?COL_BIKE_ACT:COL_BIKE);
+     pushCircleDyn(cx-fx*0.15,cy-fy*0.15,0.24,8,COL_WHITE);
+     if(braking) pushCircleDyn(cx-fx*0.78,cy-fy*0.78,0.16,6,COL_BRAKE_ON);
+     if(showBlinkers&&v.is_changing&&blinkOn){
+      const side=blinkerLeft?-0.42:0.42;
+      pushCircleDyn(cx+fx*0.45+rx*side,cy+fy*0.45+ry*side,0.18,6,COL_BLINK);
+     }
+    }
+    if(active){
+     const rad=v.is_car?3.1:1.7;
+     pushRingDyn(cx,cy,rad-0.25,rad,20,COL_WHITE);
+    }
+    if(labelsOut&&(cam.zoom>=3.8||active)&&(v.is_car||cam.zoom>=5.2||active)){
+     const spdKmh=Math.round(Number(v.interp_speed!=null?v.interp_speed:(v.speed||0))*3.6);
+     labelsOut.push({x:p.x,y:p.y-Math.max(8,1.2*worldScale),text:`${spdKmh}`,active});
+    }
+    continue;
+   }
+
+   // Canvas 2D fallback (zero shadowBlur)
+   ctx.save();
+   ctx.translate(p.x,p.y);
+   ctx.rotate(Math.atan2(-ty,tx)-steerAngle);
+   if(v.is_car){
+    const carW=4.5*worldScale, carH=1.4*worldScale;
+    const lw=Math.max(1.0,carW*0.09), lh=Math.max(0.8,carH*0.22), ly=carH*0.14;
+    ctx.fillStyle=active?'#ffe4a0':'#ff9e42';
+    ctx.beginPath();
+    if(ctx.roundRect) ctx.roundRect(-carW/2, -carH/2, carW, carH, Math.min(3.5,carH*0.25));
+    else ctx.rect(-carW/2, -carH/2, carW, carH);
+    ctx.fill();
+    ctx.strokeStyle='#8f420a';ctx.lineWidth=Math.max(0.8,0.08*worldScale);ctx.stroke();
+
+    ctx.fillStyle='#12222d';
+    ctx.beginPath();
+    if(ctx.roundRect) ctx.roundRect(-carW*0.22, -carH*0.38, carW*0.48, carH*0.76, Math.min(2,carH*0.15));
+    else ctx.rect(-carW*0.22, -carH*0.38, carW*0.48, carH*0.76);
+    ctx.fill();
+
+    ctx.fillStyle='#fffce6';
+    ctx.fillRect(carW/2 - lw, -carH/2 + ly, lw, lh);
+    ctx.fillRect(carW/2 - lw, carH/2 - ly - lh, lw, lh);
+
+    ctx.fillStyle=braking?'#ff2233':'#991520';
+    ctx.fillRect(-carW/2, -carH/2 + ly, lw, lh);
+    ctx.fillRect(-carW/2, carH/2 - ly - lh, lw, lh);
+
+    if(showBlinkers && v.is_changing && blinkOn){
+     ctx.fillStyle='#ffb703';
+     const bw=Math.max(1.5,carW*0.14), bh=Math.max(1.2,carH*0.22);
+     if(blinkerLeft){
+      ctx.fillRect(carW/2 - bw, -carH/2 - bh*0.4, bw, bh);
+      ctx.fillRect(-carW/2, -carH/2 - bh*0.4, bw, bh);
+     }
+     if(blinkerRight){
+      ctx.fillRect(carW/2 - bw, carH/2 - bh*0.6, bw, bh);
+      ctx.fillRect(-carW/2, carH/2 - bh*0.6, bw, bh);
+     }
+    }
+   }else{
+    const bikeW=1.9*worldScale, bikeH=0.62*worldScale;
+    ctx.fillStyle=active?'#7ef4e2':'#3ee6ce';
+    ctx.beginPath();
+    if(ctx.roundRect) ctx.roundRect(-bikeW/2, -bikeH/2, bikeW, bikeH, Math.min(2.2,bikeH/2));
+    else ctx.rect(-bikeW/2, -bikeH/2, bikeW, bikeH);
+    ctx.fill();
+    ctx.strokeStyle='#0d4c45';ctx.lineWidth=Math.max(0.5,0.05*worldScale);ctx.stroke();
+
+    ctx.fillStyle='#ffffff';
+    ctx.beginPath();
+    ctx.arc(-bikeW*0.08, 0, Math.max(0.9,bikeH*0.38), 0, Math.PI*2);
+    ctx.fill();
+
+    if(braking){
+     ctx.fillStyle='#ff2233';
+     ctx.beginPath();
+     ctx.arc(-bikeW*0.42, 0, Math.max(0.6,bikeH*0.24), 0, Math.PI*2);
+     ctx.fill();
+    }
+    if(showBlinkers && v.is_changing && blinkOn){
+     ctx.fillStyle='#ffb703';
+     const sideY=blinkerLeft?-bikeH*0.65:bikeH*0.65;
+     ctx.beginPath();
+     ctx.arc(bikeW*0.25, sideY, Math.max(0.9,bikeH*0.32), 0, Math.PI*2);
+     ctx.fill();
+    }
+   }
+   if(active){
+    ctx.strokeStyle='#ffffff';ctx.lineWidth=1.5;ctx.beginPath();
+    ctx.arc(0,0,Math.max(v.is_car?10:6.5, (v.is_car?3.0:1.6)*worldScale),0,Math.PI*2);ctx.stroke();
+   }
+   ctx.restore();
+
+   if((cam.zoom>=3.8 || active) && (v.is_car || cam.zoom>=5.2 || active)){
+    const spdKmh=Math.round(Number(v.interp_speed!=null?v.interp_speed:(v.speed||0))*3.6);
+    ctx.save();
+    ctx.font='600 10px system-ui';
+    ctx.fillStyle=active?'#ffffff':'rgba(230,242,248,0.82)';
+    ctx.textAlign='center';
+    ctx.fillText(`${spdKmh}`,p.x,p.y-Math.max(8,1.2*worldScale));
+    ctx.restore();
+   }
+  }
+ }
+
+ function drawOverlayLabels(speedLabels){
+  if(!octx)return;
+  octx.clearRect(0,0,view.w,view.h);
+  if(!roads.length){
+   octx.fillStyle='#82939e';octx.font='14px system-ui';octx.textAlign='center';
+   octx.fillText('Đang tải sơ đồ đường…',view.w/2,view.h/2);
+   return;
+  }
+  octx.font=`600 ${cam.zoom>=2?11:10}px system-ui`;
+  octx.fillStyle='#9eb4c2';
+  octx.textAlign='center';
+  for(const r of roads){
+   if(r.kind!=='approach'&&r.kind!=='exit')continue;
+   const mid=roadPosition(r,58);
+   const curbDist=(Number(r.num_lanes||1)*SUBLANE_W)+4.2;
+   const p=project([mid.point[0]+mid.tangent[1]*curbDist,mid.point[1]-mid.tangent[0]*curbDist]);
+   if(p&&p.x>18&&p.x<view.w-18&&p.y>16&&p.y<view.h-16) octx.fillText(r.id,p.x,p.y);
+  }
+  if(speedLabels&&speedLabels.length){
+   octx.font='600 10px system-ui';
+   for(const l of speedLabels){
+    octx.fillStyle=l.active?'#ffffff':'rgba(230,242,248,0.85)';
+    octx.fillText(l.text,l.x,l.y);
+   }
+  }
+ }
+
+ function bindAttrib(vbo){
+  gl.bindBuffer(gl.ARRAY_BUFFER,vbo);
+  gl.enableVertexAttribArray(glState.aPos);
+  gl.vertexAttribPointer(glState.aPos,2,gl.FLOAT,false,24,0);
+  gl.enableVertexAttribArray(glState.aCol);
+  gl.vertexAttribPointer(glState.aCol,4,gl.FLOAT,false,24,8);
+ }
+
+ function draw(){
+  if(gl&&glState.ready){
+   gl.clearColor(0.035,0.059,0.082,1.0);
+   gl.clear(gl.COLOR_BUFFER_BIT);
+   if(!roads.length){drawOverlayLabels([]);return;}
+   gl.useProgram(glState.prog);
+   gl.uniform2f(glState.uView,view.w,view.h);
+   gl.uniform1f(glState.uScale,cachedBaseScale);
+   gl.uniform2f(glState.uOffset,cachedBaseOx,cachedBaseOy);
+   gl.uniform3f(glState.uCam,cam.zoom,cam.panX,cam.panY);
+
+   bindAttrib(glState.staticVbo);
+   gl.drawArrays(gl.TRIANGLES,0,glState.staticCount);
+
+   if(el('toggleSublanes')?.checked&&glState.sublaneCount>0){
+    bindAttrib(glState.sublaneVbo);
+    gl.drawArrays(gl.TRIANGLES,0,glState.sublaneCount);
+   }
+
+   glState.dynLen=0;
+   const speedLabels=[];
+   drawSignals();
+   drawVehicles(speedLabels);
+   if(glState.dynLen>0){
+    gl.bindBuffer(gl.ARRAY_BUFFER,glState.dynVbo);
+    const slice=glState.dynBuf.subarray(0,glState.dynLen);
+    if(glState.dynLen>glState.vboCap){
+     gl.bufferData(gl.ARRAY_BUFFER,glState.dynBuf,gl.DYNAMIC_DRAW);
+     glState.vboCap=glState.dynCap;
+    }else{
+     gl.bufferSubData(gl.ARRAY_BUFFER,0,slice);
+    }
+    gl.enableVertexAttribArray(glState.aPos);
+    gl.vertexAttribPointer(glState.aPos,2,gl.FLOAT,false,24,0);
+    gl.enableVertexAttribArray(glState.aCol);
+    gl.vertexAttribPointer(glState.aCol,4,gl.FLOAT,false,24,8);
+    gl.drawArrays(gl.TRIANGLES,0,glState.dynLen/6);
+   }
+   drawOverlayLabels(speedLabels);
+   return;
+  }
+  if(!ctx)return;
+  ctx.clearRect(0,0,view.w,view.h);
+  if(!roads.length){
+   ctx.fillStyle='#82939e';ctx.font='14px system-ui';ctx.textAlign='center';
+   ctx.fillText('Đang tải sơ đồ đường…',view.w/2,view.h/2);
+   return;
+  }
+  drawGrid();
+  drawAreas();
+  roads.forEach(drawRoad);
+  drawSignals();
+  drawVehicles();
+ }
+
+ function animationLoop(timestamp){
+  updateSignalDisplay();
+  fpsFrames++;
+  if(timestamp - lastFpsUpdate >= 1000){
+   currentFps = Math.round((fpsFrames * 1000) / (timestamp - lastFpsUpdate));
+   setTxt('fpsBadge', `${currentFps} FPS${gl?' · GPU':''}`);
+   fpsFrames = 0;
+   lastFpsUpdate = timestamp;
+  }
+  draw();
+  if(typeof requestAnimationFrame!=='undefined') requestAnimationFrame(animationLoop);
+ }
+
+ function updateState(data){
+  const now = getNow();
+  const previousCycle=Number(state?.cycle);
+  const nextState=data.state||data;
+  snapshotDelta=Number.isFinite(previousCycle)?Number(nextState.cycle)-previousCycle:1;
+  state=nextState;
+  const selectedId=selectedVehicle?.id;
+  vehicles=data.vehicles||data.state?.vehicles||[];
+
+  prevVehiclesMap = currVehiclesMap;
+  currVehiclesMap = new Map();
+  for(const v of vehicles){
+   currVehiclesMap.set(v.id, v);
+  }
+
+  lastTickTime = now;
+
+  const mode=data.mode||state.mode||el('mode').value;
+  el('mode').value=mode==='train'?'train':'fixed';
+  waitingAction=mode==='train'&&Boolean(data.dqn_waiting_action??state.dqn_waiting_action);
+
+  if(waitingAction){
+   el('decisionStatus').classList.add('show');
+   el('trainActions').classList.add('show');
+  }else{
+   el('decisionStatus').classList.remove('show');
+   el('trainActions').classList.remove('show');
+  }
+
+  el('actionLvl').disabled=el('actionHdt').disabled=!waitingAction||busy||resetting;
+  el('step1').disabled=el('step50').disabled=waitingAction||busy||resetting;
+  el('run').disabled=waitingAction||resetting||running;
+  el('decisionStatus').textContent=waitingAction?'Đang chờ quyết định · chọn hướng LVL hoặc HDT để tiếp tục.':'Đang chờ quyết định điều khiển.';
+
+  updateSignalDisplay();
+
+  el('cycle').textContent=format(state.cycle);
+  el('time').textContent=`${format(state.time_sec)} s`;
+  el('created').textContent=format(state.created);
+  el('passed').textContent=format(state.passed);
+  el('active').textContent=format(state.active??vehicles.length);
+  el('queue').textContent=format(state.queue);
+  el('vehicleCount').textContent=vehicles.length;
+
+  setTxt('frNe',`${state.front_row_max_NE??0} / 12`);
+  setTxt('frSe',`${state.front_row_max_SE??0} / 12`);
+  setTxt('frSw',`${state.front_row_max_SW??0} / 12`);
+  setTxt('frNw',`${state.front_row_max_NW??0} / 11`);
+  setTxt('queueIntegral',state.queue_time_integral!=null?`${format(state.queue_time_integral)} s`:'— s');
+  setTxt('delayIntegral',state.weighted_delay_integral!=null?`${format(state.weighted_delay_integral)} s`:'— s');
+
+  const rate=state.created>0?((state.passed/state.created)*100).toFixed(1):'0.0';
+  setTxt('passRate',`${rate} %`);
+  setTxt('nextDecision',state.next_decision_in_cycles!=null?`${state.next_decision_in_cycles} tick`:'— tick');
+
+  selectedVehicle=vehicles.find(v=>v.id===selectedId)||null;hoveredVehicle=null;
+  showVehicle(selectedVehicle);
+  draw();
+ }
+
+ function format(n){return n==null?'—':Number(n).toLocaleString('vi-VN')}
+
+ function updateSignalDisplay(){
+  if(!state)return;
+  const phase=String(state.phase||'—').toUpperCase();
+  const yellow=String(state.yellow_phase||'').toUpperCase();
+  const isRed=['NONE','ALL-RED','ALL_RED','RED'].includes(phase);
+  const light=el('phaseLight');
+  light.className='phase-light'+(yellow?' yellow':phase==='HDT'?' hdt':isRed?' red':'');
+  el('phaseName').textContent=yellow?`VÀNG ${yellow}`:isRed?'ĐỎ':`XANH ${phase}`;
+  const lamp=yellow?'yellow':isRed?'red':'green';
+  for(const color of ['red','yellow','green'])el(`lamp${color[0].toUpperCase()}${color.slice(1)}`).classList.toggle('on',lamp===color);
+  let remaining=Number(state.phase_remaining_sec);
+  if(Number.isFinite(remaining)&&running){
+   const elapsed=Math.max(0,getNow()-lastTickTime);
+   remaining=Math.max(0,remaining-elapsed/Math.max(50,tickIntervalMs)*Math.max(1,snapshotDelta)*0.2);
+  }
+  el('phaseTimer').textContent=Number.isFinite(remaining)?`${remaining.toFixed(1)}s`:'—';
+  el('signalHudPhase').textContent=yellow?`ĐÈN VÀNG · ${yellow}`:isRed?'ĐÈN ĐỎ':`ĐÈN XANH · ${phase}`;
+  el('signalHudDirection').textContent=yellow?`Hướng ${yellow} sắp kết thúc`:phase==='LVL'?'Lê Văn Lương · NE/SW':phase==='HDT'?'Hoàng Đạo Thúy · SE/NW':'Đỏ toàn phần · chuyển pha';
+  el('signalHudTimer').textContent=Number.isFinite(remaining)?`${remaining.toFixed(1)}s`:'—';
+  el('phaseDesc').textContent=yellow?`Đèn vàng ${yellow} · còn ${Number.isFinite(remaining)?remaining.toFixed(1):'—'} giây`:phase==='LVL'?'Đèn xanh hướng Lê Văn Lương (NE/SW)':phase==='HDT'?'Đèn xanh hướng Hoàng Đạo Thúy (SE/NW)':phase==='—'?'Chưa có dữ liệu':'Đèn đỏ toàn phần · chuyển pha';
+ }
+
+ async function request(path,options={}){
+  let response;
+  try{response=await fetch(path,{...options,headers:{'Content-Type':'application/json',...(options.headers||{})}})}
+  catch(e){throw new Error('Không kết nối được máy chủ mô phỏng. Hãy kiểm tra máy chủ và tải lại trang.')}
+  let body;try{body=await response.json()}catch{body=null}
+  if(!response.ok)throw new Error(body?.error||body?.message||`Máy chủ trả về lỗi ${response.status}.`);
+  return body;
+ }
+
+ async function refreshState(){
+  const data=await request('/api/state');
+  updateState(data);
+  setConnection(true,'Đã kết nối máy chủ');
+ }
+
+ async function step(cycles){
+  if(busy||resetting||waitingAction)return;
+  busy=true;el('step1').disabled=el('step50').disabled=el('reset').disabled=true;
+  try{
+   const data=await request('/api/step',{method:'POST',body:JSON.stringify({cycles})});
+   updateState(data);clearError();setConnection(true,'Đã kết nối máy chủ');
+   if(data.step_status==='waiting_for_action'||waitingAction){
+    if(data.step_status==='waiting_for_action'&&data.cycles_advanced!=null)
+     el('decisionStatus').textContent=`Đã chạy ${format(data.cycles_advanced)} tick · đang chờ quyết định LVL/HDT.`;
+    pause();
+   }
+  }catch(e){showError(e.message);setConnection(false,'Mất kết nối máy chủ');throw e}
+  finally{
+   busy=false;el('step1').disabled=el('step50').disabled=waitingAction||resetting;
+   el('actionLvl').disabled=el('actionHdt').disabled=!waitingAction||resetting;
+  }
+ }
+
+ async function runLoop(token){
+  while(running&&token===runToken){
+   const t0=getNow();
+   const stepCount=Number(el('rate').value);
+   const mult=Number(el('speedMult')?.value||1.0);
+   const baseDurationMs=stepCount<=1?200:180;
+   const targetInterval=Math.max(20, Math.round(baseDurationMs/mult));
+   tickIntervalMs=targetInterval;
+   try{
+    await step(Number(el('rate').value));
+   }catch{
+    pause();break;
+   }
+   if(!running||token!==runToken)break;
+   const elapsed=getNow()-t0;
+   const delay=Math.max(10, targetInterval-elapsed);
+   await new Promise(resolve=>setTimeout(resolve,delay));
+  }
+ }
+
+ function run(){
+  if(running||resetting||waitingAction)return;
+  running=true;
+  const token=++runToken;
+  el('run').disabled=true;
+  el('pause').disabled=false;
+  runLoop(token);
+ }
+
+ function pause(){
+  running=false;
+  runToken++;
+  el('run').disabled=waitingAction||resetting;
+  el('pause').disabled=true;
+ }
+
+ async function reset(){
+  pause();clearError();const seed=Number(el('seed').value);
+  if(!Number.isSafeInteger(seed)){showError('Seed cần là một số nguyên hợp lệ.');return}
+  resetting=true;
+  el('reset').disabled=el('step1').disabled=el('step50').disabled=el('run').disabled=el('actionLvl').disabled=el('actionHdt').disabled=true;
+  try{
+   while(busy)await new Promise(resolve=>setTimeout(resolve,25));
+   const data=await request('/api/reset',{method:'POST',body:JSON.stringify({seed,mode:el('mode').value})});
+   if(data?.vehicles||data?.state)updateState(data);else await refreshState();
+   setConnection(true,'Đã kết nối máy chủ');
+  }catch(e){showError(e.message);setConnection(false,'Lỗi đặt lại mô phỏng')}
+  finally{
+   resetting=false;el('reset').disabled=false;
+   el('step1').disabled=el('step50').disabled=waitingAction;
+   el('run').disabled=waitingAction;
+   el('actionLvl').disabled=el('actionHdt').disabled=!waitingAction;
+  }
+ }
+
+ async function chooseAction(action){
+  if(!waitingAction||busy||resetting)return;
+  busy=true;el('actionLvl').disabled=el('actionHdt').disabled=true;
+  try{
+   const data=await request('/api/action',{method:'POST',body:JSON.stringify({action})});
+   updateState(data);clearError();setConnection(true,'Đã kết nối máy chủ');
+  }catch(e){showError(e.message);setConnection(false,'Lỗi gửi quyết định')}
+  finally{
+   busy=false;el('actionLvl').disabled=el('actionHdt').disabled=!waitingAction;
+   el('step1').disabled=el('step50').disabled=waitingAction;
+   el('run').disabled=waitingAction;
+  }
+ }
+
+ async function init(){
+  try{
+   const data=await request('/api/roads');
+   roads=parseRoads(data);
+   roadById=new Map(roads.map(r=>[r.id,r]));
+   if(!roads.length)throw new Error('Máy chủ chưa trả về hình học đường hợp lệ.');
+   const all=roads.flatMap(r=>r.coordinates);
+   bounds={
+    minX:Math.min(...all.map(p=>p[0])),maxX:Math.max(...all.map(p=>p[0])),
+    minY:Math.min(...all.map(p=>p[1])),maxY:Math.max(...all.map(p=>p[1]))
+   };
+   el('roadCount').textContent=`${roads.length} đoạn đường · hình học thực`;
+   resize();
+   try{const aData=await request('/api/areas');if(aData)areas=parseAreas(aData)}catch{}
+   if(gl){
+    buildStaticGL();
+    if(!glState.ready){gl=null;ctx=canvas.getContext('2d');resize();}
+   }
+   await refreshState();
+   if(typeof requestAnimationFrame!=='undefined') requestAnimationFrame(animationLoop);
+  }catch(e){
+   setConnection(false,'Không tải được dữ liệu');
+   showError(e.message);
+   draw();
+  }
+ }
+
+ function vehicleLabel(v){
+  const road=roadById.get(v.road),speed=v.speed_kmh??(v.speed==null?null:Number(v.speed)*3.6);
+  const type=v.is_car?'Ô tô':'Xe máy';
+  let roadName=road?.name||v.road||'đường —';
+  if(road&&road.kind==='connector'){
+   const turn=road.turn==='left'?'rẽ trái':road.turn==='right'?'rẽ phải':'đi thẳng';
+   roadName=`ngã tư ${road.arm} → ${road.to_arm} (${turn})`;
+  }
+  let base=`${type} #${v.id??'—'} · ${roadName} · làn ${v.lane??'—'}/${road?.num_lanes||12} · tốc độ ${speed==null?'—':format(speed.toFixed(1))}${speed==null?'':' km/h'}`;
+
+  if(Number(v.speed||0)>=3.0 &&
+     (v.is_changing_lane || (v.lane_change_progress!=null && v.lane_change_progress<1.0))){
+   const progPercent=Math.round((v.lane_change_progress||0)*100);
+   const dur=(v.lateral_duration||1.0).toFixed(2);
+   const signalTxt=v.turn_signal==='left'?'xi-nhan trái':(v.turn_signal==='right'?'xi-nhan phải':'xi-nhan');
+   base+=`<span class="tag-bezier">ĐANG CHUYỂN LÀN BÉZIER: ${progPercent}% · T_lc=${dur}s · ${signalTxt}</span>`;
+  }
+  return base;
+ }
+
+ function hitVehicle(event){
+  const rect=canvas.getBoundingClientRect(),x=event.clientX-rect.left,y=event.clientY-rect.top;
+  let best=null,distance=Math.max(14,4.5*getWorldScale());
+  for(const item of vehiclePoints){
+   const d=Math.hypot(item.x-x,item.y-y);
+   if(d<distance){best=item.vehicle;distance=d}
+  }
+  return best;
+ }
+
+ function showVehicle(v){
+  const infoEl=el('vehicleInfo');
+  if(!v){
+   infoEl.innerHTML='Di chuột hoặc bấm vào xe để xem thông tin.';
+   return;
+  }
+  infoEl.innerHTML=vehicleLabel(v);
+ }
+
+ canvas.addEventListener('pointerdown',event=>{
+  if(event.button!==0)return;
+  dragging=true;dragMoved=false;
+  dragStart={x:event.clientX,y:event.clientY};
+  panStart={x:cam.panX,y:cam.panY};
+  canvas.style.cursor='grabbing';
+ });
+
+ canvas.addEventListener('pointermove',event=>{
+  if(dragging){
+   const dx=event.clientX-dragStart.x,dy=event.clientY-dragStart.y;
+   if(Math.hypot(dx,dy)>3)dragMoved=true;
+   cam.panX=panStart.x+dx;
+   cam.panY=panStart.y+dy;
+   draw();
+   return;
+  }
+  hoveredVehicle=hitVehicle(event);
+  canvas.style.cursor=hoveredVehicle?'pointer':'grab';
+  showVehicle(hoveredVehicle||selectedVehicle);
+  draw();
+ });
+
+ window.addEventListener('pointerup',()=>{
+  if(!dragging)return;
+  dragging=false;
+  canvas.style.cursor=hoveredVehicle?'pointer':'grab';
+ });
+
+ canvas.addEventListener('pointerleave',()=>{
+  if(dragging){dragging=false;}
+  hoveredVehicle=null;
+  canvas.style.cursor='grab';
+  showVehicle(selectedVehicle);
+  draw();
+ });
+
+ canvas.addEventListener('click',event=>{
+  if(dragMoved){dragMoved=false;return;}
+  selectedVehicle=hitVehicle(event);
+  showVehicle(selectedVehicle);
+  draw();
+ });
+
+ canvas.addEventListener('wheel',event=>{
+  event.preventDefault();
+  const rect=canvas.getBoundingClientRect();
+  const sx=event.clientX-rect.left,sy=event.clientY-rect.top;
+  const factor=Math.exp(-event.deltaY*0.0018);
+  zoomAt(cam.zoom*factor,sx,sy);
+ },{passive:false});
+
+ canvas.addEventListener('dblclick',event=>{
+  const rect=canvas.getBoundingClientRect();
+  zoomAt(cam.zoom*1.6,event.clientX-rect.left,event.clientY-rect.top);
+ });
+
+ el('zoomIn')?.addEventListener('click',()=>zoomAt(cam.zoom*1.35));
+ el('zoomOut')?.addEventListener('click',()=>zoomAt(cam.zoom/1.35));
+ el('zoomCenter')?.addEventListener('click',focusIntersection);
+ el('zoomReset')?.addEventListener('click',resetZoom);
+ el('toggleSublanes')?.addEventListener('change',()=>draw());
+ el('toggleBlinkers')?.addEventListener('change',()=>draw());
+
+ el('actionLvl').addEventListener('click',()=>chooseAction(0));
+ el('actionHdt').addEventListener('click',()=>chooseAction(2));
+
+ window.addEventListener('keydown',event=>{
+  if(event.altKey||event.ctrlKey||event.metaKey||event.target?.matches?.('input,select,textarea'))return;
+  if(event.key==='+'||event.key==='='){event.preventDefault();zoomAt(cam.zoom*1.25);return}
+  if(event.key==='-'||event.key==='_'){event.preventDefault();zoomAt(cam.zoom/1.25);return}
+  if(event.key==='r'||event.key==='R'){event.preventDefault();resetZoom();return}
+  if(!waitingAction||busy||resetting)return;
+  if(event.key==='0'){event.preventDefault();chooseAction(0)}
+  if(event.key==='2'){event.preventDefault();chooseAction(2)}
+ });
+
+ el('run').addEventListener('click',run);
+ el('pause').addEventListener('click',pause);
+ el('step1').addEventListener('click',()=>step(1).catch(()=>{}));
+ el('step50').addEventListener('click',()=>step(50).catch(()=>{}));
+ el('reset').addEventListener('click',reset);
+ window.addEventListener('resize',()=>{resize();draw();});
+ if('ResizeObserver' in window) new ResizeObserver(()=>{resize();draw();}).observe(canvas);
+
+ init();
+})();
+</script>
+</body>
+</html>

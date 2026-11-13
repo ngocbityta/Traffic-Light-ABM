@@ -17,12 +17,13 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "dqn_py"))
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "train" / "logic"))
 
-from demand import demand_parameters, generate_demand
-from gama_env import GamaTrafficEnv
-from python_env import PythonTrafficEnv
-from server_manager import GamaServerManager
+from train.logic.demand import demand_parameters, generate_demand
+from train.logic.gama_env import GamaTrafficEnv
+from train.logic.python_env import PythonTrafficEnv
+from train.logic.server_manager import GamaServerManager
 
 
 FIELDS = ("global_phase", "decision_count", "green_cycles",

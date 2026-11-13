@@ -25,11 +25,12 @@ import torch
 from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "dqn_py"))
-from dqn_agent import QNetwork
-from gama_env import GamaTrafficEnv, STATE_FIELDS, STATE_PACK_EXPR
-from server_manager import GamaServerManager
-from demand import generate_demand
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "train" / "logic"))
+from train.logic.dqn_agent import QNetwork
+from train.logic.gama_env import GamaTrafficEnv, STATE_FIELDS, STATE_PACK_EXPR
+from train.logic.server_manager import GamaServerManager
+from train.logic.demand import generate_demand
 
 METHODS = ("Fixed-Time", "MaxPressure", "Q-Learning", "Deep Q-Learning")
 EXTRA_FIELDS = [
@@ -39,11 +40,11 @@ EXTRA_FIELDS = [
     "ground_requests", "ground_pending", "bypass_requests", "bypass_pending",
 ]
 PACK = STATE_PACK_EXPR + ''.join(f' + "|" + {name}' for name in EXTRA_FIELDS)
-MODEL = ROOT / "Traffic/models/intersection-benchmark.gaml"
-SOURCE_PATHS = (MODEL, ROOT / "Traffic/models/intersection-dqn-legacy.gaml",
-                ROOT / "Traffic/includes/collision_avoidance.gaml",
-                ROOT / "Traffic/includes/doan_scenery.gaml", ROOT / "dqn_py/gama_env.py",
-                ROOT / "dqn_py/dqn_agent.py", ROOT / "dqn_py/demand.py", Path(__file__))
+MODEL = ROOT / "train/benchmarks/gama/models/intersection-benchmark.gaml"
+SOURCE_PATHS = (MODEL, ROOT / "train/benchmarks/gama/models/intersection-dqn-legacy.gaml",
+                ROOT / "train/benchmarks/gama/includes/collision_avoidance.gaml",
+                ROOT / "train/benchmarks/gama/includes/doan_scenery.gaml", ROOT / "train/logic/gama_env.py",
+                ROOT / "train/logic/dqn_agent.py", ROOT / "train/logic/demand.py", Path(__file__))
 
 
 def source_hashes():

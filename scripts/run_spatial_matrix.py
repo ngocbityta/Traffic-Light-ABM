@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TRAIN = ROOT / "dqn_py" / "train.py"
+TRAIN = ROOT
 ALGORITHMS = ("rainbow", "hybrid")
 LEGACY_REWARDS = ("r1", "r2", "r3", "r4")
 LVL_REWARDS = ("r1", "r2", "r4")
@@ -91,7 +91,7 @@ def run_matrix(args):
                 print(f"[MATRIX] Archived incomplete {name} to {archived.name}", flush=True)
             if destination.exists() and not (args.resume and snapshot.exists()):
                 raise FileExistsError(f"{destination} exists; choose another directory or --resume")
-            command = [sys.executable, "-u", str(TRAIN),
+            command = [sys.executable, "-u", "-m", "train.logic.train",
                        "--algorithm", algorithm, "--scenario", args.scenario,
                        "--backend", args.backend,
                        "--reward-mode", reward,

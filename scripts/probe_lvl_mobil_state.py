@@ -9,11 +9,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "dqn_py"))
+PYTHON_SIM_ROOT = ROOT / "python-simulation" / "simulation"
+sys.path.insert(0, str(PYTHON_SIM_ROOT))
+sys.path.insert(0, str(ROOT / "train" / "logic"))
 
-from gama_env import GamaTrafficEnv
-from server_manager import GamaServerManager
-from LeVanLuongIntersection.demand import demand_parameters, generate_demand
+from train.logic.gama_env import GamaTrafficEnv
+from train.logic.server_manager import GamaServerManager
+from python_simulation.demand import demand_parameters, generate_demand
 
 
 async def main(args):
@@ -28,7 +30,7 @@ async def main(args):
             manager.start(reuse_running=False)
             env = GamaTrafficEnv(
                 port=args.port,
-                model_path=str(ROOT / "LeVanLuongIntersection/models/LeVanLuong.gaml"),
+                model_path=str(ROOT / "gama-simulation/simulation/models/LeVanLuong.gaml"),
                 experiment="python_parity", verbose=False)
             await env.setup()
             await env.load_experiment(parameters=[

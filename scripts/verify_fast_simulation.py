@@ -15,9 +15,9 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from dqn_py.demand import demand_parameters, generate_demand
-from dqn_py.gama_env import GamaTrafficEnv, featurize
-from dqn_py.server_manager import GamaServerManager
+from train.logic.demand import demand_parameters, generate_demand
+from train.logic.gama_env import GamaTrafficEnv, featurize
+from train.logic.server_manager import GamaServerManager
 
 
 async def rollout(env, seed, horizon, demand):

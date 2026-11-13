@@ -17,7 +17,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from LeVanLuongIntersection.python_sim import LeVanLuongSimulator
+PYTHON_SIM_ROOT = ROOT / "python-simulation" / "simulation"
+sys.path.insert(0, str(PYTHON_SIM_ROOT))
+from python_simulation.python_sim import LeVanLuongSimulator
 
 
 def neighbors_locals(self, vehicle, lane, lane_maps):

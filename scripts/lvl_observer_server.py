@@ -10,15 +10,22 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SIM_DIR = ROOT / "LeVanLuongIntersection"
+UI_DIR = ROOT / "python-simulation" / "ui"
+GEOJSON_DIR = (ROOT / "python-simulation" / "simulation" / "python_simulation" / "includes")
 sys.path.insert(0, str(ROOT))
+PYTHON_SIM_ROOT = ROOT / "python-simulation" / "simulation"
+sys.path.insert(0, str(PYTHON_SIM_ROOT))
 
-from LeVanLuongIntersection.demand import generate_demand
-from LeVanLuongIntersection.python_sim import LeVanLuongSimulator
+from python_simulation.demand import generate_demand
+from python_simulation.python_sim import LeVanLuongSimulator
+from python_simulation.vehicle_geometry import SUBLANE_WIDTH
 
 
 class Observer:
-    def __init__(self, seed=1, mode="fixed"):
+    def __init__(self, seed=1, mode="fixed", junction_model="negotiation",
+                 sim_kwargs=None):
+        self.junction_model = junction_model
+        self.sim_kwargs = dict(sim_kwargs or {})
         self.lock = threading.RLock()
         self.seed = seed
         self._demand_path = None
@@ -38,17 +45,20 @@ class Observer:
         self.seed = seed
         self.mode = mode
         self.sim = LeVanLuongSimulator(seed=seed, demand_file=self._demand_path,
-                                       train_mode=(mode == "train"))
+                                       train_mode=(mode == "train"),
+                                       junction_model=self.junction_model,
+                                       **self.sim_kwargs)
         return self.state()
 
     def state(self):
         result = self.sim.snapshot()
         result["mode"] = self.mode
+        result["junction_model"] = self.junction_model
         vehicles = []
         for vehicle in self.sim.vehicles:
             road, progress = self.sim._road_state(vehicle)
             is_changing = bool(vehicle.lane_change_progress < 1.0)
-            target_shift = getattr(vehicle, "target_lateral_shift", (vehicle.lane + (vehicle.occupied - 1) / 2.0) * 0.8)
+            target_shift = getattr(vehicle, "target_lateral_shift", (vehicle.lane + (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH)
             curr_shift = getattr(vehicle, "current_lateral_shift", target_shift)
             start_shift = getattr(vehicle, "start_lateral_shift", curr_shift)
             turn_signal = "none"
@@ -88,6 +98,7 @@ def make_handler(observer):
             body = json.dumps(data, separators=(",", ":")).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -109,20 +120,21 @@ def make_handler(observer):
 
         def do_GET(self):
             if self.path == "/":
-                path = SIM_DIR / "observer.html"
+                path = UI_DIR / "observer.html"
                 try:
                     body = path.read_bytes()
                 except OSError:
                     return self._json({"error": "observer.html not found"}, 404)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
                 return
             if self.path == "/api/roads":
                 try:
-                    body = (SIM_DIR / "includes" / "roads.geojson").read_bytes()
+                    body = (GEOJSON_DIR / "roads.geojson").read_bytes()
                 except OSError:
                     return self._json({"error": "roads.geojson not found"}, 500)
                 self.send_response(200)
@@ -133,7 +145,7 @@ def make_handler(observer):
                 return
             if self.path == "/api/areas":
                 try:
-                    body = (SIM_DIR / "includes" / "areas.geojson").read_bytes()
+                    body = (GEOJSON_DIR / "areas.geojson").read_bytes()
                 except OSError:
                     return self._json({"error": "areas.geojson not found"}, 500)
                 self.send_response(200)
@@ -204,8 +216,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--junction-model", choices=("negotiation", "reservation"),
+                        default="negotiation",
+                        help="negotiation: vehicles enter, creep and weave (default); "
+                             "reservation: the older ConflictEngine time-window arbiter")
+    parser.add_argument("--startup-reaction", type=float, default=None,
+                        help="max reaction delay (s) of a stopped queue at green onset")
+    parser.add_argument("--startup-headway", type=float, default=None,
+                        help="release headway (s) between queued vehicles in one sublane")
     args = parser.parse_args()
-    observer = Observer(args.seed)
+    startup = {}
+    if args.startup_reaction is not None:
+        startup["reaction_delay"] = args.startup_reaction
+    if args.startup_headway is not None:
+        startup["discharge_headway"] = args.startup_headway
+    observer = Observer(args.seed, junction_model=args.junction_model,
+                        sim_kwargs={"startup_params": startup} if startup else None)
+    print(f"Junction model: {args.junction_model}")
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(observer))
     print(f"LVL observer listening at http://127.0.0.1:{args.port}/")
     try:

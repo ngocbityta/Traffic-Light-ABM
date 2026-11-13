@@ -2,9 +2,9 @@
 """Serve the trained benchmark DQN to GAMA Studio's GUI demo experiment.
 
 Run ``python3 scripts/demo_dqn.py``, then open
-``Traffic/models/intersection-dqn-demo.gaml`` and run ``my_experiment``.
+``train/benchmarks/gama/models/intersection-dqn-demo.gaml`` and run ``my_experiment``.
 The two processes exchange one request and one action per decision through
-``dqn_py/run/demo_bridge``. No GAMA headless server is needed.
+``train/results/demo_bridge``. No GAMA headless server is needed.
 """
 
 import argparse
@@ -15,7 +15,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BRIDGE = ROOT / "dqn_py" / "run" / "demo_bridge"
+sys.path.insert(0, str(ROOT))
+BRIDGE = ROOT / "train" / "results" / "demo_bridge"
 DEFAULT_WEIGHTS = ROOT / "comparison_results" / "fair_benchmark_20261005_final" / "best_dqn.pt"
 
 
@@ -24,17 +25,17 @@ def use_project_python():
     try:
         import torch  # noqa: F401
     except ImportError:
-        project_python = ROOT / "dqn_py" / "venv" / "bin" / "python"
+        project_python = ROOT / "train" / "venv" / "bin" / "python"
         if not project_python.is_file() or Path(sys.executable).resolve() == project_python.resolve():
-            raise SystemExit("Thiếu PyTorch. Chạy bash dqn_py/setup_env.sh trước.")
+            raise SystemExit("Thiếu PyTorch. Chạy bash train/scripts/setup_env.sh trước.")
         os.execv(str(project_python), [str(project_python), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 def load_network(weights):
     import torch
 
-    sys.path.insert(0, str(ROOT / "dqn_py"))
-    from dqn_agent import QNetwork
+    sys.path.insert(0, str(ROOT / "train" / "logic"))
+    from train.logic.dqn_agent import QNetwork
 
     checkpoint = torch.load(weights, map_location="cpu", weights_only=False)
     if "online" not in checkpoint:

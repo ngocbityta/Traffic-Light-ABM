@@ -191,7 +191,7 @@ def main():
     mobility, safety = {}, {}
     for name, (filename, _, _) in MODELS.items():
         mobility[name], safety[name] = run_simulation(
-            ROOT / "Traffic" / "models" / filename, name, args.output_dir)
+            ROOT / "train" / "benchmarks" / "gama" / "models" / filename, name, args.output_dir)
 
     print_summary("6 CHỈ SỐ LƯU THÔNG", mobility, MOBILITY_METRICS)
     plot_mobility(mobility, args.output_dir / "traffic_comparison_3models_mobility.png")

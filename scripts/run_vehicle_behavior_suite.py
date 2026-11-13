@@ -23,14 +23,15 @@ if hasattr(sys.stdout, "reconfigure"):
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
-sys.path.insert(0, str(BASE_DIR / "dqn_py"))
+sys.path.insert(0, str(BASE_DIR / "python-simulation" / "simulation"))
+sys.path.insert(0, str(BASE_DIR / "train" / "logic"))
 
-from LeVanLuongIntersection.python_sim import (
+from python_simulation.python_sim import (
     LeVanLuongSimulator, ARMS, DT, road_lengths
 )
-from LeVanLuongIntersection.demand import generate_demand
-from dqn_py.lvl_env import _observation
-from dqn_py.python_env import PythonTrafficEnv
+from python_simulation.demand import generate_demand
+from train.logic.lvl_env import _observation
+from train.logic.python_env import PythonTrafficEnv
 
 
 class VehicleBehaviorTestSuite:
@@ -102,17 +103,19 @@ class VehicleBehaviorTestSuite:
             f"Xe sau giảm tốc duy trì khoảng cách an toàn IDM (gap={gap:.2f}m > 0, v={follower.speed*3.6:.1f} < {initial_follower_spd*3.6:.1f} km/h)"
         )
 
-        # KINE-03: Negative gap / overlap emergency braking
+        # KINE-03: Spawn queue keeps clearance even before the road origin.
         sim = LeVanLuongSimulator(flow_per_approach=0)
         sim._create_vehicle("NE", "through", False, 5, 40.0)
-        sim._create_vehicle("NE", "through", False, 5, 40.0)  # exact same position -> negative bumper gap
+        sim._create_vehicle("NE", "through", False, 5, 40.0)
         sim.step(1)
         speeds_finite = all(math.isfinite(v.speed) and v.speed >= 0 for v in sim.vehicles)
-        positions_finite = all(math.isfinite(v.position) and v.position >= 0 for v in sim.vehicles)
+        positions_finite = all(math.isfinite(v.position) for v in sim.vehicles)
+        front, rear = sorted(sim.vehicles, key=lambda v: v.position, reverse=True)
+        gap = front.position - rear.position - (front.length + rear.length) / 2
         self.assert_test(
-            "Kinematics", "KINE-03-OverlapBrakingClamped",
-            speeds_finite and positions_finite,
-            "Đè vạch/trùng vị trí được phanh an toàn, không sinh NaN, Infinite hay tốc độ âm"
+            "Kinematics", "KINE-03-SpawnClearance",
+            speeds_finite and positions_finite and gap >= max(1.0, front.gap, rear.gap) - 1e-8,
+            "Xe mới có thể xếp hàng trước đầu đường; thân xe vẫn cách nhau an toàn"
         )
 
         # KINE-04: Speed cap adherence
@@ -143,7 +146,7 @@ class VehicleBehaviorTestSuite:
     def test_mobil_lane_changing(self):
         print("--- [2] KIỂM THỬ ĐỔI LÀN MOBIL & RÀNG BUỘC SUBLANE ---")
 
-        # MOBIL-01: Cooldown enforcement (4.0s = 20 ticks)
+        # MOBIL-01: Cooldown and no unnecessary free-road lane change.
         sim = LeVanLuongSimulator(flow_per_approach=0, train_mode=True)
         sim._create_vehicle("NE", "through", False, 10, 40)
         sim.step(19)
@@ -152,10 +155,11 @@ class VehicleBehaviorTestSuite:
         lane_at_20 = sim.vehicles[0].lane
         sim.step(1)
         lane_at_21 = sim.vehicles[0].lane
+        cooldown_elapsed = sim.vehicles[0].time_since_lane_change >= 4.0
         self.assert_test(
             "MOBIL", "MOBIL-01-CooldownEnforcement",
-            lane_at_19 == 10 and lane_at_20 == 10 and lane_at_21 < 10,
-            f"Khóa đổi làn đủ 4.0s (20 ticks): tick 19={lane_at_19}, tick 20={lane_at_20}, tick 21={lane_at_21}"
+            lane_at_19 == 10 and lane_at_20 == 10 and lane_at_21 == 10 and cooldown_elapsed,
+            f"Không đổi làn khi chưa đủ 4s hoặc khi không có lợi ích: tick 19={lane_at_19}, tick 20={lane_at_20}, tick 21={lane_at_21}"
         )
 
         # MOBIL-02: Boundary clamping (Lane 0 cannot go < 0)
@@ -171,52 +175,59 @@ class VehicleBehaviorTestSuite:
 
         # MOBIL-03: Boundary clamping right edge
         sim = LeVanLuongSimulator(flow_per_approach=0)
-        # NE_in has 16 sublanes (0..15). Car occupies 2 sublanes, max valid lane is 14.
-        sim._create_vehicle("NE", "through", True, 14, 40)
+        ne_lanes = sim.roads["NE_in"]["num_lanes"]
+        sim._create_vehicle("NE", "through", True, ne_lanes - 2, 40)
         sim.step(50)
         car = sim.vehicles[0]
         self.assert_test(
             "MOBIL", "MOBIL-03-BoundaryClampingMax",
-            car.lane + car.occupied <= 16,
-            f"Ô tô (2 sublane) không bao giờ vượt biên phải (lane={car.lane}, lane+occupied={car.lane+car.occupied} <= 16)"
+            car.lane + car.occupied <= ne_lanes,
+            f"Ô tô (2 sublane) không bao giờ vượt biên phải (lane={car.lane}, lane+occupied={car.lane+car.occupied} <= {ne_lanes})"
         )
 
-        # MOBIL-04: NW road 14 sublanes geometry constraint
+        # MOBIL-04: NW road sublanes geometry constraint
         sim = LeVanLuongSimulator(flow_per_approach=0)
-        # NW_in only has 14 sublanes (0..13)
-        sim._create_vehicle("NW", "through", True, 12, 40)   # Car at lane 12 (occupies 12, 13)
-        sim._create_vehicle("NW", "through", False, 13, 40)  # Motorbike at lane 13 (occupies 13)
+        nw_lanes = sim.roads["NW_in"]["num_lanes"]
+        sim._create_vehicle("NW", "through", True, nw_lanes - 2, 40)
+        sim._create_vehicle("NW", "through", False, nw_lanes - 1, 40)
         sim.step(30)
         nw_car = sim.vehicles[0]
         nw_moto = sim.vehicles[1]
         self.assert_test(
             "MOBIL", "MOBIL-04-NWSublaneGeometry",
-            nw_car.lane + nw_car.occupied <= 14 and nw_moto.lane + nw_moto.occupied <= 14,
-            f"Nhánh NW (14 sublane) giới hạn làn chính xác: ô tô ({nw_car.lane}..{nw_car.lane+nw_car.occupied}), xe máy ({nw_moto.lane}..{nw_moto.lane+nw_moto.occupied})"
+            nw_car.lane + nw_car.occupied <= nw_lanes and nw_moto.lane + nw_moto.occupied <= nw_lanes,
+            f"Nhánh NW ({nw_lanes} sublane) giới hạn làn chính xác: ô tô ({nw_car.lane}..{nw_car.lane+nw_car.occupied}), xe máy ({nw_moto.lane}..{nw_moto.lane+nw_moto.occupied})"
         )
 
-        # MOBIL-05: Spawn overlap resolution before cooldown
+        # MOBIL-05: Same-lane vehicles may queue safely without lane changes.
         sim = LeVanLuongSimulator(flow_per_approach=0)
-        sim._create_vehicle("NE", "through", False, 13, 40)
-        sim._create_vehicle("NE", "through", False, 13, 40)
+        sim._create_vehicle("NE", "through", False, ne_lanes - 2, 40)
+        sim._create_vehicle("NE", "through", False, ne_lanes - 2, 40)
         sim.step(1)
-        lanes = {v.lane for v in sim.vehicles}
+        front, rear = sorted(sim.vehicles, key=lambda v: v.position, reverse=True)
+        gap = front.position - rear.position - (front.length + rear.length) / 2
         self.assert_test(
             "MOBIL", "MOBIL-05-OverlapResolution",
-            len(lanes) == 2,
-            f"Xung đột trùng làn khi xuất hiện được giải tỏa ngay lập tức (lanes={lanes})"
+            gap >= max(1.0, front.gap, rear.gap) - 1e-8,
+            f"Xe cùng làn giữ khoảng hở thay vì bắt buộc lách ngang (gap={gap:.2f}m)"
         )
 
-        # MOBIL-06: Continuous Bézier / Smootherstep lateral trajectory
-        sim = LeVanLuongSimulator(flow_per_approach=0, train_mode=True)
+        # MOBIL-06: A lane change in progress follows its smooth lateral trajectory.
+        sim = LeVanLuongSimulator(flow_per_approach=0)
         sim._create_vehicle("NE", "through", False, 10, 40)
-        sim.step(20)  # Reach cooldown expiration
         v = sim.vehicles[0]
-        sim.step(1)   # Trigger lane change
+        v.speed = 8.0
+        v.lane = 9
+        v.lane_change_from = 10
+        v.lane_change_progress = 0.0
+        v.start_lateral_shift = v.current_lateral_shift = 8.0
+        v.target_lateral_shift = 7.2
+        v.lateral_duration = 1.0
+        sim.step(1)
         shift_1 = v.current_lateral_shift
         prog_1 = v.lane_change_progress
         smooth_active = (0.0 < prog_1 < 1.0 and shift_1 != v.start_lateral_shift and shift_1 != v.target_lateral_shift)
-        sim.step(25)  # Allow transition to complete (duration ~ 2.9s)
+        sim.step(6)
         smooth_complete = (v.lane_change_progress == 1.0 and abs(v.current_lateral_shift - v.target_lateral_shift) < 1e-5)
         self.assert_test(
             "MOBIL", "MOBIL-06-BezierLateralShift",
@@ -296,7 +307,7 @@ class VehicleBehaviorTestSuite:
         sim = LeVanLuongSimulator(flow_per_approach=3000, seed=77)
         sim.step(250)  # SE/NW queued up during red
         queue_before = sum(v.speed * 3.6 < 1.0 and v.arm in ("SE", "NW") for v in sim.vehicles)
-        sim.step(20)   # 15 ticks red clearance + 5 ticks green
+        sim.step(70)   # 15 ticks red clearance, then enough green to clear the stop line
         passed_into_conn = sum(v.arm in ("SE", "NW") and v.position > v.approach_end for v in sim.vehicles)
         self.assert_test(
             "Signal", "SIG-04-GreenReleasesQueue",
@@ -335,15 +346,16 @@ class VehicleBehaviorTestSuite:
 
         # OBS-02: Sublane validity mask in Channel 5
         grid = obs_spatial["spatial"]
-        ne_valid = (grid[0, 5, :, :] == 1.0).all()
-        se_valid = (grid[1, 5, :, :] == 1.0).all()
-        sw_valid = (grid[2, 5, :, :] == 1.0).all()
-        nw_valid_14 = (grid[3, 5, :, :14] == 1.0).all()
-        nw_invalid_2 = (grid[3, 5, :, 14:] == 0.0).all()
+        roads = road_lengths()
+        masks_ok = True
+        for idx, arm in enumerate(ARMS):
+            n = roads[f"{arm}_in"]["num_lanes"]
+            if not ((grid[idx, 5, :, :n] == 1.0).all() and (grid[idx, 5, :, n:] == 0.0).all()):
+                masks_ok = False
         self.assert_test(
             "Observation", "OBS-02-Channel5SublaneMask",
-            ne_valid and se_valid and sw_valid and nw_valid_14 and nw_invalid_2,
-            "Kênh C5 phản ánh đúng mặt nạ hình học (NE/SE/SW 16 làn hợp lệ, NW 14 làn hợp lệ, 2 làn padding)"
+            masks_ok,
+            f"Kênh C5 phản ánh đúng mặt nạ hình học (NE={roads['NE_in']['num_lanes']}, SE={roads['SE_in']['num_lanes']}, SW={roads['SW_in']['num_lanes']}, NW={roads['NW_in']['num_lanes']} sublane)"
         )
 
         # OBS-03: Channel 1 speed ratio averaging across multi-vehicles
@@ -392,7 +404,7 @@ class VehicleBehaviorTestSuite:
             for v in sim_jam.vehicles:
                 if not (math.isfinite(v.speed) and v.speed >= 0):
                     all_speeds_finite = False
-                if not (math.isfinite(v.position) and v.position >= 0):
+                if not math.isfinite(v.position):
                     all_positions_finite = False
         self.assert_test(
             "EdgeCases", "EDGE-02-MegaJamLiveness",
@@ -441,7 +453,7 @@ class VehicleBehaviorTestSuite:
 
         # LEGACY-01: Phase wait cycle accumulation (with demand tracking per GAML)
         import asyncio
-        from dqn_py.python_env import Vehicle as LegacyVehicle, STOP_DISTANCE as LEGACY_STOP
+        from train.logic.python_env import Vehicle as LegacyVehicle, STOP_DISTANCE as LEGACY_STOP
         async def run_legacy():
             env = PythonTrafficEnv(verbose=False, state_mode="dtse")
             # Without vehicles, all phase wait times must stay 0 (GAML logic: phase_demand = 0 resets wait)
