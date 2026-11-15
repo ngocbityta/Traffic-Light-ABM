@@ -24,7 +24,6 @@ if hasattr(sys.stdout, "reconfigure"):
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 sys.path.insert(0, str(BASE_DIR / "python-simulation" / "simulation"))
-sys.path.insert(0, str(BASE_DIR / "train" / "logic"))
 
 from python_simulation.python_sim import (
     LeVanLuongSimulator, ARMS, DT, road_lengths

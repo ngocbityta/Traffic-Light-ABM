@@ -8,12 +8,14 @@ import tempfile
 import time
 from pathlib import Path
 
-if __package__:
-    from .gama_env import GamaTrafficEnv, STATE_FIELDS, featurize
-    from .server_manager import GamaServerManager
-else:
-    from gama_env import GamaTrafficEnv, STATE_FIELDS, featurize
-    from server_manager import GamaServerManager
+import sys
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:  # allow ``python train/tests/test_doan_server.py``
+    sys.path.insert(0, str(ROOT))
+
+from train.logic.gama_env import GamaTrafficEnv, STATE_FIELDS, featurize
+from train.logic.server_manager import GamaServerManager
 
 
 async def run(port, horizon):

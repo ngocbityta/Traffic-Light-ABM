@@ -134,8 +134,12 @@ class LeVanLuongTests(unittest.TestCase):
                             continue
                         gap = ahead_progress - behind_progress - (
                             behind.length + ahead.length) / 2
-                        self.assertGreaterEqual(gap + 1e-8,
-                                                max(1.0, behind.gap, ahead.gap))
+                        # A standing follower may have a standing merger
+                        # slot in just ahead of it: bodies must not overlap.
+                        # Anything that moves keeps the full clearance.
+                        needed = (0.0 if behind.speed < 0.5 else
+                                  max(1.0, behind.gap, ahead.gap))
+                        self.assertGreaterEqual(gap + 1e-8, needed)
 
     def test_red_light_keeps_whole_vehicle_before_stop_line(self):
         sim = LeVanLuongSimulator(seed=1)
@@ -264,14 +268,21 @@ class LeVanLuongTests(unittest.TestCase):
         sim._idm = controlled_idm
         sim.step()
 
-        crossing_speed = 8.0 + old_acceleration * DT
-        remaining = DT - 0.2 / crossing_speed
+        # The old road's acceleration acts until the seam, the new road's
+        # for the remainder: together exactly one tick, never more.
+        remaining = DT - 0.2 / (8.0 + old_acceleration * DT)
+        crossing_speed = 8.0 + old_acceleration * (DT - remaining)
+        self.assertLessEqual(vehicle.speed - 8.0,
+                             max(old_acceleration, new_acceleration) * DT + 1e-9)
         self.assertAlmostEqual(vehicle.speed,
                                crossing_speed + new_acceleration * remaining)
+        # Progress is measured on the connector's reference line; the
+        # vehicle's own sublane path is ``scale`` times as long.
+        scale = sim._curve_profile("NE_SW", vehicle.seam_shift)[1][0]
         self.assertAlmostEqual(vehicle.position,
                                vehicle.approach_end + vehicle.seam_progress +
-                               crossing_speed * remaining +
-                               0.5 * new_acceleration * remaining ** 2)
+                               (crossing_speed * remaining +
+                                0.5 * new_acceleration * remaining ** 2) / scale)
 
     def test_blocked_follower_speed_matches_capped_displacement(self):
         sim = LeVanLuongSimulator(flow_per_approach=0)

@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from train import parse_args, training_config
+from train.logic.train import parse_args, training_config
 
 
 class TrainPythonSimModeTests(unittest.TestCase):

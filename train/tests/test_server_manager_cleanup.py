@@ -31,7 +31,12 @@ class ServerCleanupTest(unittest.TestCase):
                 's=socket.socket();s.bind(("127.0.0.1",int(sys.argv[1])));'
                 's.listen();time.sleep(120)\n')
             launcher = root / 'headless.sh'
-            launcher.write_text('"$TEST_PYTHON" listener.py "$2" &\nwait\n')
+            # The manager launches ``headless.sh -m <heap> -socket <port> ...``:
+            # pick the port by its flag, not by position.
+            launcher.write_text(
+                'while [ $# -gt 0 ]; do\n'
+                ' if [ "$1" = "-socket" ]; then PORT="$2"; fi\n shift\ndone\n'
+                '"$TEST_PYTHON" listener.py "$PORT" &\nwait\n')
             manager = GamaServerManager(port=port, gama_headless=str(launcher), workdir=tmp,
                                         log_file=str(root / 'server.log'), startup_timeout=10)
             with patch.dict(os.environ, {'TEST_PYTHON': sys.executable}):

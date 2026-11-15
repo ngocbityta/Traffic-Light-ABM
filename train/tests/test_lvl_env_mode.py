@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lvl_env import LVLPythonEnv
+from train.logic.lvl_env import LVLPythonEnv
 
 
 class LVLPythonEnvModeTests(unittest.IsolatedAsyncioTestCase):
@@ -43,7 +43,11 @@ class LVLPythonEnvModeTests(unittest.IsolatedAsyncioTestCase):
                 spawned = await env.read_state()
                 self.assertEqual(spawned["total_vehicles_created"], 1)
                 self.assertEqual(spawned["spatial"].shape, (4, 6, 20, 16))
-                self.assertEqual(spawned["spatial"][0, 0, 19, 0], 1.0)
+                # Safe mode enters the vehicle at speed: after one tick it
+                # may be in the second-farthest 6 m cell and have started
+                # its merge towards the through corridor.
+                self.assertEqual(spawned["spatial"][0, 0, 18:20, :3].max(), 1.0)
+                self.assertEqual(spawned["spatial"][0, 0].sum(), 1.0)
 
                 await env.step_cycles(49)
                 decision = await env.read_state()
@@ -85,13 +89,19 @@ class LVLPythonEnvModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(before["approach_ew"], 1)
         self.assertGreater(before["spatial"][1, 0].sum(), 0.0)
 
-        after, reward, _, info = await env.step(2, horizon=150, current_state=before)
+        # The switch costs 4 s yellow + 2 s all-red, so HDT turns green 6 s
+        # into this 10 s decision interval and the motorbike, starting from
+        # rest, is released during the next one.
+        after, reward, _, info = await env.step(2, horizon=250, current_state=before)
         self.assertEqual(after["global_phase"], 4)
-        self.assertEqual(after["approach_ew"], 0)
-        self.assertEqual(after["spatial"][1, 0].sum(), 0.0)
-        self.assertEqual(env.sim.vehicles[0].road, "NW_out")
         self.assertTrue(info["bootstrap_valid"])
         self.assertLess(reward, 0.0)
+        # HDT has just started: leaving it again is masked by the minimum green.
+        self.assertEqual(after["action_mask"].tolist(), [False, False, True, False])
+        after, _, _, _ = await env.step(2, horizon=250, current_state=after)
+        self.assertEqual(after["approach_ew"], 0)
+        self.assertEqual(after["spatial"][1, 0].sum(), 0.0)
+        self.assertIn(env.sim.vehicles[0].road, ("SE_NW", "NW_out"))
 
 
 if __name__ == "__main__":

@@ -11,7 +11,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 PYTHON_SIM_ROOT = ROOT / "python-simulation" / "simulation"
 sys.path.insert(0, str(PYTHON_SIM_ROOT))
-sys.path.insert(0, str(ROOT / "train" / "logic"))
 
 from train.logic.gama_env import GamaTrafficEnv
 from train.logic.server_manager import GamaServerManager

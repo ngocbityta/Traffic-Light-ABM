@@ -26,7 +26,6 @@ from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "train" / "logic"))
 from train.logic.dqn_agent import QNetwork
 from train.logic.gama_env import GamaTrafficEnv, STATE_FIELDS, STATE_PACK_EXPR
 from train.logic.server_manager import GamaServerManager

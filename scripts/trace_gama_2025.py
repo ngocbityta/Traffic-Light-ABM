@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path[:0] = [str(ROOT), str(ROOT / "python-simulation" / "simulation"), str(ROOT / "train" / "logic")]
+sys.path[:0] = [str(ROOT), str(ROOT / "python-simulation" / "simulation")]
 
 from train.logic.gama_env import GamaTrafficEnv
 from train.logic.server_manager import GamaServerManager

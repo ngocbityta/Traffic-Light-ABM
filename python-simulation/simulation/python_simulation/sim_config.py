@@ -3,7 +3,9 @@ import json
 from pathlib import Path
 
 DEFAULT_CONFIG = {"junction_model": "negotiation", "yellow": 4.0,
-                  "all_red": 2.0, "vehicle_params": {}, "startup_params": {}}
+                  "all_red": 2.0, "vehicle_params": {}, "startup_params": {},
+                  "min_green": 10.0, "jam_timeout": 120.0,
+                  "curve_lat_accel": 3.0, "curve_decel": 2.0, "max_decel": 7.5}
 ALLOWED = set(DEFAULT_CONFIG) | {"negotiation_params"}
 
 

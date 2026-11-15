@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lvl_env import _observation
+from train.logic.lvl_env import _observation
 
 
 class LVLMetricSemanticsTests(unittest.TestCase):

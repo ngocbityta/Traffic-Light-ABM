@@ -234,6 +234,8 @@ class Vehicle:
     # followers in that sublane yield to it (courtesy gap). NaN = no claim.
     merge_claim_shift: float = math.nan
     queue_stop_offset: float = 0.0
+    # Seconds standing still on the connector (jam safety net).
+    junction_standstill: float = 0.0
 
     in_road: str = ""
     conn_road: str = ""
@@ -308,6 +310,98 @@ class LeVanLuongSimulator:
         # continuous lateral_shift across narrower connectors and exits.
         return min(next_max, max(0, lane + next_max - old_max))
 
+    CURVE_STEP = 0.5       # m of reference progress between profile samples
+    CURVE_SHIFT_BIN = 0.35  # m of lateral shift per cached profile
+
+    def _curve_profile(self, road, shift):
+        """(speed caps, path scales) of ``road`` for a lateral ``shift``.
+
+        Sample ``i`` sits at reference progress ``i * CURVE_STEP``. The speed
+        cap is the physical speed the path allows there: sqrt(a_lat * R) of
+        the shifted path, lowered so that every tighter point ahead can be
+        reached braking at ``curve_decel``. The scale is physical path length
+        per metre of reference progress: sublanes on the outside of a turn
+        travel further than the reference line, inner ones less.
+        """
+        key = (road, int(round(shift / self.CURVE_SHIFT_BIN)))
+        profile = self._curve_profiles.get(key)
+        if profile is not None:
+            return profile
+        geometry = self._geometry_roads[road]
+        length = geometry.length
+        count = max(2, int(math.ceil(length / self.CURVE_STEP)) + 1)
+        lateral = key[1] * self.CURVE_SHIFT_BIN
+        points = []
+        for i in range(count):
+            pose = geometry.pose(min(length, i * self.CURVE_STEP), lateral)
+            points.append((pose.x, pose.y))
+        ref_step = [min(length, (i + 1) * self.CURVE_STEP) - min(length, i * self.CURVE_STEP)
+                    for i in range(count - 1)]
+        seg = [math.dist(a, b) for a, b in zip(points, points[1:])]
+        heading = [math.atan2(b[1] - a[1], b[0] - a[0]) if d > 1e-9 else 0.0
+                   for (a, b), d in zip(zip(points, points[1:]), seg)]
+        # +-4 m: a polyline concentrates its turning at vertices, and a driver
+        # smooths short jogs of the lane alignment over about a car length.
+        window = 8
+        if self.roads[road].get("turn") == "through":
+            # Through connectors are straight apart from alignment jogs of
+            # about a metre near the stop lines; drivers straighten those.
+            window = 20
+        caps, scales = [], []
+        road_cap = 40.0 / 3.6
+        for i in range(count):
+            lo, hi = max(0, i - window), min(count - 2, i + window - 1)
+            arc = sum(seg[lo:hi + 1])
+            ref = sum(ref_step[lo:hi + 1])
+            turn = abs((heading[hi] - heading[lo] + math.pi) % (2 * math.pi) - math.pi)
+            # ``turn`` is accumulated between the first and last segment
+            # centres, i.e. over the arc minus half of each end segment.
+            span = arc - 0.5 * (seg[lo] + seg[hi])
+            if self.curve_lat_accel > 0 and turn > 1e-4 and span > 1e-6:
+                caps.append(min(road_cap, math.sqrt(self.curve_lat_accel * span / turn)))
+            else:
+                caps.append(road_cap)
+            scales.append(min(1.6, max(0.5, arc / ref)) if ref > 1e-9 else 1.0)
+        for i in range(count - 2, -1, -1):
+            caps[i] = min(caps[i], math.sqrt(
+                caps[i + 1] ** 2 + 2.0 * self.curve_decel * seg[i]))
+        profile = (tuple(caps), tuple(scales))
+        self._curve_profiles[key] = profile
+        return profile
+
+    def _path_scale(self, vehicle):
+        """Physical metres travelled per metre of route progress."""
+        if (self.mode != "safe" or
+                not vehicle.approach_end <= vehicle.position < vehicle.connector_end):
+            return 1.0
+        scales = self._curve_profile(vehicle.conn_road, vehicle.current_lateral_shift)[1]
+        index = int((vehicle.position - vehicle.approach_end) / self.CURVE_STEP)
+        return scales[min(len(scales) - 1, max(0, index))]
+
+    def _curve_speed_cap(self, vehicle):
+        """Speed the vehicle's path geometry allows here (m/s, physical)."""
+        if self.curve_lat_accel <= 0:
+            return math.inf
+        if vehicle.position >= vehicle.connector_end:
+            return math.inf
+        if vehicle.position >= vehicle.approach_end:
+            caps = self._curve_profile(vehicle.conn_road, vehicle.current_lateral_shift)[0]
+            index = int((vehicle.position - vehicle.approach_end) / self.CURVE_STEP)
+            return caps[min(len(caps) - 1, max(0, index))]
+        distance = vehicle.approach_end - vehicle.position
+        if distance > 60.0:
+            return math.inf
+        key = (vehicle.conn_road, int(round(vehicle.current_lateral_shift / self.CURVE_SHIFT_BIN)))
+        entry = self._curve_entry.get(key)
+        if entry is None:
+            seam_shift = self._continuous_seam_pose(
+                vehicle.in_road, vehicle.conn_road, key[1] * self.CURVE_SHIFT_BIN)[1]
+            lanes = self.roads[vehicle.conn_road]["num_lanes"]
+            seam_shift = min(max(seam_shift, 0.0), (lanes - 1) * SUBLANE_WIDTH)
+            entry = self._curve_profile(vehicle.conn_road, seam_shift)[0][0]
+            self._curve_entry[key] = entry
+        return math.sqrt(entry * entry + 2.0 * self.curve_decel * distance)
+
     @staticmethod
     def _stop_position(vehicle):
         return (vehicle.approach_end - vehicle.length / 2 - STOP_MARGIN
@@ -319,7 +413,9 @@ class LeVanLuongSimulator:
                  roads_path=ROOT / "includes" / "roads.geojson",
                  demand_file=None, train_mode=False, mode="safe", yellow=4.0,
                  vehicle_params=None, startup_params=None,
-                 junction_model="negotiation", negotiation_params=None):
+                 junction_model="negotiation", negotiation_params=None,
+                 min_green=10.0, jam_timeout=120.0,
+                 curve_lat_accel=3.0, curve_decel=2.0, max_decel=7.5):
         if mode not in ("safe", "gama_2025_6_4"):
             raise ValueError("mode must be 'safe' or 'gama_2025_6_4'")
         self.mode = mode
@@ -434,6 +530,38 @@ class LeVanLuongSimulator:
         self.max_road_safety_correction = 0.0
         self.largest_road_safety_event = None
         self.green_ticks = 0
+        # Train mode: a phase must have shown green for ``min_green`` seconds
+        # before the policy may leave it (see ``action_mask``).
+        min_green = float(min_green)
+        jam_timeout = float(jam_timeout)
+        if not math.isfinite(min_green) or min_green < 0 or math.isnan(jam_timeout) or jam_timeout < 0:
+            raise ValueError("min_green and jam_timeout must be non-negative")
+        self.min_green = min_green
+        self._min_green_ticks = int(round(min_green / DT))
+        # Safety net (cf. SUMO time-to-teleport): a vehicle standing inside
+        # the junction for longer than this is removed and counted. 0 or inf
+        # disables it. It must stay at zero in a healthy run.
+        self.jam_timeout = jam_timeout
+        self.jam_removed = 0
+        # Kinematic limits (safe mode). ``curve_lat_accel`` caps the lateral
+        # acceleration on curved connector paths (v <= sqrt(a_lat * R)) with
+        # anticipatory braking at ``curve_decel`` before the curve; 0 turns
+        # the limit off. ``max_decel`` is the emergency braking bound of the
+        # car-following law; position guards that need more than this are
+        # counted in ``hard_brake_events`` instead of being hidden.
+        for name, value in (("curve_lat_accel", curve_lat_accel),
+                            ("curve_decel", curve_decel), ("max_decel", max_decel)):
+            if not math.isfinite(float(value)) or float(value) < 0:
+                raise ValueError(f"{name} must be a non-negative number")
+        if float(curve_decel) <= 0 or float(max_decel) <= 0:
+            raise ValueError("curve_decel and max_decel must be positive")
+        self.curve_lat_accel = float(curve_lat_accel) if self.mode == "safe" else 0.0
+        self.curve_decel = float(curve_decel)
+        self.max_decel = float(max_decel)
+        self._curve_profiles = {}
+        self._curve_entry = {}
+        self.hard_brake_events = 0
+        self.masked_actions = 0
         self.train_mode = bool(train_mode)
         self.dqn_waiting_action = False
         self.dqn_action = -1
@@ -502,9 +630,30 @@ class LeVanLuongSimulator:
         elif self.phase in ("LVL", "HDT"):
             self._last_yellow = None
 
+    def action_mask(self):
+        """Legal actions (LVL, -, HDT, -) at the current decision tick.
+
+        Keeping the running phase is always legal. Leaving it requires
+        ``min_green`` seconds of green; during yellow/all-red the pending
+        phase is the only legal choice.
+        """
+        if self.phase in ("LVL", "HDT"):
+            current = self.phase
+            may_switch = self.green_ticks >= self._min_green_ticks
+        else:
+            current = self.pending_phase
+            may_switch = False
+        return (current == "LVL" or may_switch, False,
+                current == "HDT" or may_switch, False)
+
     def set_action(self, action):
         if not self.train_mode or not self.dqn_waiting_action or action not in (0, 2):
             raise ValueError("Action requires a Le Van Luong decision tick and phase 0 or 2")
+        if not self.action_mask()[action]:
+            # An illegal switch is a hold, never an error: the environment
+            # masks it, but baselines and old checkpoints may still ask.
+            self.masked_actions += 1
+            action = 0 if self.action_mask()[0] else 2
         self.dqn_action = action
         self.dqn_waiting_action = False
 
@@ -609,6 +758,28 @@ class LeVanLuongSimulator:
                 continue
             position = min(position, other.position - (length + other.length) / 2
                            - max(1.0, other.gap))
+        # Vehicles arrive from upstream at speed, not from rest at the model
+        # boundary. Enter at the desired speed, lowered to what the headway
+        # to the vehicle ahead in the same lateral band allows (IDM steady
+        # state and the ability to stop behind it at comfortable braking).
+        entry_speed = 0.0
+        if self.mode == "safe":
+            entry_speed = min(speed_kmh / 3.6, 60.0 / 3.6)
+            for other in self.vehicles:
+                if other.road != f"{arm}_in" or other.position < position:
+                    continue
+                if abs(initial_shift - other.current_lateral_shift) >= (
+                        new_half_width + self._half_width(other) + LATERAL_CLEARANCE):
+                    continue
+                room = (other.position - position - (length + other.length) / 2
+                        - kind_params["gap"])
+                if room <= 0.0:
+                    entry_speed = 0.0
+                    break
+                entry_speed = min(
+                    entry_speed, room / kind_params["headway"],
+                    math.sqrt(other.speed * other.speed +
+                              2.0 * kind_params["decel"] * room))
         creation_id = self._next_creation_id
         self._next_creation_id += 1
         # Fixed for each vehicle and seed; do not consume the demand RNG.
@@ -632,6 +803,7 @@ class LeVanLuongSimulator:
             creation_id=creation_id,
             created_cycle=self.cycle,
             position=position,
+            speed=entry_speed,
             demand_row_id=demand_row_id,
             current_lateral_shift=initial_shift,
             start_lateral_shift=initial_shift,
@@ -804,6 +976,13 @@ class LeVanLuongSimulator:
         # stopped in one tick when its grant expires.
         clearance_time = self._yellow + self.all_red
         speed_limit = min(vehicle.desired, 60.0 / 3.6)
+        cap_now = self._curve_speed_cap(vehicle)
+        if math.isfinite(cap_now):
+            # A turning vehicle slows for its curve: its mean speed over the
+            # remaining approach lies between the cap here and at the line.
+            cap_line = math.sqrt(max(0.0, cap_now * cap_now -
+                                     2.0 * self.curve_decel * max(0.0, x)))
+            speed_limit = min(speed_limit, 0.5 * (cap_now + cap_line))
         cruise_speed = max(0.0, min(vehicle.speed, speed_limit))
         accel_time = min(clearance_time,
                          max(0.0, speed_limit - cruise_speed) /
@@ -1183,6 +1362,10 @@ class LeVanLuongSimulator:
                             self._stop_position(vehicle) - vehicle.position <= entry_horizon)
             if (self.mode == "safe" and is_in_road and not committed and
                     startup_gate_enabled.get(vehicle.arm, False) and
+                    # A vehicle created this tick is not in the scheduler's
+                    # snapshot yet; it arrives at speed and is not a member
+                    # of the standing queue the gate releases.
+                    vehicle.created_cycle < self.cycle and
                     vehicle.creation_id not in startup_allowed.get(vehicle.arm, ())):
                 # Startup gating applies only to the onset queue recorded by
                 # the arm scheduler. Keep the vehicle at its existing position
@@ -1224,15 +1407,32 @@ class LeVanLuongSimulator:
                 # seam, even when it takes another connector. Those paths
                 # share the first metres of the junction and only diverge
                 # after their bodies have cleared one another.
+                own_pose = None
                 for ahead in self.vehicles:
                     if (ahead is vehicle or ahead.arm != vehicle.arm or
                             ahead.position <= vehicle.position or
                             ahead.position - vehicle.position > 40.0 or
-                            ahead.road not in (vehicle.in_road, ahead.conn_road) or
-                            abs(ahead.current_lateral_shift -
-                                vehicle.current_lateral_shift) >=
-                            self._half_width(vehicle) + self._half_width(ahead) +
-                            LATERAL_CLEARANCE):
+                            ahead.road not in (vehicle.in_road, ahead.conn_road)):
+                        continue
+                    if ahead.road == old_road:
+                        lateral = abs(ahead.current_lateral_shift -
+                                      vehicle.current_lateral_shift)
+                    else:
+                        # Lateral shifts are road-local (each connector has
+                        # its own origin), so across the seam the sideways
+                        # separation is measured in the plane. Comparing raw
+                        # shifts made a vehicle beside this one a "leader"
+                        # with a negative gap: a stop from speed in one tick.
+                        if own_pose is None:
+                            own_pose = self._geometry_roads[old_road].pose(
+                                old_progress, vehicle.current_lateral_shift)
+                        ahead_road, ahead_progress = self._road_state(ahead)
+                        ahead_pose = self._geometry_roads[ahead_road].pose(
+                            ahead_progress, ahead.current_lateral_shift)
+                        lateral = abs((ahead_pose.y - own_pose.y) * own_pose.tx -
+                                      (ahead_pose.x - own_pose.x) * own_pose.ty)
+                    if lateral >= (self._half_width(vehicle) + self._half_width(ahead) +
+                                   LATERAL_CLEARANCE):
                         continue
                     if ahead.conn_road != vehicle.conn_road:
                         own_band = self._negotiation._band_path(
@@ -1256,8 +1456,13 @@ class LeVanLuongSimulator:
                         leader, gap = ahead, seam_gap
             vehicle.leading_distance = gap
             vehicle.leading_speed = leader.speed if leader else 0.0
+            # Route progress is measured on the road's reference line; on a
+            # curved connector a shifted sublane covers ``scale`` physical
+            # metres per metre of progress. Speeds stay physical.
+            scale = self._path_scale(vehicle)
             acceleration = (lane_decision.acceleration if self.mode == "gama_2025_6_4"
-                            else self._idm(vehicle, gap, leader.speed if leader else 0.0))
+                            else self._idm(vehicle, gap * scale,
+                                           leader.speed if leader else 0.0))
             junction_stop = (self._junction_stop.get(vehicle.creation_id)
                              if self._negotiation is not None else None)
             if junction_stop is not None:
@@ -1266,7 +1471,8 @@ class LeVanLuongSimulator:
                 junction_stop, junction_obstacle_speed = junction_stop
                 junction_room = junction_stop - (vehicle.position + vehicle.length / 2.0)
                 acceleration = min(acceleration, self._idm(
-                    vehicle, max(0.0, junction_room) + vehicle.gap, junction_obstacle_speed))
+                    vehicle, max(0.0, junction_room) * scale + vehicle.gap,
+                    junction_obstacle_speed))
             must_hold_at_stop = (
                 self.mode == "safe" and is_in_road and not committed and
                 (route_invalid or denied_entry or not green or (
@@ -1280,7 +1486,14 @@ class LeVanLuongSimulator:
                 if stop_gap <= entry_horizon:
                     stop_accel = self._idm(vehicle, stop_gap + vehicle.gap, 0.0)
                     if stop_gap > 0.5:
-                        stop_accel = max(-max(vehicle.decel * 1.4, 4.2), stop_accel)
+                        # Comfortable braking where it suffices, but never less
+                        # than the stop needs: a floor below the kinematic
+                        # requirement left residual speed at the hold point,
+                        # which the position guard then removed in one tick.
+                        needed = vehicle.speed * vehicle.speed / (2.0 * stop_gap)
+                        floor = min(self.max_decel,
+                                    max(vehicle.decel * 1.4, 4.2, 1.1 * needed))
+                        stop_accel = max(-floor, stop_accel)
                     acceleration = min(acceleration, stop_accel)
             initial_speed = vehicle.speed
             predicted_speed = initial_speed + acceleration * DT
@@ -1311,6 +1524,7 @@ class LeVanLuongSimulator:
             else:
                 distance = initial_speed * DT + 0.5 * acceleration * DT * DT
                 vehicle.speed = predicted_speed
+            distance /= scale
             unconstrained_distance = distance
             # The safety resolver is a final guard, not a way to brake by
             # moving a vehicle backwards. Preserve the required link clearance
@@ -1330,7 +1544,8 @@ class LeVanLuongSimulator:
                                     + junction_obstacle_speed * DT)
                 if distance > junction_room + 1e-9:
                     distance = junction_room
-                    vehicle.speed = max(0.0, min(vehicle.speed, 2.0 * junction_room / DT - initial_speed))
+                    vehicle.speed = max(0.0, min(
+                        vehicle.speed, 2.0 * junction_room * scale / DT - initial_speed))
                     self._negotiation.hard_caps += 1
             if (route_invalid and vehicle.position <= stop_position <
                     vehicle.position + distance):
@@ -1375,7 +1590,7 @@ class LeVanLuongSimulator:
                 # GAMA reaches the node using the predicted old-road speed,
                 # then enters the new road, evaluates MOBIL lane choice, and
                 # computes IDM with the new road's parameters.
-                remaining = max(0.0, DT - to_boundary / predicted_speed)
+                remaining = min(DT, max(0.0, DT - to_boundary * scale / predicted_speed))
                 pre_transition_speed = initial_speed
                 pre_transition_lane = vehicle.lane
                 old_entry = (old_progress, id(vehicle), vehicle)
@@ -1482,7 +1697,12 @@ class LeVanLuongSimulator:
                         new_distance = transition.new_road_distance
                         vehicle.speed = transition.stored_speed
                 else:
-                    crossing_speed = predicted_speed
+                    # Speed at the seam: the old road's acceleration acts only
+                    # until the boundary is reached. Using the full-step
+                    # ``predicted_speed`` here applied it twice (up to 2x
+                    # a_max across every road seam).
+                    crossing_speed = max(0.0, initial_speed +
+                                         acceleration * (DT - remaining))
                     if crossing_speed + new_acceleration * remaining < 0:
                         new_distance = -0.5 * crossing_speed * crossing_speed / new_acceleration
                         vehicle.speed = 0.0
@@ -1491,13 +1711,15 @@ class LeVanLuongSimulator:
                                         0.5 * new_acceleration * remaining * remaining)
                         vehicle.speed = max(0.0, crossing_speed +
                                             new_acceleration * remaining)
+                new_scale = self._path_scale(vehicle)
+                new_distance /= new_scale
                 unconstrained_new_distance = new_distance
                 if self.mode == "safe" and math.isfinite(new_gap):
                     new_distance = min(new_distance, max(0.0, new_gap))
                 if (self.mode == "safe" and remaining > 0 and
                         new_distance < unconstrained_new_distance - 1e-9):
                     vehicle.speed = min(vehicle.speed, max(
-                        0.0, 2.0 * new_distance / remaining - crossing_speed))
+                        0.0, 2.0 * new_distance * new_scale / remaining - crossing_speed))
                 vehicle.position += max(0.0, new_distance)
                 curr_entry = (seam_progress, id(vehicle), vehicle)
                 for sub in self._footprint(vehicle):
@@ -1514,7 +1736,7 @@ class LeVanLuongSimulator:
             else:
                 if distance < unconstrained_distance - 1e-9:
                     vehicle.speed = min(vehicle.speed, max(
-                        0.0, 2.0 * distance / DT - initial_speed))
+                        0.0, 2.0 * distance * scale / DT - initial_speed))
                 hold_from = vehicle.position
                 vehicle.position += max(0.0, distance)
                 if is_in_road and not can_cross and vehicle.position > stop_position:
@@ -1617,8 +1839,14 @@ class LeVanLuongSimulator:
                         moving_gap = (other.gap + min(8.0, other.speed * other.headway)
                                       if other_progress < road_progress else
                                       vehicle.gap + min(8.0, vehicle.speed * vehicle.headway))
-                        if (separation - closing * remaining_change >=
-                                max(1.2, vehicle.gap, other.gap, moving_gap)):
+                        needed = max(1.2, vehicle.gap, other.gap, moving_gap)
+                        if vehicle.speed < 0.5 and other.speed < 0.5:
+                            # Standing bodies that do not overlap lengthwise
+                            # cannot meet by a sideways move. The moving-gap
+                            # rule (1.2 m) exceeds a car's jam gap (1.0 m), so
+                            # a queued follower froze the change half-way.
+                            needed = 0.0
+                        if separation - closing * remaining_change >= needed:
                             continue
                         if self._moving_away(vehicle.current_lateral_shift, next_shift,
                                              other_shift, other_shift):
@@ -1635,6 +1863,25 @@ class LeVanLuongSimulator:
                 elif vehicle.lane_change_progress >= 1.0:
                     vehicle.current_lateral_shift = vehicle.target_lateral_shift
                 survivors.append(vehicle)
+        if self.mode == "safe":
+            limit = (self.max_decel + 0.5) * DT
+            for vehicle in survivors:
+                before = starting_speeds.get(vehicle.creation_id)
+                if before is not None and before - vehicle.speed > limit:
+                    self.hard_brake_events += 1
+        if (self.mode == "safe" and self.jam_timeout > 0
+                and math.isfinite(self.jam_timeout)):
+            kept = []
+            for vehicle in survivors:
+                if vehicle.road == vehicle.conn_road and vehicle.speed < 0.1:
+                    vehicle.junction_standstill += DT
+                    if vehicle.junction_standstill > self.jam_timeout:
+                        self.jam_removed += 1
+                        continue
+                else:
+                    vehicle.junction_standstill = 0.0
+                kept.append(vehicle)
+            survivors = kept
         self.vehicles = survivors
         # The index is only valid inside this tick's movement pass.
         self._road_index = None
@@ -1717,6 +1964,14 @@ class LeVanLuongSimulator:
                             half_width + other_half_width + LATERAL_CLEARANCE):
                         continue
                     clearance = max(1.0, vehicle.gap, ahead.gap)
+                    if vehicle.speed < 0.5:
+                        # A standing merger may slot in just ahead of a
+                        # standing follower (see ``_choose_lane``). Bodies
+                        # that do not overlap are left where they are: a
+                        # standing follower is never pushed backwards to
+                        # restore the moving clearance (also not when its
+                        # leader pulls away), it simply waits for the gap.
+                        clearance = 0.0
                     allowed = min(allowed, ahead_progress -
                                   (vehicle.length + ahead.length) / 2 - clearance)
                     if allowed < progress:
@@ -1838,6 +2093,12 @@ class LeVanLuongSimulator:
                     # its jam gap, which must not count as "too close".
                     back_floor = follower.gap - 0.05 + follower.speed ** 2 / (
                         2.0 * max(4.0, 1.5 * follower.decel))
+                    if follower.speed < 0.5 and vehicle.speed < 0.5:
+                        # Both standing: bodies that do not overlap are enough.
+                        # A follower that crept inside its own jam gap behind
+                        # the claim otherwise blocks the merger for ever, and
+                        # the merger, held at its buffer, blocks the approach.
+                        back_floor = 0.0
                     back_required = ((1.0 - urgency) * back_required +
                                      urgency * back_floor)
             if front_gap < front_required or back_gap < back_required:
@@ -1863,9 +2124,12 @@ class LeVanLuongSimulator:
                               if other_pos < progress else
                               (vehicle.speed - other.speed))
                 long_sep -= closing * max(vehicle.lateral_duration, DT)
-                # Impatient mergers accept the smaller of the two jam gaps.
+                # Impatient mergers accept the smaller of the two jam gaps,
+                # and any positive gap to a body that is standing like them.
+                jam = (0.0 if vehicle.speed < 0.5 and other.speed < 0.5
+                       else min(vehicle.gap, other.gap) - 0.05)
                 if long_sep >= ((1.0 - urgency) * max(1.5, vehicle.gap, other.gap) +
-                                urgency * (min(vehicle.gap, other.gap) - 0.05)):
+                                urgency * jam):
                     continue
                 other_lo = min(other.current_lateral_shift, other.target_lateral_shift)
                 other_hi = max(other.current_lateral_shift, other.target_lateral_shift)
@@ -1889,7 +2153,12 @@ class LeVanLuongSimulator:
                 if getattr(follower, "leading_distance", math.inf) >= back_gap:
                     prior_gap = back_gap + vehicle.length + front_gap
                     after = self._idm(follower, back_gap, vehicle.speed)
-                    if after <= -2.5:
+                    # MOBIL's safety criterion limits the braking imposed on
+                    # the new follower. A standing follower brakes for nobody;
+                    # IDM merely reports a large negative value for a gap
+                    # inside its jam distance, which vetoed every merge in
+                    # front of a queue.
+                    if after <= -2.5 and follower.speed >= 0.5:
                         continue
                     before = self._idm(follower, prior_gap, leader_speed)
                     follower_delta = after - before
@@ -2047,12 +2316,20 @@ class LeVanLuongSimulator:
         road, position = self._neighbor_road_state[id(vehicle)]
         candidate_shift = ((lane + (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
                            if shift is None else shift)
-        def lateral_interacts(other):
+        def lateral_interacts(other, other_position=None):
             if self.mode != "safe":
                 return True
             reach = self._half_width(vehicle) + self._half_width(other) + LATERAL_CLEARANCE
-            return (abs(candidate_shift - other.current_lateral_shift) < reach or
-                    abs(candidate_shift - other.merge_claim_shift) < reach)
+            if abs(candidate_shift - other.current_lateral_shift) < reach:
+                return True
+            # A claimed merge counts as a leader only when the merger is
+            # fully ahead (same rule as ``consider`` below). A vehicle already
+            # alongside keeps going so the merger can slot in behind it;
+            # otherwise the two wait for each other for ever.
+            if (other_position is not None and other_position - position <
+                    (vehicle.length + other.length) / 2):
+                return False
+            return abs(candidate_shift - other.merge_claim_shift) < reach
         leader = follower = None
         front = back = math.inf
         front_distance = back_distance = math.inf
@@ -2061,7 +2338,8 @@ class LeVanLuongSimulator:
             index = bisect.bisect_left(entries, (position, -1))
             ahead = index
             while ahead < len(entries) and (entries[ahead][2] is vehicle or
-                                            not lateral_interacts(entries[ahead][2])):
+                                            not lateral_interacts(entries[ahead][2],
+                                                                  entries[ahead][0])):
                 ahead += 1
             if ahead < len(entries):
                 other_position, _, other = entries[ahead]
@@ -2235,7 +2513,8 @@ class LeVanLuongSimulator:
                 return cached
         road_limit = (40.0 if vehicle.approach_end <= vehicle.position <
                       vehicle.connector_end else 60.0) / 3.6
-        limit = min(vehicle.desired, road_limit)
+        curve_cap = self._curve_speed_cap(vehicle)
+        limit = min(vehicle.desired, road_limit, curve_cap)
         if vehicle.position < vehicle.approach_end:
             green = self._green_for(vehicle)
             if ((not green and vehicle.position <= self._stop_position(vehicle) + 1e-8)
@@ -2249,6 +2528,13 @@ class LeVanLuongSimulator:
             (2 * math.sqrt(vehicle.accel * vehicle.decel)))
         interaction = (desired_gap / gap) ** 2 if gap > 0 else math.inf
         result = vehicle.accel * (1 - (vehicle.speed / max(limit, 1e-6)) ** 4 - interaction)
+        if vehicle.speed > curve_cap:
+            # IDM's free term only eases a vehicle back to its limit; the
+            # curve cap falls at ``curve_decel`` along the path, so track it
+            # with the vehicle's comfortable braking.
+            result = min(result, max(-vehicle.decel, (curve_cap - vehicle.speed) / DT))
+        # No tyre delivers the unbounded braking IDM asks for at tiny gaps.
+        result = max(result, -self.max_decel)
         if gap == math.inf:
             self._free_idm_cache[id(vehicle)] = result
         return result
@@ -2292,6 +2578,8 @@ class LeVanLuongSimulator:
         result.update(yellow_phase=self.yellow_phase or "",
                       entries_during_yellow=self.entries_during_yellow,
                       entries_during_red=self.entries_during_red,
+                      jam_removed=self.jam_removed,
+                      hard_brake_events=self.hard_brake_events,
                       permitted_right_on_red_entries=self.permitted_right_on_red_entries)
         return result
 

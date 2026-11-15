@@ -15,7 +15,6 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "train" / "logic"))
 from train.logic.lvl_env import LVLGamaEnv, LVLPythonEnv
 from train.logic.gama_env import featurize
 from train.logic.hybrid_agent import SpatialHybridAgent, ARCHITECTURE as HYBRID_ARCHITECTURE

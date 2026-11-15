@@ -19,14 +19,28 @@ except ImportError:  # standalone train.py
 ARCHITECTURE = "gama-spatial-3dqn-maxpressure-4x6x20x16-v2"
 
 
-def normalized_scores(values, masks):
-    """Z-score each state's legal actions; all-equal scores contribute zero."""
+def _centered(values, masks):
     selected = torch.where(masks, values, torch.zeros_like(values))
     count = masks.sum(dim=1, keepdim=True).clamp(min=1)
     mean = selected.sum(dim=1, keepdim=True) / count
     variance = torch.where(masks, (values - mean).square(), 0.0).sum(dim=1, keepdim=True) / count
-    scale = variance.sqrt()
-    return torch.where(scale > 1e-6, (values - mean) / scale.clamp(min=1e-6), 0.0)
+    return values - mean, variance.sqrt()
+
+
+def normalized_scores(values, masks, reference=None):
+    """Centre each state's legal actions and divide by a spread.
+
+    Without ``reference`` the spread is the state's own (a z-score; all-equal
+    scores contribute zero). With exactly two legal actions a z-score is
+    always +-1 whatever the gap, so the pressure term could never outvote Q
+    unless Q was tied. ``reference`` is a typical spread (a running mean kept
+    by the agent): a small Q gap then yields a small score and a large
+    pressure gap can decide.
+    """
+    centred, scale = _centered(values, masks)
+    if reference is not None and reference > 1e-6:
+        return (centred / reference).clamp(-3.0, 3.0)
+    return torch.where(scale > 1e-6, centred / scale.clamp(min=1e-6), 0.0)
 
 
 class HybridReplay(PrioritizedReplay):
@@ -126,10 +140,27 @@ class SpatialHybridAgent:
         self.optimizer = torch.optim.Adam(self.online_net.parameters(), lr=lr)
         self.buffer = HybridReplay(buffer_size, seed=seed)
         self.last_losses = deque(maxlen=100)
+        # Running spreads for the hybrid score; None until first observed
+        # (the score then falls back to a per-state z-score).
+        self.q_spread = None
+        self.pressure_spread = None
+
+    SPREAD_RATE = 0.01  # weight of one decision in the running spreads
+
+    def _observe_spread(self, q, pressure, masks):
+        """Track the typical spread of Q and of pressure over legal actions."""
+        for name, values in (("q_spread", q), ("pressure_spread", pressure)):
+            spread = float(_centered(values, masks)[1].mean())
+            if not math.isfinite(spread) or spread <= 1e-6:
+                continue
+            old = getattr(self, name)
+            setattr(self, name, spread if old is None else
+                    old + self.SPREAD_RATE * (spread - old))
 
     def _scores(self, q, pressure, masks):
-        return (normalized_scores(q, masks) + self.pressure_lambda *
-                normalized_scores(pressure, masks)).masked_fill(~masks, -torch.inf)
+        return (normalized_scores(q, masks, self.q_spread) + self.pressure_lambda *
+                normalized_scores(pressure, masks, self.pressure_spread)
+                ).masked_fill(~masks, -torch.inf)
 
     def act(self, state, greedy=False, action_mask=None, force_random=False):
         mask = valid_mask(action_mask)
@@ -140,7 +171,10 @@ class SpatialHybridAgent:
             aux = torch.as_tensor(np.asarray(state["aux"])[None], device=self.device)
             pressure = torch.as_tensor(np.asarray(state["pressure"])[None], device=self.device)
             legal = torch.as_tensor(mask[None], device=self.device)
-            return int(self._scores(self.online_net(grid, aux), pressure, legal).argmax(dim=1).item())
+            q = self.online_net(grid, aux)
+            if not greedy:
+                self._observe_spread(q, pressure, legal)
+            return int(self._scores(q, pressure, legal).argmax(dim=1).item())
 
     def decay_epsilon(self):
         self.decisions += 1
@@ -173,6 +207,7 @@ class SpatialHybridAgent:
         q = self.online_net(s, a).gather(1, action).squeeze(1)
         with torch.no_grad():
             online_next = self.online_net(s2, a2)
+            self._observe_spread(online_next, pressure, mask)
             selected = self._scores(online_next, pressure, mask).argmax(dim=1, keepdim=True)
             target_q = self.target_net(s2, a2).gather(1, selected).squeeze(1)
             target = reward + discount * (1.0 - done) * target_q
@@ -201,6 +236,7 @@ class SpatialHybridAgent:
                     "online_net": self.online_net.state_dict(),
                     "target_net": self.target_net.state_dict(),
                     "gamma": self.gamma, "eps": self.eps,
+                    "q_spread": self.q_spread, "pressure_spread": self.pressure_spread,
                     "decisions": self.decisions, "update_count": self.update_count}, path)
 
     def load(self, path):
@@ -216,6 +252,8 @@ class SpatialHybridAgent:
         self.eps = ckpt["eps"]
         self.decisions = ckpt["decisions"]
         self.update_count = ckpt["update_count"]
+        self.q_spread = ckpt.get("q_spread")
+        self.pressure_spread = ckpt.get("pressure_spread")
         return ckpt
 
     def training_state(self):
@@ -225,6 +263,7 @@ class SpatialHybridAgent:
                 "optimizer": self.optimizer.state_dict(),
                 "eps": self.eps, "decisions": self.decisions,
                 "update_count": self.update_count,
+                "q_spread": self.q_spread, "pressure_spread": self.pressure_spread,
                 "losses": list(self.last_losses), "action_rng": self.rng.getstate(),
                 "replay": self.buffer.snapshot()}
 
@@ -236,6 +275,8 @@ class SpatialHybridAgent:
         self.optimizer.load_state_dict(state["optimizer"])
         self.eps = state["eps"]
         self.decisions, self.update_count = state["decisions"], state["update_count"]
+        self.q_spread = state.get("q_spread")
+        self.pressure_spread = state.get("pressure_spread")
         self.last_losses.clear()
         self.last_losses.extend(state["losses"])
         self.rng.setstate(state["action_rng"])

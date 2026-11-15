@@ -12,6 +12,7 @@ import csv
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 import platform
 import pickle
@@ -105,7 +106,9 @@ def parse_args(argv=None):
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--tau", type=float, default=1e-3)
     p.add_argument("--eps-start", type=float, default=1.0)
-    p.add_argument("--eps-decay-steps", type=float, default=2_000_000)
+    p.add_argument("--eps-decay-steps", type=float, default=None,
+                   help="Time constant of the exponential epsilon decay; "
+                        "default total_steps / 5 (epsilon ~ 0.7 %% of its start at the end)")
     p.add_argument("--eps-min", type=float, default=0.001)
     p.add_argument("--n-step", type=int, default=3)
     p.add_argument("--per-alpha", type=float, default=.5)
@@ -170,6 +173,10 @@ def parse_args(argv=None):
         args.gamma = .97 if args.reward_mode in ("queue_time", "total_wait", "r1", "r2", "r3", "r4") else .99
     if args.lr is None:
         args.lr = 0.1 if args.algorithm == "qlearning" else 1e-4
+    if args.eps_decay_steps is None:
+        # eps = eps_start * exp(-decisions / eps_decay_steps). The old fixed
+        # 2,000,000 left the agent 61 % random at the end of a 1M-step run.
+        args.eps_decay_steps = max(1.0, args.total_steps / 5.0)
     return args
 
 
@@ -216,8 +223,31 @@ def training_config(args):
     return config
 
 
+def actor_seed(episode_seed, learner_decisions, worker=0):
+    """Distinct exploration stream for every rollout of an episode.
+
+    An episode is collected in several rollouts. Seeding each rollout's actor
+    with the bare episode seed replayed the same random action sequence in
+    every one of them.
+    """
+    return (int(episode_seed) * 1_000_003 + int(learner_decisions) * 7919 +
+            int(worker)) % (2 ** 31 - 1)
+
+
 def make_actor(agent_class, learner, args, seed):
     """Freeze a small CPU policy for one rollout; never copy the learner's replay."""
+    # Agent constructors seed the *global* torch and numpy generators, which
+    # the learner also draws from. Building an actor must not rewind them.
+    torch_state = torch.random.get_rng_state()
+    numpy_state = np.random.get_state()
+    try:
+        return _make_actor(agent_class, learner, args, seed)
+    finally:
+        torch.random.set_rng_state(torch_state)
+        np.random.set_state(numpy_state)
+
+
+def _make_actor(agent_class, learner, args, seed):
     actor = agent_class(lr=args.lr, gamma=args.gamma, buffer_size=1,
                         warmup=1, batch_size=1, tau=args.tau,
                         eps_start=args.eps_start, eps_decay_steps=args.eps_decay_steps,
@@ -226,6 +256,9 @@ def make_actor(agent_class, learner, args, seed):
                         **spatial_kwargs(args))
     actor.eps = learner.eps
     actor.decisions = learner.decisions
+    for name in ("q_spread", "pressure_spread"):  # hybrid score scales
+        if hasattr(learner, name):
+            setattr(actor, name, getattr(learner, name))
     if args.algorithm == "qlearning":
         actor.table = {key: values.copy() for key, values in learner.table.items()}
     else:
@@ -385,8 +418,11 @@ async def amain(args):
     process_executors = []
     try:
         if args.backend == "python" and args.workers > 1:
-            process_executors = [concurrent.futures.ProcessPoolExecutor(max_workers=1)
-                                 for _ in range(args.workers)]
+            # "spawn": forking a process that already holds torch threads
+            # deadlocks on Linux/Colab.
+            spawn = multiprocessing.get_context("spawn")
+            process_executors = [concurrent.futures.ProcessPoolExecutor(
+                max_workers=1, mp_context=spawn) for _ in range(args.workers)]
         if args.start_server:
             for index in range(args.workers):
                 port = args.port + index
@@ -442,7 +478,8 @@ async def amain(args):
         class DiscardSamples:
             def writerow(self, row):
                 pass
-        ep = 0
+        ep = 0             # log rows: rollouts with workers > 1, episodes otherwise
+        episodes_done = 0  # completed episodes: validation/checkpoint cadence
         next_seed = args.seed_base + 1
         worker_states = [None] * args.workers
         worker_seeds = [None] * args.workers
@@ -468,6 +505,10 @@ async def amain(args):
                 raise ValueError("Training log does not match the checkpoint")
             with open(log_path, "w", newline="") as f:
                 csv.writer(f).writerows(old_rows[:ep + 1])
+            episodes_done = snapshot.get("episodes_done")
+            if episodes_done is None:  # snapshot from before the counter existed
+                episodes_done = (sum(row[-1] == "1" for row in old_rows[1:ep + 1])
+                                 if args.workers > 1 else ep)
             print(f"[Train] Resumed episode {ep}, decision {agent.decisions}")
         else:
             if os.path.exists(log_path):
@@ -477,6 +518,7 @@ async def amain(args):
 
         def save_training_snapshot():
             snapshot = {"config": config, "episode": ep,
+                        "episodes_done": episodes_done,
                         "next_seed": next_seed,
                         "best_validation_queue": best_validation_queue,
                         "normalizers": [worker._worst_delay_sq for worker in envs],
@@ -496,45 +538,54 @@ async def amain(args):
                     time.monotonic() - train_started >= args.max_train_seconds)
 
         while (agent.decisions < args.total_steps and
-               (args.episodes == 0 or ep < args.episodes) and
+               (args.episodes == 0 or episodes_done < args.episodes) and
                not time_budget_reached()):
             if args.workers > 1:
                 if deadline is not None and deadline - time.monotonic() < 5.0:
                     break
-                available_episodes = (args.episodes - ep) if args.episodes else args.workers
-                batch_size = min(args.workers, available_episodes,
-                                 args.validate_every - ep % args.validate_every,
-                                 args.checkpoint_every - ep % args.checkpoint_every,
-                                 args.total_steps - agent.decisions)
+                # ``--episodes`` bounds episodes, not rollouts: a worker whose
+                # episode has ended starts a new one only while episodes
+                # remain; unfinished episodes always continue.
                 remaining = args.total_steps - agent.decisions
-                quotas = [min(args.rollout_decisions,
-                              remaining // batch_size + int(i < remaining % batch_size))
-                          for i in range(batch_size)]
-                for i in range(batch_size):
+                slots = []
+                for i in range(args.workers):
+                    if len(slots) >= remaining:
+                        break
                     if worker_states[i] is None:
+                        started = next_seed - args.seed_base - 1
+                        if args.episodes and started >= args.episodes:
+                            continue
                         worker_seeds[i] = next_seed
                         next_seed += 1
-                actors = [make_actor(agent_class, agent, args, worker_seeds[i])
-                          for i in range(batch_size)]
+                    slots.append(i)
+                if not slots:
+                    break
+                batch_size = len(slots)
+                quotas = [min(args.rollout_decisions,
+                              remaining // batch_size + int(k < remaining % batch_size))
+                          for k in range(batch_size)]
+                actors = [make_actor(agent_class, agent, args,
+                                     actor_seed(worker_seeds[i], agent.decisions, i))
+                          for i in slots]
                 # All actors see the same frozen learner; independent GAMA
                 # processes collect in parallel. Learn in seed order below.
                 if process_executors:
                     loop = asyncio.get_running_loop()
                     tasks = [loop.run_in_executor(
                         process_executors[i], collect_python_rollout_process,
-                        pickle.dumps(actors[i]), args, worker_seeds[i], quotas[i],
+                        pickle.dumps(actors[k]), args, worker_seeds[i], quotas[k],
                         args.algorithm != "qlearning" and len(agent.buffer) < args.warmup,
                         episode_parameters(worker_seeds[i]) if worker_states[i] is None else None,
                         deadline, worker_states[i], worker_sim_payloads[i])
-                             for i in range(batch_size)]
+                             for k, i in enumerate(slots)]
                 else:
                     tasks = [asyncio.create_task(collect_rollout(
-                        envs[i], actors[i], args, worker_seeds[i],
-                        quotas[i], args.algorithm != "qlearning" and
+                        envs[i], actors[k], args, worker_seeds[i],
+                        quotas[k], args.algorithm != "qlearning" and
                         len(agent.buffer) < args.warmup,
                         episode_parameters(worker_seeds[i]) if worker_states[i] is None else None,
                         deadline=deadline, initial_state=worker_states[i]))
-                             for i in range(batch_size)]
+                             for k, i in enumerate(slots)]
                 try:
                     collected = await asyncio.gather(*tasks)
                 except BaseException:
@@ -542,7 +593,7 @@ async def amain(args):
                         task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
                     raise
-                for i, item in enumerate(collected):
+                for i, item in zip(slots, collected):
                     if item["decisions"] == 0:
                         continue
                     ep += 1
@@ -560,6 +611,9 @@ async def amain(args):
                     worker_states[i] = None if completed_episode else state
                     if completed_episode:
                         worker_seeds[i] = None
+                        episodes_done += 1
+                    finished = (agent.decisions >= args.total_steps or
+                                (args.episodes and episodes_done >= args.episodes))
                     if process_executors:
                         worker_sim_payloads[i] = (None if completed_episode else
                                                   item["sim_payload"])
@@ -574,8 +628,8 @@ async def amain(args):
                         csv.writer(f).writerow(row)
                     marker = ""
                     if (not time_budget_reached() and
-                            (ep % args.validate_every == 0 or agent.decisions >= args.total_steps or
-                             ep == args.episodes)):
+                            ((completed_episode and
+                              episodes_done % args.validate_every == 0) or finished)):
                         normalizer = env._worst_delay_sq
                         scores = []
                         try:
@@ -595,20 +649,22 @@ async def amain(args):
                         finally:
                             env._worst_delay_sq = normalizer
                             if not process_executors:
+                                # Validation ran on worker 0's environment.
                                 worker_states[0] = None
                                 worker_seeds[0] = None
                         score = sum(scores) / len(scores)
                         with open(os.path.join(outdir, "validation_log.csv"), "a", newline="") as f:
-                            csv.writer(f).writerow([ep, agent.decisions, *scores, score])
+                            csv.writer(f).writerow([episodes_done, agent.decisions, *scores, score])
                         if score < best_validation_queue:
                             best_validation_queue = score
                             agent.save(os.path.join(outdir, "best_weights.pt"))
                             marker = "  <- best validation queue"
-                    if (time_budget_reached() or ep % args.checkpoint_every == 0 or
-                            agent.decisions >= args.total_steps or ep == args.episodes):
+                    if (time_budget_reached() or finished or
+                            (completed_episode and
+                             episodes_done % args.checkpoint_every == 0)):
                         agent.save(os.path.join(outdir, "checkpoint.pt"))
                         save_training_snapshot()
-                    print(f"[Rollout {ep:5d} | step {agent.decisions}/{args.total_steps}] "
+                    print(f"[Rollout {ep:5d} | episode {episodes_done:4d} | step {agent.decisions}/{args.total_steps}] "
                           f"reward={item['reward']:8.1f} | decisions={item['decisions']:3d} | "
                           f"eps={agent.eps:.3f} | loss={agent.avg_loss:.4f} | "
                           f"passed={state['total_vehicles_passed']:3d} | "
@@ -712,6 +768,7 @@ async def amain(args):
                   f"wait={wait_display} | "
                   f"queue={state['current_queue_length']:2d} | {wall:5.1f}s{marker}")
 
+            episodes_done = ep
         # 4. Luu weights cuoi cung
         final_path = os.path.join(outdir, "dqn_weights.pt")
         agent.save(final_path)

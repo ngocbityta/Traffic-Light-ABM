@@ -30,11 +30,27 @@ STATE_EXPR = ('"" + cycle + "|" + phase + "|" + dqn_waiting_action + "|" + '
               'system_time_integral + "|" + weighted_delay_integral + "|" + '
               'green_ticks')
 MASK = np.asarray([True, False, True, False])
+# A phase must have shown green this long before the policy may leave it
+# (10 s = 50 cycles of 0.2 s). Switching costs 4 s yellow + 2 s all-red, so
+# with a decision every 10 s an unconstrained agent could leave each phase
+# only 4 s of green, which no real controller does and no junction survives.
+MIN_GREEN_CYCLES = 50
+
+
+def action_mask(phase, green_cycles, min_green_cycles=MIN_GREEN_CYCLES):
+    """Legal actions (LVL, -, HDT, -): staying is always legal, leaving the
+    running phase only after its minimum green."""
+    if phase not in ("LVL", "HDT"):
+        return MASK.copy()
+    may_switch = green_cycles is None or int(green_cycles) >= int(min_green_cycles)
+    return np.asarray([phase == "LVL" or may_switch, False,
+                       phase == "HDT" or may_switch, False])
 
 
 def _observation(cycle, phase, waiting, next_decision, created, passed,
                  queue_integral, system_integral, weighted_integral, vehicles,
-                 state_mode, green_cycles=None):
+                 state_mode, green_cycles=None, mask=None, transition_of=None,
+                 yellow_cycles=0, extra=None):
     grid = np.zeros((4, 6, 20, 16), dtype=np.float32)
     for arm_idx, arm_name in enumerate(ARMS):
         valid_lanes = ROADS[f"{arm_name}_in"]["num_lanes"]
@@ -71,9 +87,18 @@ def _observation(cycle, phase, waiting, next_decision, created, passed,
         dtse[1, row, bin_id] = max(dtse[1, row, bin_id], ratio)
         dtse[2, row, bin_id] = float(served)
     np.divide(grid[:, 1], speed_counts, out=grid[:, 1], where=speed_counts > 0)
-    state = dict(cycle=cycle, global_phase={"LVL": 0, "HDT": 4, "none": 1}[phase],
+    # ``global_phase`` follows the four-phase convention read by featurize():
+    # even = green of phase n // 2, odd = its yellow/clearance. During a
+    # transition the code is that of the phase being left when it is known
+    # (Python backend); it used to be 1 always, i.e. "LVL" for both.
+    phase_code = {"LVL": 0, "HDT": 4}
+    if phase in phase_code:
+        global_phase = phase_code[phase]
+    else:
+        global_phase = phase_code.get(transition_of, 0) + 1
+    state = dict(cycle=cycle, global_phase=global_phase,
                  green_cycles=cycle % 50 if green_cycles is None else int(green_cycles),
-                 yellow_cycles=0,
+                 yellow_cycles=int(yellow_cycles),
                  queue_ns=queues[0] + queues[2], queue_ew=queues[1] + queues[3],
                  approach_ns=approach_counts[0] + approach_counts[2],
                  approach_ew=approach_counts[1] + approach_counts[3],
@@ -95,7 +120,9 @@ def _observation(cycle, phase, waiting, next_decision, created, passed,
                  total_vehicles_created=created, decision_count=cycle // 50,
                  dqn_waiting_action=waiting, next_decision_in_cycles=next_decision,
                  delay_sq=delay_sq, queue_time_integral=queue_integral,
-                 external_wait_integral=0.0, action_mask=MASK.copy(),
+                 external_wait_integral=0.0,
+                 action_mask=(action_mask(phase, green_cycles) if mask is None
+                              else np.asarray(mask, dtype=bool)),
                  system_time_integral=system_integral,
                  stopped_time_integral=queue_integral,
                  external_all_time_integral=0.0, outgoing_block_integral=0.0,
@@ -105,6 +132,8 @@ def _observation(cycle, phase, waiting, next_decision, created, passed,
                  step_seconds=DT)
     state["spatial" if state_mode == "spatial" else "dtse"] = (
         grid if state_mode == "spatial" else dtse)
+    if extra:
+        state.update(extra)
     return state
 
 
@@ -199,11 +228,18 @@ class LVLPythonEnv(_LVLCommon, GamaTrafficEnv):
                 remaining = max(0.0, sim.roads[road]["length"] - progress)
             vehicles.append((vehicle.speed, vehicle.desired, vehicle.lane,
                              vehicle.occupied, road, remaining))
+        yellow_total = int(round(sim._yellow / DT))
         return _observation(sim.cycle, sim.phase, sim.dqn_waiting_action,
                             sim.next_decision_in_cycles, sim.created, sim.passed,
                             sim.queue_time_integral, sim.system_time_integral,
                             sim.weighted_delay_integral, vehicles, self.state_mode,
-                            green_cycles=getattr(sim, "green_ticks", None))
+                            green_cycles=getattr(sim, "green_ticks", None),
+                            mask=sim.action_mask(),
+                            transition_of=(sim.yellow_phase or sim._last_yellow),
+                            yellow_cycles=(yellow_total - sim.yellow_ticks_left
+                                           if sim.yellow_phase else 0),
+                            extra={"jam_removed": sim.jam_removed,
+                                   "hard_brake_events": sim.hard_brake_events})
 
     async def set_action(self, action):
         self.sim.set_action(action)

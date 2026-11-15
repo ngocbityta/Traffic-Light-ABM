@@ -8,8 +8,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from demand import demand_parameters, generate_demand
-from python_env import PythonTrafficEnv, STOP_DISTANCE, Vehicle
+from train.logic.demand import demand_parameters, generate_demand
+from train.logic.python_env import PythonTrafficEnv, STOP_DISTANCE, Vehicle
 
 
 class PythonTrafficEnvTests(unittest.IsolatedAsyncioTestCase):

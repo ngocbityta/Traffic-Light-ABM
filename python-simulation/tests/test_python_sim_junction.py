@@ -12,6 +12,8 @@ class JunctionIntegrationTests(unittest.TestCase):
     def create(sim, arm, turn, lane=0, speed=18):
         is_car = True
         sim._create_vehicle(arm, turn, is_car, lane, speed)
+        # Scenario vehicles are placed by hand and start from rest.
+        sim.vehicles[-1].speed = 0.0
         return sim.vehicles[-1]
 
     def test_real_opposing_pairs_and_same_origin_split_are_conflicts(self):
@@ -75,7 +77,8 @@ class JunctionIntegrationTests(unittest.TestCase):
         self.assertTrue(sim._conflict_map.intervals("NE_SW", "NE_SW"))
 
     def test_train_action_switch_keeps_committed_connector_reserved_on_all_red(self):
-        sim = self.make_sim(train_mode=True, junction_model="reservation")
+        sim = self.make_sim(train_mode=True, junction_model="reservation",
+                            min_green=0.0)
         inside = self.create(sim, "NE", "through")
         inside.road = "NE_SW"
         inside.position = inside.approach_end + 5.0

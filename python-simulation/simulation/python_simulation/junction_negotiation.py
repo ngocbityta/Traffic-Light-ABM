@@ -148,6 +148,9 @@ class Agent:
     commit_time: float | None = None  # passed its wait point (SUMO conflict entry)
     passive: bool = False  # red-arm approach vehicle: only seam following
     stalled: bool = False  # stopped behind its own leader: "will not pass" (SUMO willPass)
+    lateral_shift: float = 0.0
+    half_width: float = 0.35
+    connector_shift: float = 0.0
 
     @property
     def back(self):
@@ -198,6 +201,17 @@ class NegotiationParams:
     idle_rule: bool = False
     # New-phase vehicles may slip through gaps among leftovers (lach doan).
     weave: bool = True
+    # Keep the box clear: a vehicle whose arm has just turned green waits at
+    # the stop line while a vehicle left over from the previous phase still
+    # has to cross its path. Without it, short phases (an exploring RL agent
+    # switching every decision) fill the box from both directions and the
+    # junction gridlocks permanently (14/11 audit, section 2.3).
+    box_clear: bool = True
+    # A wait cycle made only of bodies standing in each other's conflict
+    # zones has no ordering left to change. After this many seconds the
+    # longest-held vehicle is released to squeeze through (nhich qua): it
+    # creeps forward under the body-overlap guard only.
+    squeeze_after: float = 8.0
 
 
 def travel_time(distance, v0, accel, vmax):
@@ -432,17 +446,22 @@ class JunctionNegotiator:
                               for q in zones) and not any(self.in_zone(c, q.b_in, q.b_out) for q in zones)
             return "behind" if behind_only else "wait"
         tg = self.timegap(g)
+        # A leftover that has been standing, held at a conflict, for a while
+        # is not coming: waiting for it (a right turner parked in the merge
+        # it must leave, yielding to a car that is itself blocked) closes a
+        # ring that nothing else opens.
+        stuck = c.stalled or (c.speed < 0.5 and c.hold_time >= self.p.squeeze_after)
         behind = ahead = True
         for q in zones:
             g_in, g_out = self.arrival(g, q.a_in), self.leave(g, q.a_out)
             c_in, c_out = self.arrival(c, q.b_in), self.leave(c, q.b_out)
             if not (c_out + self.follow_gap(g) <= g_in):
                 behind = False
-            if not (c.stalled or c_in >= g_out + tg):
+            if not (stuck or c_in >= g_out + tg):
                 ahead = False
         if behind:
             return "behind"
-        if ahead and (c.stalled or all(self.can_stop(c, q.b_in) for q in zones)):
+        if ahead and (stuck or all(self.can_stop(c, q.b_in) for q in zones)):
             return "ahead"
         return "wait"
 
@@ -551,7 +570,25 @@ class JunctionNegotiator:
                     # on each road, but not across the stop-line seam.
                     if a.road != b.road and (a.movement == b.movement or
                                              self.zones.zones(a.movement, b.movement)):
-                        lead, foll = (a, b) if a.front >= b.front else (b, a)
+                        # The zone map compares all points along two paths.
+                        # Parallel motorcycle sublanes can therefore form a
+                        # spurious all-length zone although their live bodies
+                        # are laterally separated at the seam.
+                        if (a.motorbike and b.motorbike and
+                                abs(a.connector_shift - b.connector_shift) >=
+                                a.half_width + b.half_width + 0.15):
+                            continue
+                        # The vehicle on the downstream road (the connector)
+                        # always leads. Comparing fronts alone let a long car
+                        # still on the approach "lead" a motorbike already on
+                        # the connector while the simulator's car following
+                        # ordered them the other way: a permanent mutual wait.
+                        a_down = not a.road.endswith("_in")
+                        b_down = not b.road.endswith("_in")
+                        if a_down != b_down:
+                            lead, foll = (a, b) if a_down else (b, a)
+                        else:
+                            lead, foll = (a, b) if a.front >= b.front else (b, a)
                         target = lead.back - foll.min_gap
                         if target < stop[foll.vid][0]:
                             stop[foll.vid] = (target, lead.speed)
@@ -577,6 +614,11 @@ class JunctionNegotiator:
                         mode = self.weave(g, c, seen_g)
                         if mode == "behind":
                             continue  # g reaches the zone after c has gone
+                        if mode == "ahead" and self.p.box_clear and not g.on_junction:
+                            # With the box kept clear g is held at the stop
+                            # line until the leftover has gone. Giving it the
+                            # zone as well made each wait for the other.
+                            mode = "wait"
                         if mode == "ahead":
                             # Lach doan: g slips through ahead of the leftover
                             # vehicle, which waits a moment if it must.
@@ -589,11 +631,32 @@ class JunctionNegotiator:
                 if a.arm == b.arm and z.kind == "diverge":
                     # Same approach, paths that separate: plain car following
                     # behind the leader's back until the paths have split.
-                    lead, foll = (a, b) if a.front >= b.front else (b, a)
+                    # A wide predicted corridor can touch the next sublane
+                    # even when the two bodies are currently side by side.
+                    # Do not turn that future possibility into a same-lane
+                    # follower stop tens of metres before the junction.
+                    if (a.road.endswith("_in") and b.road.endswith("_in") and
+                            abs(a.lateral_shift - b.lateral_shift) >=
+                            a.half_width + b.half_width + 0.15):
+                        continue
+                    # As at the seam: a vehicle already on its connector is
+                    # ahead of one still on the approach, whatever the path
+                    # coordinates (rebased through the seam pose) say.
+                    a_down = not a.road.endswith("_in")
+                    b_down = not b.road.endswith("_in")
+                    if a_down != b_down:
+                        lead, foll = (a, b) if a_down else (b, a)
+                    else:
+                        # Order by body centre, like the simulator's own car
+                        # following. Ordering by front made a short vehicle
+                        # "follow" a long one that is beside or behind it.
+                        lead, foll = ((a, b) if a.front - a.length / 2.0 >=
+                                      b.front - b.length / 2.0 else (b, a))
                     target = lead.back - foll.min_gap
                     if target < stop[foll.vid][0]:
                         stop[foll.vid] = (target, lead.speed)
                     self.stats["diverge"] += 1
+                    decisions.append(PairDecision(lead.vid, foll.vid, None, "diverge"))
                     continue
                 elif a.vid in pending_ids or b.vid in pending_ids:
                     # Majors ignore minors waiting at their wait point unless
@@ -619,6 +682,7 @@ class JunctionNegotiator:
         # cannot take, possibly in the middle of the stream, where through
         # vehicles of the sublanes it already blocks must stop or filter past.
         commits = set()
+        minor_waits = []  # (blocking foe, waiting minor)
         active = [ag for ag in agents if not ag.passive and ag.vid not in pending_ids]
         first_over = {}   # foe vid -> minors that go ahead of it this tick
         claimed = []      # (minor, zones on its path it may enter this tick)
@@ -665,6 +729,7 @@ class JunctionNegotiator:
                     continue
                 target = min(target, q.a_in - m.min_gap)
                 blocker = blocker or f
+                minor_waits.append((f, m))
             claimed.append((m, taken))
             if math.isfinite(target):
                 self.stats["minor_wait"] += 1
@@ -673,6 +738,8 @@ class JunctionNegotiator:
                 decisions.append(PairDecision(blocker.vid, m.vid, None, "minor_wait"))
             else:
                 self.stats["minor_gap"] += 1
+
+        self._release_blocked_minor_claims(edges, minor_waits, stop)
 
         for first, second, seen, reason in edges:
             target = INF
@@ -716,37 +783,130 @@ class JunctionNegotiator:
         self.last_decisions = decisions
         return stop, commits
 
+    def _release_blocked_minor_claims(self, edges, minor_waits, stop):
+        """Drop a minor's claim on a zone when the claim closes a wait cycle.
+
+        The minor gate runs after ``_break_cycles`` and lets a turning vehicle
+        take conflict zones one by one ("ahead", "forced", "group"). A minor
+        that is then held before a *later* zone keeps the foes of the zones
+        it took waiting although it is not moving. When those foes are, in
+        turn, what the minor waits for (through physical in-zone edges) the
+        junction locks for good, e.g. after a long green: leftover through
+        vehicles wait for a right turner that waits for them. In such a cycle
+        the minor gives the zone back: the foe goes, the minor holds before
+        the zone it has not entered yet.
+        """
+        claims = ("ahead", "forced", "group")
+        for _ in range(len(edges) + 1):
+            waits = {}
+            for item in edges:
+                waits.setdefault(item[1].vid, []).append((item[0].vid, item))
+            for foe, minor in minor_waits:
+                waits.setdefault(minor.vid, []).append((foe.vid, None))
+            state, released = {}, False
+            for root in list(waits):
+                if state.get(root) is not None or released:
+                    continue
+                stack, path = [root], []
+                iters = [iter(waits.get(root, ()))]
+                state[root] = 1
+                while stack and not released:
+                    step = next(iters[-1], None)
+                    if step is None:
+                        state[stack.pop()] = 2
+                        iters.pop()
+                        if path:
+                            path.pop()
+                        continue
+                    nxt, item = step
+                    if state.get(nxt) == 1:
+                        start = stack.index(nxt)
+                        cycle_items = path[start:] + [item]
+                        for candidate in cycle_items:
+                            if candidate is not None and candidate[3] in claims:
+                                minor, foe, zones = candidate[0], candidate[1], candidate[2]
+                                edges.remove(candidate)
+                                hold = min(z.b_in for z in zones) - minor.min_gap
+                                if hold < stop[minor.vid][0]:
+                                    stop[minor.vid] = (hold, 0.0)
+                                minor_waits.append((foe, minor))
+                                self.stats["claim_released"] = self.stats.get(
+                                    "claim_released", 0) + 1
+                                released = True
+                                break
+                    elif state.get(nxt) is None:
+                        state[nxt] = 1
+                        stack.append(nxt)
+                        path.append(item)
+                        iters.append(iter(waits.get(nxt, ())))
+            if not released:
+                return
+
     def _break_cycles(self, edges):
-        """Flip one non-physical edge per wait-for cycle (longest-held goes)."""
-        physical = ("in_zone", "both_in_zone", "diverge", "cannot_stop", "clearing")
-        waits = {}
-        for item in edges:
-            waits.setdefault(item[1].vid, []).append(item)
-        state, stack = {}, []
+        """Flip non-physical edges until no wait-for cycle can be broken.
 
-        def visit(vid):
-            state[vid] = 1
-            stack.append(vid)
-            for item in list(waits.get(vid, ())):
-                nxt = item[0].vid
-                if state.get(nxt) == 1:
-                    cycle = set(stack[stack.index(nxt):])
-                    cands = [it for v in cycle for it in waits.get(v, ())
-                             if it[0].vid in cycle and it[3] not in physical]
-                    if cands:
-                        e = max(cands, key=lambda it: (it[1].hold_time, it[1].front))
-                        e[0], e[1] = e[1], e[0]
-                        e[2] = [q.swapped() for q in e[2]]
-                        e[3] = "deadlock_break"
-                        self.stats["deadlock_break"] += 1
-                elif state.get(nxt) is None:
-                    visit(nxt)
-            stack.pop()
-            state[vid] = 2
-
-        for vid in list(waits):
-            if state.get(vid) is None:
-                visit(vid)
+        One pass flips at most one edge per cycle it meets (the longest-held
+        vehicle goes), but a flip can close another cycle through physical
+        edges, so passes repeat until none flips. A flipped edge is final:
+        it is never flipped back, which bounds the loop by the edge count.
+        """
+        fixed = ("in_zone", "both_in_zone", "diverge", "cannot_stop", "clearing",
+                 "deadlock_break")
+        for _ in range(len(edges) + 1):
+            waits = {}
+            for item in edges:
+                waits.setdefault(item[1].vid, []).append(item)
+            state = {}
+            flipped = False
+            # Iterative DFS: the wait-for graph of a saturated junction is
+            # deeper than Python's recursion limit allows.
+            for root in list(waits):
+                if state.get(root) is not None or flipped:
+                    continue
+                stack = [root]
+                iters = [iter(list(waits.get(root, ())))]
+                state[root] = 1
+                while stack and not flipped:
+                    item = next(iters[-1], None)
+                    if item is None:
+                        state[stack.pop()] = 2
+                        iters.pop()
+                        continue
+                    nxt = item[0].vid
+                    if state.get(nxt) == 1:
+                        # A list keeps the order independent of
+                        # PYTHONHASHSEED (string vids in a set are not ordered).
+                        cycle = stack[stack.index(nxt):]
+                        members = set(cycle)
+                        cands = [it for v in cycle for it in waits.get(v, ())
+                                 if it[0].vid in members and it[3] not in fixed]
+                        if cands:
+                            e = max(cands, key=lambda it: (it[1].hold_time, it[1].front))
+                            e[0], e[1] = e[1], e[0]
+                            e[2] = [q.swapped() for q in e[2]]
+                            e[3] = "deadlock_break"
+                            self.stats["deadlock_break"] += 1
+                            flipped = True
+                        else:
+                            stuck = [it for v in cycle for it in waits.get(v, ())
+                                     if it[0].vid in members and
+                                     it[3] in ("in_zone", "both_in_zone") and
+                                     it[0].speed < 0.5 and it[1].speed < 0.5 and
+                                     it[1].hold_time >= self.p.squeeze_after]
+                            if stuck:
+                                e = max(stuck, key=lambda it: (it[1].hold_time, it[1].front))
+                                for index, item_ in enumerate(edges):
+                                    if item_ is e:
+                                        del edges[index]
+                                        break
+                                self.stats["squeeze"] = self.stats.get("squeeze", 0) + 1
+                                flipped = True
+                    elif state.get(nxt) is None:
+                        state[nxt] = 1
+                        stack.append(nxt)
+                        iters.append(iter(list(waits.get(nxt, ()))))
+            if not flipped:
+                return
 
 
 # ---------------------------------------------------------------------------
@@ -780,7 +940,7 @@ class SimulatorAdapter:
         self.creep_min = 0.2
         self.sweep_car = 0.75
         self.sweep_moto = 0.0
-        self.box_clear = False
+        self.box_clear = self.negotiator.p.box_clear
         self.filter_enabled = True
         self.filter_cooldown = 1.0
         self.filter_moves = 0
@@ -883,6 +1043,12 @@ class SimulatorAdapter:
                        desired=min(v.desired, 40.0 / 3.6), motorbike=v.occupied == 1,
                        on_junction=on_conn or v.position + v.length / 2.0 > v.approach_end,
                        arm_green=green,
+                       lateral_shift=v.current_lateral_shift,
+                       half_width=sim._half_width(v),
+                       connector_shift=(v.current_lateral_shift if on_conn else
+                                        sim._continuous_seam_pose(
+                                            f"{v.arm}_in", base,
+                                            v.current_lateral_shift)[1]),
                        wait_time=self.wait[vid], road=road, hold_time=self.hold[vid],
                        commit_time=self.commit.get(vid), passive=passive,
                        stalled=(v.speed < 0.5 and v.leading_distance < max(0.5, v.gap) + 1.5))
@@ -915,6 +1081,8 @@ class SimulatorAdapter:
         # negotiator's fixed seam stop can appear only after its leader enters
         # the connector, forcing an impossible one-tick stop. Follow the
         # leader's moving rear bumper instead, including its next-tick speed.
+        seam_followers = {d.second for d in self.negotiator.last_decisions
+                          if d.reason in ("seam_follow", "diverge")}
         for decision in self.negotiator.last_decisions:
             if decision.reason != "seam_follow":
                 continue
@@ -940,7 +1108,13 @@ class SimulatorAdapter:
         # enter while a foe that is already on the junction is in its way).
         # A vehicle whose arm has green waits at the stop line as long as a
         # vehicle left over from the previous phase still has to cross its path.
-        clearing = ([ag for ag in agents if ag.on_junction and not ag.arm_green]
+        # Only vehicles that will actually cross count: one on its connector,
+        # or one past the line that holds an entry token. A red-arm vehicle
+        # standing with its nose over the line is not clearing anything and
+        # must not keep every conflicting approach closed.
+        clearing = ([ag for ag in agents if ag.on_junction and not ag.arm_green and
+                     (by_vid[ag.vid].road == by_vid[ag.vid].conn_road or
+                      by_vid[ag.vid].junction_entry_token)]
                     if self.box_clear else [])
         blocked_by_clearing = set()
         if clearing:
@@ -982,7 +1156,14 @@ class SimulatorAdapter:
             # Creeping: a vehicle may cross the stop line whenever it can
             # move forward at all; it then inches up to its stop point
             # inside the junction instead of waiting behind the line.
-            if ((s > self.creep_min or not math.isfinite(s)) and room_ok and store_ok
+            # A stop target that is only the moving rear bumper of the
+            # vehicle ahead on the same path is ordinary car following. It
+            # must not deny entry: that halted every follower at the line for
+            # a tick or two while its leader pulled away (stop-and-go
+            # discharge and one-tick stops from crawl speed).
+            following = obstacle_speed > 0.5 and ag.vid in seam_followers
+            if ((s > self.creep_min or not math.isfinite(s) or following)
+                    and room_ok and store_ok
                     and not ag.passive and ag.vid not in blocked_by_clearing):
                 grants.add(v.creation_id)
                 v.junction_wait_since = None

@@ -34,7 +34,6 @@ def use_project_python():
 def load_network(weights):
     import torch
 
-    sys.path.insert(0, str(ROOT / "train" / "logic"))
     from train.logic.dqn_agent import QNetwork
 
     checkpoint = torch.load(weights, map_location="cpu", weights_only=False)

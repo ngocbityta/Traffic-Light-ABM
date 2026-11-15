@@ -23,7 +23,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 PYTHON_SIM_ROOT = ROOT / "python-simulation" / "simulation"
 sys.path.insert(0, str(PYTHON_SIM_ROOT))
-sys.path.insert(0, str(ROOT / "train" / "logic"))
 from train.logic.lvl_env import LVLPythonEnv
 from python_simulation.python_sim import ARMS, LeVanLuongSimulator, road_lengths
 import csv
