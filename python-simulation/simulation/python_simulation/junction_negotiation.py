@@ -261,9 +261,9 @@ class JunctionNegotiator:
     prioritised links they only react to vehicles that are physically in the
     way or that have already committed to crossing (SUMO link leaders).
     *Minors* (left turns on green, SUMO ``g`` links with an internal junction)
-    drive up to a single wait point in front of their first conflict and commit
-    to the whole crossing only when :meth:`minor_blocked` (SUMO ``opened`` /
-    ``blockedByFoe``) finds no blocking foe. Vehicles still inside the junction
+    claim the conflict zones of their path one by one, in path order, when
+    :meth:`zone_verdict` (SUMO ``opened`` / ``blockedByFoe``) finds the zone
+    takeable, and wait before the first zone they cannot take. Vehicles still inside the junction
     after their phase ended are committed and clear first.
     """
 
@@ -276,6 +276,7 @@ class JunctionNegotiator:
             "minor_wait", "minor_gap", "forced", "group", "major_patience", "committed_yields", "claimed", "clearing", "weave", "box_rule")}
         self.last_decisions: list[PairDecision] = []
         self.forced_events: list[tuple[float, str]] = []
+        self._hard_held: dict[str, list] = {}
 
     # ------------------------------------------------------------ helpers
     def impatience(self, ag: Agent):
@@ -410,7 +411,10 @@ class JunctionNegotiator:
 
     # ------------------------------------------------------------ minor gate
     def minor_blocked(self, m: Agent, foes, grouped: bool):
-        """SUMO ``opened()`` for an uncommitted minor ``m``.
+        """SUMO ``opened()`` for an uncommitted minor ``m`` (whole crossing).
+
+        Not used by :meth:`decide`, which claims zones one by one through
+        :meth:`zone_verdict`; kept as the reference single-wait-point gate.
 
         ``foes`` is a list of ``(foe, zones)`` with zones seen from ``m``
         (z.a_* on m's path). Returns ``(blocker_vid | None, mode)`` where mode is
@@ -537,6 +541,15 @@ class JunctionNegotiator:
             return "block", "mutual"
         if f.stalled:
             return "ok", "forced"  # stuck behind its own leader: not passing
+        if f.speed < 0.5 and any(first is not m for first in self._hard_held.get(f.vid, ())):
+            # Standing because a third vehicle physically blocks it (a body in
+            # its zone, or a leftover it must let clear): like a foe stuck
+            # behind its own leader, it will not pass now. Waiting for it
+            # (or letting it "reclaim" its turn) closed rings such as
+            # leftover -> left turner -> through -> leftover (seed 2, random
+            # policy). If it is released later, m is in its zone first and
+            # the in-zone order makes it wait.
+            return "ok", "forced"
         if tm_in >= tf_in:
             # SUMO applies impatience only when ego would reach the conflict
             # first (MSLink::blockedByFoe: arrivalTime < foe arrivalTime). A
@@ -743,6 +756,11 @@ class JunctionNegotiator:
         # vehicles of the sublanes it already blocks must stop or filter past.
         commits = set()
         minor_waits = []  # (blocking foe, waiting minor)
+        # Who physically holds whom before the minor gate runs.
+        self._hard_held = {}
+        for first, second, _, reason in edges:
+            if reason in ("in_zone", "both_in_zone", "clearing", "cannot_stop"):
+                self._hard_held.setdefault(second.vid, []).append(first)
         active = [ag for ag in agents if not ag.passive and ag.vid not in pending_ids]
         first_over = {}   # foe vid -> minors that go ahead of it this tick
         claimed = []      # (minor, zones on its path it may enter this tick)
@@ -1004,8 +1022,12 @@ class SimulatorAdapter:
         # A green vehicle within this distance (plus its length) of its wait
         # point inside the junction counts as waiting there.
         self.advance_min = 4.0
+        # Upper bound of the corner sweep of a car body (m). The actual sweep
+        # is computed per path from its curvature (``_sweep``): a straight
+        # through path has none, a tight right turn up to this bound.
         self.sweep_car = 0.75
         self.sweep_moto = 0.0
+        self._sweep_cache: dict[tuple[str, int], float] = {}
         self.box_clear = self.negotiator.p.box_clear
         self.filter_enabled = True
         self.filter_cooldown = 1.0
@@ -1027,6 +1049,39 @@ class SimulatorAdapter:
         pts = np.array([(p.x, p.y) for p in (road.pose(float(x), shift) for x in s)])
         return PathSample(pts, s, half_width, road.length)
 
+    def _sweep(self, base, shift, length):
+        """Corner sweep of a ``length`` m rectangle centred on a path.
+
+        A rectangle kept tangent to a curve of radius R leaves the centre-line
+        band by its sagitta (L/2)^2 / (2R) at the outer corners (SUMO adds the
+        same term). R is the tightest radius of the path at this lateral
+        shift, measured over a 2 m window; 0.1 m covers discretisation. A
+        constant 0.75 m used to be added to every car path, straight ones
+        included, so through cars held vehicles in the next sublane.
+        """
+        key = (base, int(round(shift / 0.35)), int(round(length * 10)))
+        cached = self._sweep_cache.get(key)
+        if cached is not None:
+            return cached
+        road = self.sim._geometry_roads[base]
+        step = 0.5
+        n = max(3, int(road.length / step))
+        poses = [road.pose(min(road.length, i * step), key[1] * 0.35) for i in range(n + 1)]
+        window = 4  # 2 m of reference progress
+        curvature = 0.0
+        for i in range(len(poses) - window):
+            a, b = poses[i], poses[i + window]
+            turn = abs((math.atan2(b.ty, b.tx) - math.atan2(a.ty, a.tx) + math.pi)
+                       % (2 * math.pi) - math.pi)
+            # Arc length of THIS sublane (inner sublanes of a turn are shorter).
+            arc = sum(math.hypot(poses[j + 1].x - poses[j].x, poses[j + 1].y - poses[j].y)
+                      for j in range(i, i + window))
+            if arc > 1e-6:
+                curvature = max(curvature, turn / arc)
+        sweep = min(self.sweep_car, (length / 2.0) ** 2 * curvature / 2.0 + 0.1)
+        self._sweep_cache[key] = sweep
+        return sweep
+
     def _band_path(self, v, base, on_conn):
         """Lateral band the vehicle will actually sweep on its connector.
 
@@ -1037,7 +1092,12 @@ class SimulatorAdapter:
         sim = self.sim
         # Body half width plus the sweep of a rectangle on a curved path
         # (front/rear corners leave the centre-line band; SUMO adds a sagitta).
-        half = (0.85 + self.sweep_car) if v.occupied == 2 else (0.35 + self.sweep_moto)
+        if v.occupied == 2:
+            ref = (v.current_lateral_shift if on_conn else
+                   sim._continuous_seam_pose(f"{v.arm}_in", base, v.current_lateral_shift)[1])
+            half = 0.85 + self._sweep(base, ref, v.length)
+        else:
+            half = 0.35 + self.sweep_moto
         if on_conn:
             lo = min(v.current_lateral_shift, v.target_lateral_shift)
             hi = max(v.current_lateral_shift, v.target_lateral_shift)

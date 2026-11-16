@@ -150,6 +150,56 @@ def green_standing(seed, ticks):
     return sim, {k: n * 0.2 for k, n in held.items()}
 
 
+class BlockedMajorTests(unittest.TestCase):
+    def test_major_blocked_by_a_third_vehicle_does_not_hold_a_left_turner(self):
+        """Ring of seed 2 (random policy): a through vehicle that stands
+        because a third vehicle blocks it used to "reclaim" its turn against
+        a left turner, and the left turner was what blocked the third."""
+        neg = negotiator()
+        major = agent("major", "N_S@0:1", front=18.6, hold_time=5.0)
+        left = agent("left", "E_W@0:1", front=17.6, arm="E", turn="left",
+                     road="E_W", on_junction=True)
+        neg._hard_held = {"major": [agent("third", "N_S@1:1", front=8.0)]}
+        z = neg.zones.zones(left.movement, major.movement)[0]
+        self.assertEqual(neg.zone_verdict(left, major, z, None, {}), ("ok", "forced"))
+        neg._hard_held = {}
+        self.assertEqual(neg.zone_verdict(left, major, z, None, {})[0], "block")
+
+
+class CornerSweepTests(unittest.TestCase):
+    """The conflict band of a car is widened by the corner sweep of its body
+    on the path's own curvature, not by a constant 0.75 m (16/11/2026)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sim = LeVanLuongSimulator(seed=1, flow_per_approach=0)
+        cls.adapter = cls.sim._negotiation
+
+    def test_straight_path_has_almost_no_sweep(self):
+        for road in ("NE_SW", "SW_NE"):
+            self.assertLess(self.adapter._sweep(road, 3.0, 4.5), 0.2)
+
+    def test_tight_right_turn_sweeps_more_at_the_curb(self):
+        inner = self.adapter._sweep("SE_NE", 0.5, 4.5)
+        outer = self.adapter._sweep("SE_NE", 3.7, 4.5)
+        self.assertGreater(inner, outer)
+        self.assertGreater(inner, 0.45)
+        self.assertLessEqual(inner, self.adapter.sweep_car)
+
+    def test_motorbike_is_not_swept(self):
+        self.sim._create_vehicle("NE", "through", False, 3, 40)
+        bike = self.sim.vehicles[-1]
+        band = self.adapter._band_path(bike, "NE_SW", False)
+        self.sim._create_vehicle("NE", "through", True, 3, 40)
+        car = self.sim.vehicles[-1]
+        car_band = self.adapter._band_path(car, "NE_SW", False)
+        half = float(band.rsplit(":", 1)[1])
+        self.assertLess(half, 0.35 + 0.35)   # body + lateral drift allowance only
+        self.assertGreater(float(car_band.rsplit(":", 1)[1]), half + 0.85 - 0.35)
+        self.sim.vehicles.pop()
+        self.sim.vehicles.pop()
+
+
 class GreenStandingTests(unittest.TestCase):
     def test_few_vehicles_stand_at_the_line_on_green(self):
         """Seed 2, 600 s: 1,022 vehicle-seconds before the rework (882 of
