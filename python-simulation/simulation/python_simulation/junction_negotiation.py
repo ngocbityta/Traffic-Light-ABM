@@ -151,6 +151,12 @@ class Agent:
     lateral_shift: float = 0.0
     half_width: float = 0.35
     connector_shift: float = 0.0
+    # Lateral interval (connector coordinates) the body centre sweeps: its
+    # shift now and the shift it is moving to. None: use ``connector_shift``.
+    connector_span: tuple | None = None
+    # Pose in the plane (centre and unit heading); None when unknown.
+    xy: tuple | None = None
+    heading: tuple | None = None
 
     @property
     def back(self):
@@ -314,6 +320,25 @@ class JunctionNegotiator:
         return ag.speed * ag.speed / (2.0 * max(decel, 0.1)) <= max(0.0, room) + 0.05
 
     @staticmethod
+    def laterally_apart(a: Agent, b: Agent, margin=0.15):
+        """Bodies on the same connector (or about to be) that do not share a
+        lateral band, now or while finishing a lateral move."""
+        a_lo, a_hi = a.connector_span or (a.connector_shift, a.connector_shift)
+        b_lo, b_hi = b.connector_span or (b.connector_shift, b.connector_shift)
+        return max(a_lo - b_hi, b_lo - a_hi) >= a.half_width + b.half_width + margin
+
+    @staticmethod
+    def apart_in_plane(a: Agent, b: Agent, margin=0.15):
+        """Sideways distance between the two centres, across the heading of
+        the rear vehicle, exceeds both half widths."""
+        if a.xy is None or b.xy is None or a.heading is None or b.heading is None:
+            return False
+        dx, dy = b.xy[0] - a.xy[0], b.xy[1] - a.xy[1]
+        rear = a if dx * a.heading[0] + dy * a.heading[1] >= 0.0 else b
+        side = abs(dx * rear.heading[1] - dy * rear.heading[0])
+        return side >= a.half_width + b.half_width + margin
+
+    @staticmethod
     def clearing(ag: Agent):
         return ag.on_junction and not ag.arm_green
 
@@ -440,10 +465,16 @@ class JunctionNegotiator:
         (enforced after all targets are known), so weaving cannot gridlock.
         """
         if not self.p.weave or any(self.in_zone(c, q.b_in, q.b_out) for q in zones):
-            if self.p.weave:
+            # The leftover is already in a shared zone (or weaving is off):
+            # g can only go behind it. It does so whenever the leftover is
+            # moving and will have left every shared zone before g gets
+            # there. Being inside a zone used to mean "wait" outright, which
+            # held a vehicle at the stop line for a leftover that was about
+            # to leave a zone 30-40 m ahead of it.
+            if self.idle(c) or c.speed < 0.5:
                 return "wait"
             behind_only = all(self.leave(c, q.b_out) + self.follow_gap(g) <= self.arrival(g, q.a_in)
-                              for q in zones) and not any(self.in_zone(c, q.b_in, q.b_out) for q in zones)
+                              for q in zones)
             return "behind" if behind_only else "wait"
         tg = self.timegap(g)
         # A leftover that has been standing, held at a conflict, for a while
@@ -556,6 +587,11 @@ class JunctionNegotiator:
         pending_ids = {ag.vid for ag in pending}
         zone_cache = {}
 
+        # Green vehicles that must yield to a leftover of the previous phase
+        # on real timing (not merely share a zone with one), each with the
+        # speed of the slowest leftover it yields to.
+        self.clearing_holds = {}
+
         def uncleared(a, b):
             k = (a.vid, b.vid)
             if k not in zone_cache:
@@ -574,9 +610,14 @@ class JunctionNegotiator:
                         # Parallel motorcycle sublanes can therefore form a
                         # spurious all-length zone although their live bodies
                         # are laterally separated at the seam.
-                        if (a.motorbike and b.motorbike and
-                                abs(a.connector_shift - b.connector_shift) >=
-                                a.half_width + b.half_width + 0.15):
+                        # This holds for every vehicle type: the conflict
+                        # band of a car is widened for the sweep of its
+                        # corners, so a car at the line "followed" whatever
+                        # stood or moved one sublane to its side and was kept
+                        # there with a clear lane in front of it. On the
+                        # connector itself the simulator lets the same two
+                        # bodies run side by side.
+                        if self.laterally_apart(a, b):
                             continue
                         # The vehicle on the downstream road (the connector)
                         # always leads. Comparing fronts alone let a long car
@@ -626,6 +667,8 @@ class JunctionNegotiator:
                             self.stats["weave"] += 1
                             continue
                         edges.append([c, g, seen_g, "clearing"])
+                        self.clearing_holds[g.vid] = min(
+                            c.speed, self.clearing_holds.get(g.vid, INF))
                         continue
                 z = min(zones, key=lambda q: min(q.a_in - a.front, q.b_in - b.front))
                 if a.arm == b.arm and z.kind == "diverge":
@@ -638,6 +681,13 @@ class JunctionNegotiator:
                     if (a.road.endswith("_in") and b.road.endswith("_in") and
                             abs(a.lateral_shift - b.lateral_shift) >=
                             a.half_width + b.half_width + 0.15):
+                        continue
+                    # One of them has crossed the line: lateral shifts are
+                    # road-local, so measure in the plane. Bodies that are
+                    # apart sideways on paths that only separate further are
+                    # not leader and follower (a through vehicle at the line
+                    # beside a left turner that has just entered).
+                    if self.apart_in_plane(a, b):
                         continue
                     # As at the seam: a vehicle already on its connector is
                     # ahead of one still on the approach, whatever the path
@@ -672,6 +722,16 @@ class JunctionNegotiator:
                 seen = [q if second is a else q.swapped() for q in zones]
                 edges.append([first, second, seen, reason])
 
+        # Leftovers have absolute priority over a green vehicle that is not
+        # free to go. A vehicle that must wait for one leftover may not at
+        # the same time slip ahead of another: it would stand in the box
+        # holding the second while the first is held by something else, and
+        # the two phases lock (seed 1, fixed plan, tick ~1,500).
+        for item in edges:
+            if item[3] == "weave" and item[0].vid in self.clearing_holds:
+                item[0], item[1] = item[1], item[0]
+                item[2] = [q.swapped() for q in item[2]]
+                item[3] = "clearing"
         self._break_cycles(edges)
 
         # Minor gate with creeping (nhich dan / cuop duong). A left turner does
@@ -710,6 +770,9 @@ class JunctionNegotiator:
                 if q.a_in >= target:
                     break
                 verdict, mode = self.zone_verdict(m, f, q, leader, first_over)
+                if verdict != "ok" and mode == "clearing":
+                    self.clearing_holds[m.vid] = min(
+                        f.speed, self.clearing_holds.get(m.vid, INF))
                 if verdict == "ok":
                     if mode in ("ahead", "forced", "group", "claimed"):
                         edges.append([m, f, [q.swapped()], mode if mode != "claimed" else "in_zone"])
@@ -938,6 +1001,9 @@ class SimulatorAdapter:
         self._conflict_held: set[int] = set()
         self.hard_caps = 0
         self.creep_min = 0.2
+        # A green vehicle within this distance (plus its length) of its wait
+        # point inside the junction counts as waiting there.
+        self.advance_min = 4.0
         self.sweep_car = 0.75
         self.sweep_moto = 0.0
         self.box_clear = self.negotiator.p.box_clear
@@ -1013,8 +1079,14 @@ class SimulatorAdapter:
             live.add(vid)
             w = self.wait.get(vid, 0.0)
             self.wait[vid] = w + dt if v.speed < 1.0 else max(0.0, w - 2 * dt)
-            held = vid in self._conflict_held and v.speed < 1.0
-            self.hold[vid] = self.hold.get(vid, 0.0) + dt if held else 0.0
+            # Time held by a conflict. It keeps running while the vehicle
+            # stays (almost) still: a wait that drops out of the decisions
+            # for a tick (a squeeze release that a body in the way made
+            # useless) must not restart the clock, or the patience rules
+            # that depend on it (reclaim, squeeze) never fire again.
+            previous = self.hold.get(vid, 0.0)
+            held = v.speed < 1.0 and (vid in self._conflict_held or previous > 0.0)
+            self.hold[vid] = previous + dt if held else 0.0
             green = (sim._green_for(v) if hasattr(sim, "_green_for") else sim._arm_is_green(v.arm))
             if on_in:
                 stop_pos = sim._stop_position(v)
@@ -1032,8 +1104,12 @@ class SimulatorAdapter:
             # Connector progress of the front. Crossing the stop line rebases
             # progress through the seam pose, so an approach vehicle's
             # distance past the line is shifted by its seam offset.
-            seam_off = (0.0 if on_conn else sim._continuous_seam_pose(
-                f"{v.arm}_in", base, v.current_lateral_shift)[0])
+            seam_pose = (None if on_conn else sim._continuous_seam_pose(
+                f"{v.arm}_in", base, v.current_lateral_shift))
+            seam_off = 0.0 if on_conn else seam_pose[0]
+            seam_shift = v.current_lateral_shift if on_conn else seam_pose[1]
+            pose = sim._geometry_roads[road].pose(
+                sim._road_state(v)[1], v.current_lateral_shift)
             self._seam_off[vid] = seam_off
             front = v.position + v.length / 2.0 - v.approach_end + seam_off
             ag = Agent(vid=str(vid), movement=movement, arm=v.arm, turn=v.maneuver,
@@ -1046,9 +1122,11 @@ class SimulatorAdapter:
                        lateral_shift=v.current_lateral_shift,
                        half_width=sim._half_width(v),
                        connector_shift=(v.current_lateral_shift if on_conn else
-                                        sim._continuous_seam_pose(
-                                            f"{v.arm}_in", base,
-                                            v.current_lateral_shift)[1]),
+                                        seam_shift),
+                       connector_span=((min(v.current_lateral_shift, v.target_lateral_shift),
+                                        max(v.current_lateral_shift, v.target_lateral_shift))
+                                       if on_conn else (seam_shift, seam_shift)),
+                       xy=(pose.x, pose.y), heading=(pose.tx, pose.ty),
                        wait_time=self.wait[vid], road=road, hold_time=self.hold[vid],
                        commit_time=self.commit.get(vid), passive=passive,
                        stalled=(v.speed < 0.5 and v.leading_distance < max(0.5, v.gap) + 1.5))
@@ -1083,6 +1161,7 @@ class SimulatorAdapter:
         # leader's moving rear bumper instead, including its next-tick speed.
         seam_followers = {d.second for d in self.negotiator.last_decisions
                           if d.reason in ("seam_follow", "diverge")}
+        seam_targets = {}
         for decision in self.negotiator.last_decisions:
             if decision.reason != "seam_follow":
                 continue
@@ -1094,9 +1173,19 @@ class SimulatorAdapter:
                 continue
             stopping_front = (leader.position - leader.length / 2.0 -
                               follower.gap)
-            stop[decision.second] = (stopping_front - follower.approach_end +
-                                     self._seam_off.get(follower.creation_id, 0.0),
-                                     leader.speed)
+            target = (stopping_front - follower.approach_end +
+                      self._seam_off.get(follower.creation_id, 0.0))
+            # Several vehicles can lead across the seam: the nearest governs.
+            # (Each used to overwrite the previous one, so the last in the
+            # list decided, whichever it was.)
+            if decision.second not in seam_targets or target < seam_targets[decision.second][0]:
+                seam_targets[decision.second] = (target, leader.speed)
+        for vid, (target, speed) in seam_targets.items():
+            # Replace the negotiator's static seam stop by the moving bumper,
+            # unless a crossing conflict holds the vehicle clearly earlier
+            # (the seam stop itself lies within min_gap - gap of ``target``).
+            if stop[vid][0] >= target - 0.6:
+                stop[vid] = (target, speed)
         for vid in commits:
             self.commit.setdefault(int(vid), now)
         sim._junction_stop = {}
@@ -1112,21 +1201,39 @@ class SimulatorAdapter:
         # or one past the line that holds an entry token. A red-arm vehicle
         # standing with its nose over the line is not clearing anything and
         # must not keep every conflicting approach closed.
-        clearing = ([ag for ag in agents if ag.on_junction and not ag.arm_green and
-                     (by_vid[ag.vid].road == by_vid[ag.vid].conn_road or
-                      by_vid[ag.vid].junction_entry_token)]
-                    if self.box_clear else [])
+        # The hold follows the negotiator's own verdict: a vehicle waits at
+        # the line only when it would otherwise have to stop inside the box
+        # for that leftover. A leftover that leaves the shared zone before
+        # the vehicle can reach it holds nobody (it used to: any shared zone
+        # not yet cleared by both was enough, however far apart in time).
         blocked_by_clearing = set()
-        if clearing:
+        if self.box_clear:
+            holds = self.negotiator.clearing_holds
+            # Green vehicles already waiting inside the box for a leftover.
+            # A vehicle that is still rolling towards a distant wait point is
+            # not waiting yet and closes nothing behind it.
+            waiting_inside = [ag for ag in agents
+                              if ag.on_junction and ag.arm_green and ag.vid in holds
+                              and (ag.speed < 1.0 or
+                                   stop[ag.vid][0] - ag.front < self.advance_min + ag.length)]
             for ag in agents:
                 if ag.on_junction or ag.passive or not ag.arm_green:
                     continue
-                for c in clearing:
-                    if c.arm != ag.arm and any(
-                            ag.back < z.a_out and c.back < z.b_out
-                            for z in self.zone_map.zones(ag.movement, c.movement)):
-                        blocked_by_clearing.add(ag.vid)
-                        break
+                # Nobody queues behind a vehicle that waits in the box: the
+                # queue would stand across the paths of other leftovers.
+                # Only the lateral band of that vehicle is closed; the other
+                # sublanes of the stream stay open.
+                if any(w.corridor == ag.corridor and
+                       not self.negotiator.laterally_apart(ag, w)
+                       for w in waiting_inside):
+                    blocked_by_clearing.add(ag.vid)
+                    continue
+                if ag.vid in holds:
+                    # It has to yield to a leftover: it does so at the line.
+                    # Moving up to a wait point inside the junction was tried
+                    # and locked the box (random policy, seed 1): the waiting
+                    # bodies end up in the paths of other leftovers.
+                    blocked_by_clearing.add(ag.vid)
         storage = {}
         for ag in agents:
             if ag.on_junction and ag.turn == "left" and ag.commit_time is None:

@@ -112,8 +112,15 @@ Các thay đổi sau áp dụng cho chế độ `safe`; chế độ `gama_2025_6
   giữ pha (đếm trong `masked_actions`). Với quyết định mỗi 10 s và 6 s
   vàng + đỏ toàn phần, agent đổi pha nhanh nhất mỗi 20 s.
 - **Giữ trống lòng nút.** `negotiation_params={"box_clear": true}` (mặc định):
-  xe của pha mới chờ ở vạch dừng khi còn xe sót của pha cũ phải cắt qua đường
-  đi của nó. Đặt `false` để trả lại hành vi lách qua xe sót.
+  xe của pha mới chỉ chờ ở vạch dừng khi nó thật sự phải nhường một xe sót
+  của pha cũ, tức xe sót chưa kịp rời vùng xung đột trước lúc xe này tới nơi.
+  Xe sót sắp ra khỏi vùng xung đột không giữ ai lại. Khi một xe đã vào nút và
+  đang chờ xe sót, chỉ dải ngang của xe đó bị đóng, các sublane khác vẫn mở.
+  Đặt `false` để trả lại hành vi lách qua xe sót.
+- **Xe trước qua mối vạch dừng.** Một xe chỉ là "xe trước" khi thân nó nằm
+  cùng dải ngang (tính theo bề rộng thân xe, kể cả dải nó đang dịch sang). Xe
+  ở sublane bên cạnh, hoặc xe đi song song trên connector tách hướng, không
+  giữ xe ở vạch.
 - **Lưới an toàn chống kẹt.** `jam_timeout=120.0` (s): xe đứng yên trên
   connector lâu hơn ngưỡng bị gỡ khỏi mô phỏng và đếm trong `jam_removed`
   (tương tự time-to-teleport của SUMO). Một lần chạy lành mạnh có
@@ -130,4 +137,5 @@ Các thay đổi sau áp dụng cho chế độ `safe`; chế độ `gama_2025_6
   `PYTHONHASHSEED`.
 
 Các tham số trên nhận qua `--sim-config` (xem `sim_config.py`). Bộ kiểm thử
-`tests/test_train_readiness_20261115.py` giữ các điều kiện này.
+`tests/test_train_readiness_20261115.py` và `tests/test_green_yield_20261116.py`
+giữ các điều kiện này.
