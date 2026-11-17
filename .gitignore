@@ -54,3 +54,6 @@ Traffic_Papers/
 .Trashes
 gama-simulation/simulation/models/snapshots/
 gama-simulation/simulation/models/tmp_*.gaml
+
+# Claude outputs
+Claude outputs/
