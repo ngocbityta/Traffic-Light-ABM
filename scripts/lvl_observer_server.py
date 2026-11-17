@@ -43,7 +43,8 @@ class Observer:
         temp = tempfile.NamedTemporaryFile(prefix="lvl_observer_", suffix=".csv", delete=False)
         temp.close()
         self._demand_path = Path(temp.name)
-        generate_demand(self._demand_path, seed=seed, horizon=8000)
+        generate_demand(self._demand_path, seed=seed, horizon=8000,
+                        heavy_ratio=self.sim_kwargs["heavy_ratio"])
         self.seed = seed
         self.mode = mode
         self.sim = LeVanLuongSimulator(seed=seed, demand_file=self._demand_path,
@@ -51,6 +52,10 @@ class Observer:
                                        junction_model=self.junction_model,
                                        **self.sim_kwargs)
         return self.state()
+
+    def _body(self, vehicle):
+        pose = self.sim._rigid_pose(vehicle)
+        return [round(pose.x, 4), round(pose.y, 4), round(pose.tx, 6), round(pose.ty, 6)]
 
     def state(self):
         result = self.sim.snapshot()
@@ -79,7 +84,14 @@ class Observer:
                 "occupied": vehicle.occupied,
                 "speed": round(vehicle.speed, 4),
                 "speed_kmh": round(vehicle.speed * 3.6, 2),
-                "is_car": vehicle.occupied == 2,
+                "is_car": vehicle.occupied > 1,
+                "kind": vehicle.kind,
+                "width": round(2 * vehicle.half_width, 2),
+                # Rigid two-axle body (heavy vehicles): centre and heading
+                # in map coordinates, placed by its axles in the simulator.
+                "body": (self._body(vehicle) if vehicle.wheelbase > 0.0 else None),
+                "wheelbase": round(vehicle.wheelbase, 2),
+                "front_overhang": round(vehicle.front_overhang, 2),
                 "arm": vehicle.arm,
                 "to_arm": vehicle.to_arm,
                 "turn": vehicle.maneuver,
@@ -230,10 +242,14 @@ def main():
                         help="release headway (s) between queued vehicles in one sublane")
     parser.add_argument("--sim-config", type=Path,
                         help="Shared simulator JSON or calibrate_discharge output")
+    parser.add_argument("--heavy-ratio", type=float, default=None,
+                        help="share of heavy vehicles (trucks, buses) in the demand")
     args = parser.parse_args()
     simulation = load_sim_config(args.sim_config)
     if args.junction_model:
         simulation["junction_model"] = args.junction_model
+    if args.heavy_ratio is not None:
+        simulation["heavy_ratio"] = args.heavy_ratio
     startup = dict(simulation.get("startup_params", {}))
     if args.startup_reaction is not None:
         startup["reaction_delay"] = args.startup_reaction

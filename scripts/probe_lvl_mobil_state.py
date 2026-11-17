@@ -21,7 +21,7 @@ async def main(args):
     with tempfile.TemporaryDirectory(prefix="lvl_mobil_probe_") as directory:
         root = Path(directory)
         demand = root / "demand.csv"
-        generate_demand(demand, args.seed, args.tick)
+        generate_demand(demand, args.seed, args.tick, heavy_ratio=0.0)  # GAMA has no heavy vehicles
         manager = GamaServerManager(port=args.port, workdir=str(root / "gama_ws"),
                                     log_file=str(root / "gama.log"))
         env = None

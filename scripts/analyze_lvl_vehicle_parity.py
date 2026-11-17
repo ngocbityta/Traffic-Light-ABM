@@ -24,7 +24,7 @@ from python_simulation.python_sim import LeVanLuongSimulator, road_lengths
 def summarize(trace, seed, horizon, replay_current_python=False):
     with tempfile.TemporaryDirectory(prefix="lvl_analyze_") as d:
         demand_path = Path(d) / "demand.csv"
-        digest = generate_demand(demand_path, seed, horizon)
+        digest = generate_demand(demand_path, seed, horizon, heavy_ratio=0.0)  # GAMA has no heavy vehicles
         demand = list(csv.reader(demand_path.open()))
     roads = road_lengths()
     def road_position(row_id, road, remaining):
@@ -56,7 +56,7 @@ def summarize(trace, seed, horizon, replay_current_python=False):
     replay_demand = None
     if replay_dir is not None:
         replay_demand = Path(replay_dir.name) / "demand.csv"
-        generate_demand(replay_demand, seed, horizon)
+        generate_demand(replay_demand, seed, horizon, heavy_ratio=0.0)  # GAMA has no heavy vehicles
     replay_sim = LeVanLuongSimulator(seed=seed, demand_file=replay_demand) if replay_current_python else None
     replay_tick = 0
     by_tick = defaultdict(list)

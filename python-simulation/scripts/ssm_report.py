@@ -27,6 +27,8 @@ def main():
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--ticks", type=int, default=3000)
     parser.add_argument("--flow-per-approach", type=float, default=2400.0)
+    parser.add_argument("--heavy-ratio", type=float, default=None,
+                        help="share of heavy vehicles (default: simulator default)")
     parser.add_argument("--yellow", type=float, default=4.0)
     parser.add_argument("--ttc-threshold", type=float, default=ssm.DEFAULT_TTC_THRESHOLD)
     parser.add_argument("--no-pet", action="store_true",
@@ -35,8 +37,9 @@ def main():
                         help="write the trajectory columns to this .npz")
     args = parser.parse_args()
 
+    extra = {} if args.heavy_ratio is None else {"heavy_ratio": args.heavy_ratio}
     sim = LeVanLuongSimulator(seed=args.seed, flow_per_approach=args.flow_per_approach,
-                              yellow=args.yellow)
+                              yellow=args.yellow, **extra)
     start = time.perf_counter()
     recorder = trajectory.record_run(sim, args.ticks)
     data = recorder.arrays()

@@ -80,7 +80,8 @@ def _observation(cycle, phase, waiting, next_decision, created, passed,
             grid[arm, 1, bin_id, sublane] += ratio
             speed_counts[arm, bin_id, sublane] += 1.0
             grid[arm, 2, bin_id, sublane] = float(not served)
-            grid[arm, 3, bin_id, sublane] = float(occupied == 2)
+            # 1 for cars and heavy vehicles (larger than a motorbike).
+            grid[arm, 3, bin_id, sublane] = float(occupied >= 2)
             grid[arm, 4, bin_id, sublane] = (1.0 if arm in (0, 2) else -1.0)
         row = 2 * arm + int(lane >= 8)
         dtse[0, row, bin_id] = 1.0

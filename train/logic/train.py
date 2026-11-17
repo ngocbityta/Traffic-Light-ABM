@@ -405,7 +405,11 @@ async def amain(args):
             return None
         path = Path(outdir) / "demand" / f"seed_{seed}_h{args.episode_horizon}.csv"
         if args.scenario == "lvl":
-            digest = generate_lvl_demand(path, seed, args.episode_horizon)
+            # The GAMA model has no heavy vehicles: its demand stays two-type.
+            heavy_ratio = (args.simulation_config["heavy_ratio"]
+                           if args.backend == "python" else 0.0)
+            digest = generate_lvl_demand(path, seed, args.episode_horizon,
+                                         heavy_ratio=heavy_ratio)
             record_demand(seed, path, digest)
             return lvl_demand_parameters(path)
         digest = generate_demand(path, seed, args.episode_horizon)

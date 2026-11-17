@@ -48,11 +48,13 @@ try:
                                     MovementRequest)
     from .junction_negotiation import SimulatorAdapter
     from .vehicle_geometry import footprint as body_polygon, polygons_overlap
+    from .vehicle_geometry import Pose
 except ImportError:
     from vehicle_geometry import Road as GeometryRoad, SUBLANE_WIDTH
     from junction_conflicts import ConflictEngine, ConflictMap, Movement, MovementRequest
     from junction_negotiation import SimulatorAdapter
     from vehicle_geometry import footprint as body_polygon, polygons_overlap
+    from vehicle_geometry import Pose
 
 
 ROOT = Path(__file__).resolve().parent
@@ -156,6 +158,9 @@ class _Sublane(list):
 CHAUHAN2022_PDM = {
     "constant": 4.518165, "speed": 0.106, "distance": -0.083,
     "car": -1.068, "median_lane": -1.049, "intermediate_lane": -0.923,
+    # "Bus & LCV" class of the same table (z = -1.55, p = 0.121: the paper
+    # keeps it although it is not significant at the 5 % level).
+    "heavy": -1.471,
 }
 # Above this deceleration a "stop" is physically infeasible -> the vehicle goes.
 # (Chauhan et al. report decelerations down to about -6 m/s^2 in the amber.)
@@ -163,13 +168,101 @@ STOP_GO_MAX_DECEL = 6.0
 # Beyond this distance from the stop line at yellow the vehicle simply stops.
 STOP_GO_MAX_DISTANCE = 150.0
 
-# Car-following parameters per vehicle type (IDM: a, b, s0, T). Defaults are
-# the model's original engineering values, not calibrated; override them with
-# ``vehicle_params`` (see calibration.py).
+# Vehicle types. The index is the type code of the demand file (third
+# column): 0 motorbike, 1 car, 2 heavy vehicle.
+VEHICLE_KINDS = ("motorbike", "car", "heavy")
+
+# Parameters per vehicle type: car following (IDM: a, b, s0, T), body size
+# (m) and desired speed (km/h, normal distribution). The car and motorbike
+# values are the model's original engineering values, not calibrated;
+# override any of them with ``vehicle_params`` (see calibration.py).
+#
+# "heavy" merges trucks and buses/coaches into one class. Neither GAMA nor
+# SUMO has such a merged class, so the values combine their defaults:
+#   length, width, accel: SUMO vClass defaults (SUMOVehicleClass.cpp
+#     getDefaultVehicleLength, SUMOVTypeParameter.cpp VClassDefaultValues /
+#     getDefaultAccel) for "truck" (7.1 m, 2.4 m, 1.3 m/s^2) and "bus"
+#     (12 m, 2.5 m, 1.2 m/s^2), weighted 59:41 like small_truck_bus :
+#     heavy_truck_bus in the Nguyen Trai - Khuat Duy Tien counts
+#     (train/benchmarks/gama/data/traffic_data_NT_KDT.csv).
+#   decel: SUMO getDefaultDecel gives trucks/buses 4.0 against 4.5 for
+#     passenger cars; the same ratio applied to this model's car value.
+#   gap: SUMO minGap is the same (2.5 m) for cars, trucks and buses, so the
+#     model's car value is kept.
+#   headway: default ``time_headway`` of GAMA's driving skill (1.5 s,
+#     DrivingSkill.java). SUMO uses one tau for every class; heavy vehicles
+#     keeping more headway than cars is the modelling choice here.
+#   speed: SUMO speedFactor has mean 1 for every class and deviation 0.05
+#     for trucks against 0.1 for cars: the car mean with half its spread.
+#   axles: the body is the AASHTO single-unit truck design vehicle SU (Green
+#     Book, metric: 9.2 x 2.4 m, front overhang 1.2 m, rear overhang 1.8 m,
+#     wheelbase 6.1 m). With the 9.0 m length kept: front overhang 1.2 m,
+#     rear overhang 1.7 m, wheelbase 6.1 m.
+#   min_turn_radius: AASHTO SU-30 minimum centreline turning radius (front
+#     axle centre at steering lock), 38 ft = 11.6 m.
+#   lat_accel: lateral acceleration in curves; urban bus passengers rate
+#     1.5 m/s^2 "uncomfortable" (Nguyen et al., Singapore). Light vehicles
+#     use the simulator-wide ``curve_lat_accel``.
+# The width fixes the number of sublanes a type occupies (GAMA
+# ``num_lanes_occupied``): ceil(width / SUBLANE_WIDTH) = 1, 2 and 3.
 DEFAULT_VEHICLE_PARAMS = {
-    "car": {"accel": 2.5, "decel": 3.0, "gap": 1.0, "headway": 1.2},
-    "motorbike": {"accel": 2.0, "decel": 3.0, "gap": 0.3, "headway": 0.6},
+    "car": {"accel": 2.5, "decel": 3.0, "gap": 1.0, "headway": 1.2,
+            "length": 4.5, "width": 1.7, "speed_mean": 50.0, "speed_sd": 5.0},
+    "motorbike": {"accel": 2.0, "decel": 3.0, "gap": 0.3, "headway": 0.6,
+                  "length": 1.9, "width": 0.7, "speed_mean": 40.0, "speed_sd": 5.0},
+    "heavy": {"accel": 1.25, "decel": 2.7, "gap": 1.0, "headway": 1.5,
+              "length": 9.0, "width": 2.45, "speed_mean": 50.0, "speed_sd": 2.5,
+              "front_overhang": 1.2, "rear_overhang": 1.7,
+              "min_turn_radius": 11.6, "lat_accel": 1.5},
 }
+# Share of heavy vehicles in the generated demand. With the model's 85 %
+# motorbikes, the remaining 15 % split like car : (truck + bus) in the same
+# counts (22.5 % : 4.9 %) gives 2.7 %. The counts are from another junction:
+# an assumption for Le Van Luong - Hoang Dao Thuy, to be replaced by counts.
+DEFAULT_HEAVY_RATIO = 0.03
+# Body widths (m) by number of occupied sublanes, used where only a lane
+# movement id ("<connector>@<lane>:<occupied>") is known.
+HALF_WIDTH_BY_OCCUPIED = {
+    math.ceil(values["width"] / SUBLANE_WIDTH - 1e-9): values["width"] / 2.0
+    for values in DEFAULT_VEHICLE_PARAMS.values()
+}
+# Reference length of the longest light vehicle. Distance windows that were
+# tuned for it grow by the excess length of longer vehicles.
+LIGHT_VEHICLE_LENGTH = 4.5
+
+
+def vehicle_kind(value):
+    """Normalise a vehicle type given as name, demand code or car flag."""
+    if isinstance(value, str):
+        if value in VEHICLE_KINDS:
+            return value
+    elif isinstance(value, bool):
+        return "car" if value else "motorbike"
+    elif isinstance(value, int) and 0 <= value < len(VEHICLE_KINDS):
+        return VEHICLE_KINDS[value]
+    raise ValueError(f"unknown vehicle type {value!r}")
+
+
+def kind_from_draw(draw, motorbike_ratio, heavy_ratio):
+    """Vehicle type from one uniform draw.
+
+    Heavy vehicles take the low end of the interval that used to be cars, so
+    ``heavy_ratio = 0`` reproduces the two-type demand draw for draw.
+    """
+    if draw < heavy_ratio:
+        return "heavy"
+    return "car" if draw < 1.0 - motorbike_ratio else "motorbike"
+
+
+def occupied_sublanes(width):
+    return max(1, math.ceil(width / SUBLANE_WIDTH - 1e-9))
+
+# Lateral movement. A sublane change lasts sqrt(6 W / a_allow) (Naseri et al.
+# 2017) times this factor; the second table is the duration (s) a vehicle
+# starts with. Motorbikes move sideways faster than cars. Heavy vehicles are
+# slower: an assumption, neither GAMA nor SUMO sets this per vehicle class.
+LATERAL_DURATION_FACTOR = {"motorbike": 0.6, "car": 1.0, "heavy": 1.3}
+LATERAL_DURATION = {"motorbike": 0.6, "car": 1.2, "heavy": 1.6}
 
 # Candidate-window safety margin (m) around indexed progress.
 INDEX_MARGIN = 0.5
@@ -236,6 +329,28 @@ class Vehicle:
     queue_stop_offset: float = 0.0
     # Seconds standing still on the connector (jam safety net).
     junction_standstill: float = 0.0
+    # Lateral evasive manoeuvre in the junction (cut tail / run in front):
+    # until it completes, the junction negotiation treats the vehicle as
+    # already in its target band.
+    evading: bool = False
+    # Vehicle type ("motorbike", "car", "heavy") and half body width (m).
+    # Left empty they follow from the number of occupied sublanes.
+    kind: str = ""
+    half_width: float = 0.0
+    # Sideways reach (m) of the body beyond its path band where the path
+    # bends under a long rigid body (see ``_update_body_sweep``).
+    body_sweep: float = 0.0
+    # Two-axle rigid body (heavy vehicles; 0 = body tangent to its path at
+    # its centre). The front axle follows the sublane path, the rear axle
+    # trails it (tractrix): see ``_axles``.
+    wheelbase: float = 0.0
+    front_overhang: float = 0.0
+    leading_heavy: bool = False
+    leading_from: tuple = ("", 0.0)
+    rear_axle: tuple | None = None
+    front_axle_s: float = math.nan
+    # Lateral acceleration allowed in curves (m/s^2); 0 = simulator value.
+    lat_accel: float = 0.0
 
     in_road: str = ""
     conn_road: str = ""
@@ -245,6 +360,11 @@ class Vehicle:
         self.in_road = f"{self.arm}_in"
         self.conn_road = f"{self.arm}_{self.to_arm}"
         self.out_road = f"{self.to_arm}_out"
+        if not self.kind:
+            self.kind = VEHICLE_KINDS[min(self.occupied, len(VEHICLE_KINDS)) - 1]
+        if self.half_width <= 0.0:
+            self.half_width = HALF_WIDTH_BY_OCCUPIED.get(
+                self.occupied, self.occupied * SUBLANE_WIDTH / 2.0 - 0.2)
 
     def bezier_control_points(self) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]:
         """Return (P1, P2, P3, P4) cubic Bezier control points per Naseri et al. (2017) Section 3.1."""
@@ -267,8 +387,220 @@ class LeVanLuongSimulator:
     """Le Van Luong simulation with safe (default) or GAMA 2025.6.4 mode."""
     @staticmethod
     def _half_width(vehicle):
-        # Physical widths from the model: 1.7 m cars and 0.7 m motorbikes.
-        return 0.85 if vehicle.occupied == 2 else 0.35
+        # Physical widths from the model: 0.7 m motorbikes, 1.7 m cars and
+        # 2.45 m heavy vehicles (``vehicle_params``), plus the corner reach
+        # of a long body on a bending path.
+        return vehicle.half_width + vehicle.body_sweep
+
+    def _route_pose(self, vehicle, s):
+        """Pose of the vehicle's own sublane path at route coordinate ``s``."""
+        road, _ = self._road_state(vehicle)
+        if s <= vehicle.approach_end:
+            target, progress = vehicle.in_road, s
+        elif s <= vehicle.connector_end:
+            target, progress = vehicle.conn_road, s - vehicle.approach_end
+        else:
+            target, progress = vehicle.out_road, s - vehicle.connector_end
+        shift = vehicle.current_lateral_shift
+        order = (vehicle.in_road, vehicle.conn_road, vehicle.out_road)
+        here, there = order.index(road) if road in order else 0, order.index(target)
+        # Lateral shifts are road-local: carry the shift across each seam.
+        while here < there:
+            shift = self._continuous_seam_pose(order[here], order[here + 1], shift)[1]
+            here += 1
+        if here > there:
+            # Backwards across a seam: invert the (affine) forward mapping.
+            prev, cur = order[there], order[here]
+            a = self._continuous_seam_pose(prev, cur, 0.0)[1]
+            b = self._continuous_seam_pose(prev, cur, 1.0)[1]
+            shift = (shift - a) / (b - a) if abs(b - a) > 1e-9 else shift
+        return self._geometry_roads[target].pose(progress, shift)
+
+    def _walk(self, vehicle, s0, distance, step=0.5):
+        """Route coordinate reached from ``s0`` after ``distance`` metres
+        (negative: backwards) measured along the vehicle's own sublane path.
+
+        Route coordinates are progress on the roads' reference lines; on the
+        outside of a turn a metre of reference progress is up to ~1.35 m of
+        path, on the inside ~0.5 m. Body units placed by reference offsets
+        drifted apart or into each other on turns.
+        """
+        if abs(distance) < 1e-9:
+            return s0
+        direction = 1.0 if distance > 0 else -1.0
+        target = abs(distance)
+        here = self._route_pose(vehicle, s0)
+        travelled, s = 0.0, s0
+        for _ in range(int(4.0 * target / step) + 8):
+            s_next = s + direction * step
+            there = self._route_pose(vehicle, s_next)
+            d = math.hypot(there.x - here.x, there.y - here.y)
+            if travelled + d >= target:
+                return s + direction * step * ((target - travelled) / d if d > 1e-9 else 0.0)
+            travelled += d
+            here, s = there, s_next
+        return s
+
+    AXLE_STEP = 0.25  # m of front-axle travel per tractrix integration step
+
+    def _axles(self, vehicle):
+        """Front axle pose and rear axle point of a two-axle rigid body.
+
+        Kinematic single-track model at low lateral slip: the front axle
+        centre follows the vehicle's sublane path; the rear axle stays one
+        wheelbase behind it, always moving towards it (a tractrix). The rear
+        axle therefore runs inside the front axle's path on a turn
+        (off-tracking): R_rear = sqrt(R_front^2 - wheelbase^2), e.g. 9.9 m
+        for the SU truck at its 11.6 m minimum radius, whose inner rear
+        wheel then runs at 8.7 m (AASHTO: minimum inside radius 8.6 m).
+        The rear axle is committed once per tick (``_commit_axles``); this
+        integrates from that state to the current position, so guards that
+        try several positions within a tick see consistent bodies.
+        """
+        key = (vehicle.creation_id, vehicle.position, vehicle.current_lateral_shift, self.cycle)
+        cached = self._axle_cache.get(key)
+        if cached is not None:
+            return cached
+        s_front = self._walk(vehicle, vehicle.position,
+                             vehicle.length / 2.0 - vehicle.front_overhang)
+        front = self._route_pose(vehicle, s_front)
+        wheelbase = vehicle.wheelbase
+        if vehicle.rear_axle is None or not math.isfinite(vehicle.front_axle_s):
+            rear_pose = self._route_pose(vehicle, self._walk(vehicle, s_front, -wheelbase))
+            rear = (rear_pose.x, rear_pose.y)
+        else:
+            rear = vehicle.rear_axle
+            travel = s_front - vehicle.front_axle_s
+            steps = max(1, int(math.ceil(abs(travel) / self.AXLE_STEP)))
+            for k in range(1, steps + 1):
+                point = (front if k == steps else self._route_pose(
+                    vehicle, vehicle.front_axle_s + travel * k / steps))
+                dx, dy = point.x - rear[0], point.y - rear[1]
+                norm = math.hypot(dx, dy)
+                if norm > 1e-9:
+                    rear = (point.x - wheelbase * dx / norm, point.y - wheelbase * dy / norm)
+        result = (front, rear, s_front)
+        if len(self._axle_cache) > 4096:
+            self._axle_cache.clear()
+        self._axle_cache[key] = result
+        return result
+
+    def _commit_axles(self):
+        """Store this tick's rear axle of every two-axle body."""
+        for vehicle in self.vehicles:
+            if vehicle.wheelbase > 0.0:
+                _, rear, s_front = self._axles(vehicle)
+                vehicle.rear_axle = rear
+                vehicle.front_axle_s = s_front
+        self._axle_cache.clear()
+
+    def _rigid_pose(self, vehicle):
+        """Centre and heading of a two-axle rigid body (one rectangle from
+        the rear overhang behind the rear axle to the front overhang ahead
+        of the front axle)."""
+        front, rear, _ = self._axles(vehicle)
+        dx, dy = front.x - rear[0], front.y - rear[1]
+        norm = math.hypot(dx, dy) or 1.0
+        tx, ty = dx / norm, dy / norm
+        rear_overhang = vehicle.length - vehicle.wheelbase - vehicle.front_overhang
+        # Body centre: midway between rear end and front end.
+        offset = (vehicle.wheelbase + vehicle.front_overhang - rear_overhang) / 2.0
+        cx, cy = rear[0] + tx * offset, rear[1] + ty * offset
+        return Pose(cx, cy, tx, ty, math.atan2(ty, tx), 0.0)
+
+    def _body_axis_points(self, vehicle):
+        """Rear quarter, centre and front quarter of a rigid two-axle body,
+        as (x, y, tx, ty)."""
+        pose = self._rigid_pose(vehicle)
+        quarter = vehicle.length / 4.0
+        return tuple((pose.x + pose.tx * k * quarter, pose.y + pose.ty * k * quarter,
+                      pose.tx, pose.ty) for k in (-1, 0, 1))
+
+    def _body_polygons(self, vehicle, road=None, inflate=0.0):
+        """Footprint of a body (a list with one rectangle).
+
+        Cars and motorbikes: a rigid rectangle tangent to their path at the
+        centre, as before. Heavy vehicles: one rigid rectangle placed by its
+        two axles (``_rigid_pose``).
+        """
+        width = 2 * (vehicle.half_width + inflate)
+        if vehicle.wheelbase > 0.0:
+            return [body_polygon(self._rigid_pose(vehicle), length=vehicle.length, width=width)]
+        if road is None:
+            road, progress = self._road_state(vehicle)
+        else:
+            progress = (vehicle.position if road == vehicle.in_road else
+                        vehicle.position - vehicle.approach_end if road == vehicle.conn_road
+                        else vehicle.position - vehicle.connector_end)
+        pose = self._geometry_roads[road].pose(progress, vehicle.current_lateral_shift)
+        return [body_polygon(pose, length=vehicle.length, width=width)]
+
+    def _update_body_sweep(self):
+        """Sideways reach of a rigid two-axle body beyond its path band.
+
+        On a turn the rear axle runs inside the path (off-tracking) and the
+        front overhang swings outside it; at the stop-line jogs the straight
+        body cuts the corner. The largest sideways distance between the body
+        axis and the path, at the front end, the axles and the rear end, is
+        added to the half width used by the lateral rules, so neighbours
+        keep clear of the whole swept body. Cars and motorbikes keep the
+        model's original band.
+        """
+        for vehicle in self.vehicles:
+            if vehicle.wheelbase <= 0.0:
+                continue
+            # Everywhere: a lane change yaws the body as well (the front axle
+            # moves sideways first, the rear axle follows).
+            front, rear, s_front = self._axles(vehicle)
+            dx, dy = front.x - rear[0], front.y - rear[1]
+            norm = math.hypot(dx, dy) or 1.0
+            tx, ty = dx / norm, dy / norm
+            rear_overhang = vehicle.length - vehicle.wheelbase - vehicle.front_overhang
+            reach = 0.0
+            # Distances behind the front axle along the body axis.
+            for back in (-vehicle.front_overhang, 0.0, vehicle.wheelbase / 2.0,
+                         vehicle.wheelbase, vehicle.wheelbase + rear_overhang):
+                ax, ay = front.x - tx * back, front.y - ty * back
+                path = self._route_pose(vehicle, self._walk(vehicle, s_front, -back))
+                side = abs((ax - path.x) * path.ty - (ay - path.y) * path.tx)
+                reach = max(reach, side)
+            vehicle.body_sweep = min(2.5, reach + 0.1) if reach > 0.05 else 0.0
+
+    def _path_min_radius(self, road, shift, window=8):
+        """Tightest radius (m) of a path, measured over ``window`` x 0.5 m."""
+        geometry = self._geometry_roads[road]
+        poses = [geometry.pose(min(geometry.length, i * 0.5), shift)
+                 for i in range(int(geometry.length / 0.5) + 1)]
+        best = math.inf
+        for i in range(len(poses) - window):
+            a, b = poses[i], poses[i + window]
+            turn = abs((math.atan2(b.ty, b.tx) - math.atan2(a.ty, a.tx) + math.pi)
+                       % (2 * math.pi) - math.pi)
+            arc = sum(math.hypot(poses[j + 1].x - poses[j].x, poses[j + 1].y - poses[j].y)
+                      for j in range(i, i + window))
+            if turn > 1e-6:
+                best = min(best, arc / turn)
+        return best
+
+    def _interaction_reach(self, vehicle, other, other_position, position):
+        """Lateral distance below which ``other`` leads or follows ``vehicle``.
+
+        The corner reach of a long body (``body_sweep``) widens the band for
+        bodies ahead of or behind it, so they keep clear of its swinging ends.
+        A body already alongside is not turned into a leader with a negative
+        gap when the reach grows on a bend; the physical body guards keep the
+        two apart. Without long bodies this is the original rule.
+        """
+        reach = vehicle.half_width + other.half_width + LATERAL_CLEARANCE
+        if vehicle.body_sweep or other.body_sweep:
+            if (other_position is None or abs(other_position - position) >=
+                    (vehicle.length + other.length) / 2):
+                reach += vehicle.body_sweep + other.body_sweep
+        return reach
+
+    def _length_slack(self):
+        """Excess length (m) of the longest vehicle over a passenger car."""
+        return max(0.0, self._max_vehicle_length - LIGHT_VEHICLE_LENGTH)
 
     def _footprint(self, vehicle):
         first, last = vehicle.lane, vehicle.lane + vehicle.occupied
@@ -297,6 +629,46 @@ class LeVanLuongSimulator:
             incoming["num_lanes"], vehicle.occupied, vehicle.maneuver)
         return min(max(vehicle.lane, minimum), maximum)
 
+    def _release_mutual_merge(self, vehicle, buffer_stop):
+        """Hold point of a merger blocked by a merger standing beside it.
+
+        Two vehicles that both still have to merge into their route corridor
+        can stand side by side at their merge buffers, each sitting in the
+        sublanes the other needs: with 3-sublane heavy vehicles the through
+        corridor has only two, overlapping, positions, so two heavy vehicles
+        abreast never resolve it (seen as a stalled approach at 10 % heavy
+        vehicles). The vehicle further ahead (or created first) is let past
+        its buffer, one body length ahead of the other, so it can move over
+        in front of it; the other then merges behind. The real stop line
+        still applies.
+        """
+        reach_long = (vehicle.length + self._max_vehicle_length) / 2 + 1.0
+        release = buffer_stop
+        for other in self.vehicles:
+            if (other is vehicle or other.road != vehicle.road or other.speed >= 0.5 or
+                    abs(other.position - vehicle.position) > reach_long or
+                    other.lane == self._route_target_lane(other)):
+                continue
+            if abs(other.position - vehicle.position) >= (vehicle.length + other.length) / 2:
+                continue  # not beside each other
+            if (vehicle.position, -vehicle.creation_id) < (other.position, -other.creation_id):
+                continue  # the other one goes first
+            # Is ``other`` in the way of this vehicle's next sublane step?
+            step = 1 if self._route_target_lane(vehicle) > vehicle.lane else -1
+            target = (vehicle.lane + step + (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
+            if abs(target - other.current_lateral_shift) >= (
+                    vehicle.half_width + other.half_width + LATERAL_CLEARANCE):
+                continue
+            ahead = other.position + (other.length + vehicle.length) / 2 + max(
+                vehicle.gap, other.gap) + 1.0
+            release = max(release, ahead)
+        return min(release, self._stop_position(vehicle))
+
+    def _right_target(self, arm):
+        return next(road["to_arm"] for road in self.roads.values()
+                    if road["kind"] == "connector" and road["arm"] == arm and
+                    road["turn"] == "right")
+
     def _mapped_lane(self, vehicle, lane, old_road, next_road):
         old_max = self.roads[old_road]["num_lanes"] - vehicle.occupied
         next_max = self.roads[next_road]["num_lanes"] - vehicle.occupied
@@ -305,6 +677,10 @@ class LeVanLuongSimulator:
         if vehicle.maneuver == "right":
             # Right-turn connectors are built from the curb (build_layout.py):
             # sublane k of the approach, the connector and the exit coincide.
+            if vehicle.wheelbase > 0.0 and next_road == vehicle.conn_road:
+                # A heavy vehicle swings out to a sublane it can steer round.
+                wide = self._heavy_right_lane.get(next_road)
+                return min(next_max, max(lane, wide if wide is not None else next_max))
             return min(lane, next_max)
         # Align all maneuvers to the median edge so discrete sublane IDs match
         # continuous lateral_shift across narrower connectors and exits.
@@ -313,7 +689,7 @@ class LeVanLuongSimulator:
     CURVE_STEP = 0.5       # m of reference progress between profile samples
     CURVE_SHIFT_BIN = 0.35  # m of lateral shift per cached profile
 
-    def _curve_profile(self, road, shift):
+    def _curve_profile(self, road, shift, lat_accel=None):
         """(speed caps, path scales) of ``road`` for a lateral ``shift``.
 
         Sample ``i`` sits at reference progress ``i * CURVE_STEP``. The speed
@@ -323,7 +699,10 @@ class LeVanLuongSimulator:
         per metre of reference progress: sublanes on the outside of a turn
         travel further than the reference line, inner ones less.
         """
+        lat_accel = self.curve_lat_accel if lat_accel is None else lat_accel
         key = (road, int(round(shift / self.CURVE_SHIFT_BIN)))
+        if lat_accel != self.curve_lat_accel:
+            key = key + (lat_accel,)
         profile = self._curve_profiles.get(key)
         if profile is not None:
             return profile
@@ -357,8 +736,8 @@ class LeVanLuongSimulator:
             # ``turn`` is accumulated between the first and last segment
             # centres, i.e. over the arc minus half of each end segment.
             span = arc - 0.5 * (seg[lo] + seg[hi])
-            if self.curve_lat_accel > 0 and turn > 1e-4 and span > 1e-6:
-                caps.append(min(road_cap, math.sqrt(self.curve_lat_accel * span / turn)))
+            if lat_accel > 0 and turn > 1e-4 and span > 1e-6:
+                caps.append(min(road_cap, math.sqrt(lat_accel * span / turn)))
             else:
                 caps.append(road_cap)
             scales.append(min(1.6, max(0.5, arc / ref)) if ref > 1e-9 else 1.0)
@@ -384,21 +763,32 @@ class LeVanLuongSimulator:
             return math.inf
         if vehicle.position >= vehicle.connector_end:
             return math.inf
+        # Per-type lateral acceleration (heavy vehicles: passenger comfort).
+        lat_accel = (min(vehicle.lat_accel, self.curve_lat_accel)
+                     if vehicle.lat_accel > 0 else None)
         if vehicle.position >= vehicle.approach_end:
-            caps = self._curve_profile(vehicle.conn_road, vehicle.current_lateral_shift)[0]
+            caps = self._curve_profile(vehicle.conn_road, vehicle.current_lateral_shift,
+                                       lat_accel)[0]
             index = int((vehicle.position - vehicle.approach_end) / self.CURVE_STEP)
             return caps[min(len(caps) - 1, max(0, index))]
         distance = vehicle.approach_end - vehicle.position
         if distance > 60.0:
             return math.inf
         key = (vehicle.conn_road, int(round(vehicle.current_lateral_shift / self.CURVE_SHIFT_BIN)))
+        if lat_accel is not None:
+            key = key + (lat_accel, self._mapped_lane(vehicle, vehicle.lane, vehicle.in_road,
+                                                      vehicle.conn_road))
         entry = self._curve_entry.get(key)
         if entry is None:
             seam_shift = self._continuous_seam_pose(
                 vehicle.in_road, vehicle.conn_road, key[1] * self.CURVE_SHIFT_BIN)[1]
             lanes = self.roads[vehicle.conn_road]["num_lanes"]
             seam_shift = min(max(seam_shift, 0.0), (lanes - 1) * SUBLANE_WIDTH)
-            entry = self._curve_profile(vehicle.conn_road, seam_shift)[0][0]
+            if vehicle.wheelbase > 0.0:
+                # It brakes for the sublane it will actually drive.
+                lane = self._mapped_lane(vehicle, vehicle.lane, vehicle.in_road, vehicle.conn_road)
+                seam_shift = (lane + (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
+            entry = self._curve_profile(vehicle.conn_road, seam_shift, lat_accel)[0][0]
             self._curve_entry[key] = entry
         return math.sqrt(entry * entry + 2.0 * self.curve_decel * distance)
 
@@ -415,19 +805,46 @@ class LeVanLuongSimulator:
                  vehicle_params=None, startup_params=None,
                  junction_model="negotiation", negotiation_params=None,
                  min_green=10.0, jam_timeout=120.0,
-                 curve_lat_accel=3.0, curve_decel=2.0, max_decel=7.5):
+                 curve_lat_accel=3.0, curve_decel=2.0, max_decel=7.5,
+                 heavy_ratio=DEFAULT_HEAVY_RATIO):
         if mode not in ("safe", "gama_2025_6_4"):
             raise ValueError("mode must be 'safe' or 'gama_2025_6_4'")
         self.mode = mode
         self.seed = int(seed)
         numeric_parameters = (flow_per_approach, motorbike_ratio, p_left,
-                              p_right, green_lvl, green_hdt, all_red)
+                              p_right, green_lvl, green_hdt, all_red, heavy_ratio)
         if (not all(math.isfinite(value) for value in numeric_parameters) or
                 flow_per_approach < 0 or not 0 <= motorbike_ratio <= 1 or
+                not 0 <= heavy_ratio <= 1 or motorbike_ratio + heavy_ratio > 1 + 1e-12 or
                 min(p_left, p_right, green_lvl, green_hdt, all_red) < 0 or
                 p_left + p_right > 1 or flow_per_approach / 3600 * DT > 1):
             raise ValueError("Invalid flow, vehicle mix, turn split, or signal timing")
         self.rng = random.Random(seed)
+        # Vehicle types first: the lane-level movements below need the number
+        # of sublanes each type occupies.
+        self.vehicle_params = {kind: dict(values)
+                               for kind, values in DEFAULT_VEHICLE_PARAMS.items()}
+        for kind, values in (vehicle_params or {}).items():
+            if kind not in self.vehicle_params:
+                raise ValueError(f"unknown vehicle type {kind!r}")
+            unknown = set(values) - set(self.vehicle_params[kind])
+            if unknown:
+                raise ValueError(f"unknown vehicle parameters {sorted(unknown)}")
+            if any(not math.isfinite(float(v)) or float(v) <= 0 for v in values.values()):
+                raise ValueError("vehicle parameters must be positive")
+            self.vehicle_params[kind].update({k: float(v) for k, v in values.items()})
+        self._occupied = {kind: occupied_sublanes(self.vehicle_params[kind]["width"])
+                          for kind in VEHICLE_KINDS}
+        # Lane movement ids and several behaviour rules identify the type by
+        # its sublane count, so the three types must keep distinct counts.
+        if not (self._occupied["motorbike"] == 1 < self._occupied["car"]
+                < self._occupied["heavy"]):
+            raise ValueError(
+                "vehicle widths must give 1 sublane for motorbikes and more "
+                "sublanes for cars than for motorbikes, for heavy vehicles than for cars")
+        self._half_width_by_occupied = {
+            self._occupied[kind]: self.vehicle_params[kind]["width"] / 2.0
+            for kind in VEHICLE_KINDS}
         self.roads = road_lengths(roads_path)
         self._geometry_roads = {}
         source = json.loads(Path(roads_path).read_text(encoding="utf-8"))
@@ -439,7 +856,7 @@ class LeVanLuongSimulator:
         self._lane_movement_defs = {}
         for movement in base_conflicts.movements.values():
             road = self._geometry_roads[movement.id]
-            for occupied in (1, 2):
+            for occupied in sorted(self._half_width_by_occupied):
                 for lane in range(max(0, road.num_lanes - occupied + 1)):
                     shift = (lane + (occupied - 1) / 2.0) * SUBLANE_WIDTH
                     count = max(1, math.ceil(road.length / 5.0))
@@ -454,6 +871,25 @@ class LeVanLuongSimulator:
                         lane_id, movement.arm, movement.to_arm, movement.turn,
                         points, tuple(lengths))
         self._conflict_map = base_conflicts
+        self._axle_cache = {}
+        self.heavy_turns_rerouted = 0
+        # Right-turn connector sublane a heavy vehicle drives (front axle):
+        # the curb-most one whose tightest radius allows its minimum
+        # turning radius; None when no sublane does (the turn is then
+        # rerouted, see ``_create_vehicle``).
+        self._heavy_right_lane = {}
+        heavy = self.vehicle_params["heavy"]
+        heavy_occupied = self._occupied["heavy"]
+        for road_id, road in self.roads.items():
+            if road.get("kind") != "connector" or road.get("turn") != "right":
+                continue
+            lane = None
+            for candidate in range(max(0, road["num_lanes"] - heavy_occupied + 1)):
+                shift = (candidate + (heavy_occupied - 1) / 2.0) * SUBLANE_WIDTH
+                if self._path_min_radius(road_id, shift) >= heavy["min_turn_radius"] - 0.05:
+                    lane = candidate
+                    break
+            self._heavy_right_lane[road_id] = lane
         self._lane_conflict_pair_cache = {}
         self._conflict_engine = ConflictEngine(
             self._conflict_map, left_wait_priority_after=10.0)
@@ -461,7 +897,7 @@ class LeVanLuongSimulator:
         self._road_index = None
         self._exited_this_tick = []
         # Upper bounds used to size index windows (updated on creation).
-        self._max_vehicle_length = 4.5
+        self._max_vehicle_length = LIGHT_VEHICLE_LENGTH
         self._max_vehicle_gap = 1.0
         # Junction conflict model (safe mode only): "reservation" keeps the
         # time-window ConflictEngine; "negotiation" uses the SUMO-style
@@ -475,6 +911,7 @@ class LeVanLuongSimulator:
             self._negotiation = SimulatorAdapter(self, negotiation_params)
         self.flow_per_approach = flow_per_approach
         self.motorbike_ratio = motorbike_ratio
+        self.heavy_ratio = heavy_ratio
         self.p_left = p_left
         self.p_right = p_right
         self.green_lvl = green_lvl
@@ -499,17 +936,6 @@ class LeVanLuongSimulator:
         self.phase = "LVL"
         self.vehicles = []
         self._next_creation_id = 0
-        self.vehicle_params = {kind: dict(values)
-                               for kind, values in DEFAULT_VEHICLE_PARAMS.items()}
-        for kind, values in (vehicle_params or {}).items():
-            if kind not in self.vehicle_params:
-                raise ValueError(f"unknown vehicle type {kind!r}")
-            unknown = set(values) - set(self.vehicle_params[kind])
-            if unknown:
-                raise ValueError(f"unknown vehicle parameters {sorted(unknown)}")
-            if any(not math.isfinite(float(v)) or float(v) <= 0 for v in values.values()):
-                raise ValueError("vehicle parameters must be positive")
-            self.vehicle_params[kind].update({k: float(v) for k, v in values.items()})
         self.startup_params = dict(startup_params or {})
         if self.mode == "safe":
             self._startup_schedulers = {
@@ -581,11 +1007,11 @@ class LeVanLuongSimulator:
                         row = (int(raw[0]), int(raw[1]), int(raw[2]),
                                float(raw[3]), int(raw[4]), int(raw[5]))
                         if (row[0] < 1 or not 0 <= row[1] < 4 or
-                                row[2] not in (0, 1) or
+                                not 0 <= row[2] < len(VEHICLE_KINDS) or
                                 not math.isfinite(row[3]) or row[3] <= 0 or
                                 not 0 <= row[4] <= 2):
                             raise ValueError(f"Invalid demand row: {raw}")
-                        occupied = 2 if row[2] else 1
+                        occupied = self._occupied[VEHICLE_KINDS[row[2]]]
                         incoming = self.roads[f"{ARMS[row[1]]}_in"]
                         if not 0 <= row[5] <= incoming["num_lanes"] - occupied:
                             raise ValueError(f"Invalid demand lane: {raw}")
@@ -708,9 +1134,9 @@ class LeVanLuongSimulator:
     def _spawn(self):
         if self._replay:
             while self._cursor < len(self._rows) and self._rows[self._cursor][0] <= self.cycle:
-                _, origin, car, speed, turn, lane = self._rows[self._cursor]
+                _, origin, kind, speed, turn, lane = self._rows[self._cursor]
                 self._create_vehicle(ARMS[origin], ("left", "right", "through")[turn],
-                                     bool(car), lane, speed, self._cursor)
+                                     VEHICLE_KINDS[kind], lane, speed, self._cursor)
                 self._cursor += 1
             return
         for arm in ARMS:
@@ -720,21 +1146,34 @@ class LeVanLuongSimulator:
             turn = "left" if draw < self.p_left else (
                 "right" if draw < self.p_left + self.p_right else "through")
             incoming = self.roads[f"{arm}_in"]
-            is_car = self.rng.random() < 1 - self.motorbike_ratio
-            occupied = 2 if is_car else 1
+            kind = kind_from_draw(self.rng.random(), self.motorbike_ratio,
+                                  self.heavy_ratio)
+            occupied = self._occupied[kind]
             minimum, maximum = (0, incoming["num_lanes"] - occupied) if turn == "through" else turn_lane_bounds(incoming["num_lanes"], occupied, turn)
             lane = self.rng.randrange(minimum, maximum + 1)
-            speed_kmh = max(1.0, self.rng.gauss(50 if is_car else 40, 5))
-            self._create_vehicle(arm, turn, is_car, lane, speed_kmh)
+            params = self.vehicle_params[kind]
+            speed_kmh = max(1.0, self.rng.gauss(params["speed_mean"], params["speed_sd"]))
+            self._create_vehicle(arm, turn, kind, lane, speed_kmh)
 
-    def _create_vehicle(self, arm, turn, is_car, lane, speed_kmh, demand_row_id=-1):
+    def _create_vehicle(self, arm, turn, kind, lane, speed_kmh, demand_row_id=-1):
+        """Add a vehicle. ``kind`` is a type name ("motorbike", "car",
+        "heavy"), a demand code (0, 1, 2) or the legacy car flag (bool)."""
+        kind = vehicle_kind(kind)
+        is_car = kind != "motorbike"
+        if (kind == "heavy" and turn == "right" and self.mode == "safe" and
+                self._heavy_right_lane.get(f"{arm}_{self._right_target(arm)}") is None):
+            # No sublane of this right turn is wide enough for the heavy
+            # vehicle's minimum turning radius: it goes straight on instead.
+            turn = "through"
+            self.heavy_turns_rerouted += 1
         connector = next(road for road in self.roads.values()
                          if road["kind"] == "connector" and
                          road["arm"] == arm and road["turn"] == turn)
         target = connector["to_arm"]
         incoming = self.roads[f"{arm}_in"]
         outgoing = self.roads[f"{target}_out"]
-        occupied = 2 if is_car else 1
+        kind_params = self.vehicle_params[kind]
+        occupied = self._occupied[kind]
         if (not 0 <= lane <= incoming["num_lanes"] - occupied or
                 not math.isfinite(speed_kmh) or speed_kmh <= 0):
             raise ValueError("Invalid lane or requested speed")
@@ -746,10 +1185,9 @@ class LeVanLuongSimulator:
         approach_end = incoming["length"]
         connector_end = approach_end + connector["length"]
         initial_shift = (lane + (occupied - 1) / 2.0) * SUBLANE_WIDTH
-        length = 4.5 if is_car else 1.9
-        kind_params = self.vehicle_params["car" if is_car else "motorbike"]
+        length = kind_params["length"]
         position = 0.0
-        new_half_width = 0.85 if is_car else 0.35
+        new_half_width = kind_params["width"] / 2.0
         for other in self.vehicles if self.mode == "safe" else ():
             if other.road != f"{arm}_in":
                 continue
@@ -809,8 +1247,13 @@ class LeVanLuongSimulator:
             start_lateral_shift=initial_shift,
             target_lateral_shift=initial_shift,
             lane_change_progress=1.0,
-            lateral_duration=0.6 if not is_car else 1.2,
+            lateral_duration=LATERAL_DURATION[kind],
             queue_stop_offset=queue_stop_offset,
+            kind=kind, half_width=new_half_width,
+            wheelbase=(kind_params["length"] - kind_params["front_overhang"] -
+                       kind_params["rear_overhang"]) if "front_overhang" in kind_params else 0.0,
+            front_overhang=kind_params.get("front_overhang", 0.0),
+            lat_accel=kind_params.get("lat_accel", 0.0),
             time_since_lane_change=0.8 if initial_merge_ready else 0.0,
             gama_entered=self.mode != "gama_2025_6_4"))
         self.created += 1
@@ -859,18 +1302,44 @@ class LeVanLuongSimulator:
             vehicle, vehicle.lane, f"{vehicle.arm}_in", base))
         return f"{base}@{lane}:{vehicle.occupied}"
 
-    @staticmethod
-    def _leader_advance(leader, road, moved_ids):
+    def _leader_advance(self, leader, road, moved_ids):
         """Distance the leader is still expected to cover this tick.
 
         A leader processed earlier in this sequential pass has already moved
         and its lane-map entry holds the new position, so adding its advance
         again would let the follower encroach and be pushed back afterwards.
+        A leader without permission to cross the stop line will not pass its
+        stop point: counting a full step of it let the follower close in on
+        a leader that then stopped short, and the road guard pushed the
+        follower back (a few cm, 16/11/2026).
         """
         if (leader is None or id(leader) in moved_ids or leader.road != road or
                 leader.speed <= 0.5):
             return 0.0
-        return max(0.0, leader.speed * DT - 0.5 * leader.decel * DT * DT)
+        advance = max(0.0, leader.speed * DT - 0.5 * leader.decel * DT * DT)
+        if leader.leading_heavy:
+            # The leader follows a truck or bus, which can stop short (it is
+            # held by a junction stop, or yaws through a lane change): count
+            # no more than the leader's own room.
+            room = leader.leading_distance
+            road, position = leader.leading_from
+            if road == leader.road:
+                # The gap was measured before the leader's own last move.
+                room -= leader.position - position
+            advance = min(advance, max(0.0, room - max(1.0, leader.gap)))
+        if (self.mode == "safe" and road == leader.in_road and
+                not leader.junction_entry_token and
+                leader.creation_id not in self._junction_grants):
+            stop = self._stop_position(leader)
+            room = stop - leader.position
+            if -1e-8 <= room <= leader.speed * DT + leader.speed ** 2 / (2.0 * leader.decel):
+                # It is about to hold at its stop point and may brake up to
+                # ``max_decel`` to do so (a signal change revokes grants).
+                hard_stop = (leader.speed ** 2 / (2.0 * self.max_decel)
+                             if leader.speed <= self.max_decel * DT else
+                             leader.speed * DT - 0.5 * self.max_decel * DT * DT)
+                advance = min(advance, max(0.0, room), hard_stop)
+        return advance
 
     def _new_road_lanes(self, road):
         if self.mode == "gama_2025_6_4":
@@ -949,8 +1418,8 @@ class LeVanLuongSimulator:
         c = CHAUHAN2022_PDM
         x = max(0.0, vehicle.approach_end - vehicle.position - vehicle.length / 2.0)
         utility = c["constant"] + c["speed"] * max(0.0, vehicle.speed) + c["distance"] * x
-        if vehicle.occupied == 2:
-            utility += c["car"]
+        if vehicle.kind != "motorbike":
+            utility += c[vehicle.kind]
         width = self.roads[vehicle.in_road]["num_lanes"] * SUBLANE_WIDTH
         fraction = vehicle.current_lateral_shift / max(width, 1e-9)
         # Sublanes are counted from the right (kerb) side: thirds of the
@@ -1122,7 +1591,7 @@ class LeVanLuongSimulator:
         lane_conflicts = object.__new__(ConflictMap)
         lane_conflicts.movements = lane_map
         lane_conflicts.clearance = 1.0
-        lane_conflicts.default_vehicle_length = 4.5
+        lane_conflicts.default_vehicle_length = LIGHT_VEHICLE_LENGTH
         lane_conflicts.near_miss_distance = 1.85
         lane_conflicts.conflicts = {}
         lane_conflicts.near_miss_pairs = set()
@@ -1143,8 +1612,8 @@ class LeVanLuongSimulator:
                         else:
                             self._lane_conflict_pair_cache[key] = ()
                     else:
-                        half_a = 0.85 if occ_a == 2 else 0.35
-                        half_b = 0.85 if occ_b == 2 else 0.35
+                        half_a = self._half_width_by_occupied[occ_a]
+                        half_b = self._half_width_by_occupied[occ_b]
                         lane_conflicts.near_miss_distance = half_a + half_b + 0.15
                         self._lane_conflict_pair_cache[key] = ConflictMap._pair(
                             lane_conflicts, lane_map[aid], lane_map[bid])[0]
@@ -1237,6 +1706,8 @@ class LeVanLuongSimulator:
         self._dest_groups = None
 
     def _move(self):
+        if self.mode == "safe":
+            self._update_body_sweep()
         starting_positions = {v.creation_id: v.position for v in self.vehicles}
         starting_speeds = {v.creation_id: v.speed for v in self.vehicles}
         # GAMA iterates agents in insertion order. Each agent performs its
@@ -1351,6 +1822,8 @@ class LeVanLuongSimulator:
                 # queue until its route corridor is clear.
                 remaining_lanes = abs(vehicle.lane - self._route_target_lane(vehicle))
                 stop_position -= 12.0 * (remaining_lanes + 1)
+                if vehicle.merge_wait >= MERGE_PATIENCE:
+                    stop_position = self._release_mutual_merge(vehicle, stop_position)
             safe_committed = (committed and
                               (self.mode != "safe" or vehicle.junction_entry_token))
             entry_horizon = (max(28.0, vehicle.speed * vehicle.speed / (2.0 * max(1.0, vehicle.decel))
@@ -1427,12 +1900,19 @@ class LeVanLuongSimulator:
                             own_pose = self._geometry_roads[old_road].pose(
                                 old_progress, vehicle.current_lateral_shift)
                         ahead_road, ahead_progress = self._road_state(ahead)
-                        ahead_pose = self._geometry_roads[ahead_road].pose(
-                            ahead_progress, ahead.current_lateral_shift)
-                        lateral = abs((ahead_pose.y - own_pose.y) * own_pose.tx -
-                                      (ahead_pose.x - own_pose.x) * own_pose.ty)
-                    if lateral >= (self._half_width(vehicle) + self._half_width(ahead) +
-                                   LATERAL_CLEARANCE):
+                        if ahead.wheelbase > 0.0:
+                            # Long rigid body: its rear may still be right
+                            # ahead while its centre has turned away.
+                            ahead_poses = [Pose(x, y, tx, ty, 0.0, 0.0) for x, y, tx, ty
+                                           in self._body_axis_points(ahead)]
+                        else:
+                            ahead_poses = [self._geometry_roads[ahead_road].pose(
+                                ahead_progress, ahead.current_lateral_shift)]
+                        lateral = min(abs((ahead_pose.y - own_pose.y) * own_pose.tx -
+                                          (ahead_pose.x - own_pose.x) * own_pose.ty)
+                                      for ahead_pose in ahead_poses)
+                    if lateral >= self._interaction_reach(
+                            vehicle, ahead, ahead.position, vehicle.position):
                         continue
                     if ahead.conn_road != vehicle.conn_road:
                         own_band = self._negotiation._band_path(
@@ -1452,9 +1932,24 @@ class LeVanLuongSimulator:
                             continue
                     seam_gap = (ahead.position - vehicle.position -
                                 (ahead.length + vehicle.length) / 2.0)
+                    if ((ahead.wheelbase > 0.0 or vehicle.wheelbase > 0.0) and
+                            ahead.position <= vehicle.position + vehicle.length / 2.0):
+                        # Beside a long body, not behind it: the other
+                        # centre is still alongside (see the seam targets in
+                        # junction_negotiation).
+                        continue
+                    if (is_in_road and ahead.road == ahead.conn_road and
+                            ahead.wheelbase > 0.0):
+                        # Past the seam jog the long body is turned against
+                        # the follower still on the approach: keep its
+                        # corner reach as extra distance (see
+                        # ``_resolve_seam_overlaps``).
+                        seam_gap -= ahead.body_sweep
                     if seam_gap < gap:
                         leader, gap = ahead, seam_gap
             vehicle.leading_distance = gap
+            vehicle.leading_heavy = leader is not None and leader.wheelbase > 0.0
+            vehicle.leading_from = (vehicle.road, vehicle.position)
             vehicle.leading_speed = leader.speed if leader else 0.0
             # Route progress is measured on the road's reference line; on a
             # curved connector a shifted sublane covers ``scale`` physical
@@ -1636,8 +2131,11 @@ class LeVanLuongSimulator:
                 else:
                     min_shift = ((vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
                     max_shift = (self.roads[next_road]["num_lanes"] - 1 - (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
-                    if new_shift < min_shift - 0.05 or new_shift > max_shift + 0.05:
-                        vehicle.target_lateral_shift = (vehicle.lane + (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
+                    lane_centre = (vehicle.lane + (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
+                    swing = (vehicle.wheelbase > 0.0 and next_road == vehicle.conn_road and
+                             vehicle.maneuver == "right" and abs(new_shift - lane_centre) > 0.3)
+                    if new_shift < min_shift - 0.05 or new_shift > max_shift + 0.05 or swing:
+                        vehicle.target_lateral_shift = lane_centre
                         vehicle.lane_change_progress = 0.0
                         vehicle.lateral_duration = max(0.8, abs(vehicle.target_lateral_shift - new_shift) / 1.8)
                     else:
@@ -1802,8 +2300,9 @@ class LeVanLuongSimulator:
                     bezier_u = 3.0 * u * u - 2.0 * u * u * u
                     next_shift = (vehicle.start_lateral_shift +
                         (vehicle.target_lateral_shift - vehicle.start_lateral_shift) * bezier_u)
-                    lo = min(vehicle.current_lateral_shift, next_shift)
-                    hi = max(vehicle.current_lateral_shift, next_shift)
+                    own_lo = min(vehicle.current_lateral_shift, next_shift)
+                    own_hi = max(vehicle.current_lateral_shift, next_shift)
+                    own_progress = road_progress
                     lateral_blocked = False
                     reach_long = (vehicle.length + self._max_vehicle_length) / 2 + max(
                         1.2, vehicle.gap, self._max_vehicle_gap) + 20.0 * vehicle.lateral_duration
@@ -1815,12 +2314,48 @@ class LeVanLuongSimulator:
                                       other.road == other.conn_road and
                                       abs(other.position - other.connector_end -
                                           road_progress) <= reach_long)
+                    near_exit = (new_road == vehicle.conn_road and
+                                 vehicle.connector_end - vehicle.position <= reach_long)
+                    if near_exit:
+                        # Bodies that already crossed the exit seam still
+                        # share the space just past the connector end.
+                        nearby.extend(other for other in self._nearby(
+                            vehicle.out_road, 0.0, reach_long)
+                            if other.road == vehicle.out_road)
+                    if new_road == vehicle.conn_road and road_progress < reach_long:
+                        # A heavy vehicle of the same approach still standing
+                        # at the stop line already reaches up to 4.5 m into
+                        # the junction with its front.
+                        nearby.extend(other for other in self.vehicles
+                                      if other.wheelbase > 0.0 and other.arm == vehicle.arm and
+                                      other.road == other.in_road and
+                                      other.position + other.length / 2 > other.approach_end)
                     for other in nearby:
                         if other is vehicle:
                             continue
                         other_road, other_progress = self._road_state(other)
                         other_shift = other.current_lateral_shift
-                        if other_road != new_road:
+                        lo, hi = own_lo, own_hi
+                        road_progress = own_progress
+                        ego_cur, ego_next = vehicle.current_lateral_shift, next_shift
+                        if near_exit and other_road == vehicle.out_road:
+                            # Compare in exit-road coordinates.
+                            seam_progress, cur_out = self._continuous_seam_pose(
+                                new_road, other_road, vehicle.current_lateral_shift)
+                            _, next_out = self._continuous_seam_pose(
+                                new_road, other_road, next_shift)
+                            road_progress = (vehicle.position - vehicle.connector_end +
+                                             seam_progress)
+                            lo, hi = min(cur_out, next_out), max(cur_out, next_out)
+                            ego_cur, ego_next = cur_out, next_out
+                        elif (other_road == other.in_road and other.wheelbase > 0.0 and
+                              new_road == vehicle.conn_road):
+                            # Compare in this connector's coordinates.
+                            seam_progress, other_shift = self._continuous_seam_pose(
+                                other.in_road, new_road, other_shift)
+                            other_progress = (other.position - other.approach_end +
+                                              seam_progress)
+                        elif other_road != new_road:
                             if (not new_road.endswith("_out") or
                                     other_road != other.conn_road or
                                     other.to_arm != vehicle.to_arm):
@@ -1848,7 +2383,7 @@ class LeVanLuongSimulator:
                             needed = 0.0
                         if separation - closing * remaining_change >= needed:
                             continue
-                        if self._moving_away(vehicle.current_lateral_shift, next_shift,
+                        if self._moving_away(ego_cur, ego_next,
                                              other_shift, other_shift):
                             continue
                         lateral_gap = max(lo - other_shift,
@@ -1887,8 +2422,11 @@ class LeVanLuongSimulator:
         self._road_index = None
         self._exited_this_tick = []
         if self.mode == "safe":
+            self._update_body_sweep()
             self._resolve_road_conflicts()
             self._resolve_connector_overlaps(starting_positions, starting_speeds)
+            self._resolve_seam_overlaps(starting_positions, starting_speeds)
+        self._commit_axles()
 
     def _resolve_connector_overlaps(self, starting_positions, starting_speeds):
         """Stop a following connector body before it enters an occupied footprint.
@@ -1899,6 +2437,9 @@ class LeVanLuongSimulator:
         in the current tick and never rewinds to an earlier tick.
         """
         groups = {}
+        # The 8 m window below covers two passenger cars; longer bodies
+        # overlap at larger centre distances.
+        slack = self._length_slack()
         for vehicle in self.vehicles:
             road, progress = self._road_state(vehicle)
             if not road.endswith(("_in", "_out")):
@@ -1906,28 +2447,28 @@ class LeVanLuongSimulator:
         for road, entries in groups.items():
             entries.sort(key=lambda item: item[0], reverse=True)
             placed = []
-            geometry = self._geometry_roads[road]
-            def make_polygon(item):
-                return body_polygon(geometry.pose(
-                    item.position - item.approach_end,
-                    item.current_lateral_shift), length=item.length,
-                    width=2 * self._half_width(item))
+            def make_polygons(item):
+                # Physical bodies: the corner reach (``body_sweep``) already
+                # widens the lateral rules that keep vehicles apart.
+                return self._body_polygons(item, road)
+
+            def touches(item, blockers):
+                own = make_polygons(item)
+                return any(polygons_overlap(a, b, 0.0)
+                           for polygons in blockers for a in own for b in polygons)
             for progress, vehicle in entries:
                 blockers = [other for ahead, _, other in placed
-                            if ahead - progress < 8.0]
-                if blockers and any(polygons_overlap(make_polygon(vehicle), other, 0.0)
-                                    for other in blockers):
+                            if ahead - progress < 8.0 + slack]
+                if blockers and touches(vehicle, blockers):
                     end = vehicle.position
                     start = min(end, starting_positions.get(vehicle.creation_id, end))
                     vehicle.position = start
-                    if not any(polygons_overlap(make_polygon(vehicle), other, 0.0)
-                               for other in blockers):
+                    if not touches(vehicle, blockers):
                         lo, hi = start, end
                         for _ in range(18):
                             mid = (lo + hi) / 2
                             vehicle.position = mid
-                            if any(polygons_overlap(make_polygon(vehicle), other, 0.0)
-                                   for other in blockers):
+                            if touches(vehicle, blockers):
                                 hi = mid
                             else:
                                 lo = mid
@@ -1936,7 +2477,66 @@ class LeVanLuongSimulator:
                     vehicle.speed = max(0.0, min(vehicle.speed,
                         2.0 * distance / DT - starting_speeds.get(vehicle.creation_id, 0.0)))
                 placed.append((vehicle.position - vehicle.approach_end,
-                               vehicle, make_polygon(vehicle)))
+                               vehicle, make_polygons(vehicle)))
+
+    def _resolve_seam_overlaps(self, starting_positions, starting_speeds):
+        """Stop an approach body short of a body just past the stop line,
+        when one of the two is a heavy vehicle.
+
+        ``_resolve_connector_overlaps`` compares bodies on the same connector
+        only. At the stop-line seams the connector starts with a jog of up to
+        ~10 degrees, so a vehicle still on the approach and the rear unit of
+        a truck or bus already on the connector are turned against each
+        other: a route gap of more than a metre can still let the corner of
+        the follower into the truck. Like the connector guard this only
+        shortens the follower's move of this tick; it never moves anybody
+        back beyond its start. Pairs of light vehicles keep the original
+        behaviour.
+        """
+        if not any(v.wheelbase > 0.0 for v in self.vehicles):
+            return
+        near_seam = {}
+        for other in self.vehicles:
+            if (other.road == other.conn_road and
+                    other.position - other.approach_end < max(other.length, 9.0) + 2.0):
+                near_seam.setdefault(other.arm, []).append(other)
+        for vehicle in self.vehicles:
+            if (vehicle.road != vehicle.in_road or
+                    vehicle.approach_end - vehicle.position > vehicle.length / 2 + 2.0):
+                continue
+            # Pairs with a heavy vehicle on either side; light pairs keep the
+            # original behaviour.
+            blockers = [other for other in near_seam.get(vehicle.arm, ())
+                        if other.wheelbase > 0.0 or vehicle.wheelbase > 0.0]
+            if not blockers:
+                continue
+            end = vehicle.position
+            start = min(end, starting_positions.get(vehicle.creation_id, end))
+            if end - start < 1e-9:
+                continue
+            bodies = [polygon for other in blockers if other.position > vehicle.position
+                      for polygon in self._body_polygons(other)]
+
+            def touches():
+                return any(polygons_overlap(own, other, 0.0)
+                           for own in self._body_polygons(vehicle, vehicle.in_road)
+                           for other in bodies)
+            if not bodies or not touches():
+                continue
+            vehicle.position = start
+            if touches():
+                vehicle.position = end  # contact from an earlier tick: leave it
+                continue
+            lo, hi = start, end
+            for _ in range(18):
+                vehicle.position = (lo + hi) / 2
+                if touches():
+                    hi = vehicle.position
+                else:
+                    lo = vehicle.position
+            vehicle.position = lo
+            vehicle.speed = max(0.0, min(vehicle.speed, 2.0 * (lo - start) / DT -
+                                         starting_speeds.get(vehicle.creation_id, 0.0)))
 
     def _resolve_road_conflicts(self):
         """Keep vehicle bodies and their minimum clearance apart on road links.
@@ -1946,6 +2546,8 @@ class LeVanLuongSimulator:
         arms have different cumulative route positions.
         """
         by_road = {}
+        # The 6 m window below is a car length plus its clearance.
+        slack = self._length_slack()
         for vehicle in self.vehicles:
             road, progress = self._road_state(vehicle)
             if road.endswith(("_in", "_out")):
@@ -1954,14 +2556,15 @@ class LeVanLuongSimulator:
             entries.sort(key=lambda item: item[0], reverse=True)
             settled = []
             for progress, vehicle in entries:
-                half_width = self._half_width(vehicle)
                 allowed = progress
                 for ahead_progress, ahead in reversed(settled):
-                    if ahead_progress - progress > 6.0:
+                    if ahead_progress - progress > 6.0 + slack:
                         continue
-                    other_half_width = self._half_width(ahead)
+                    # Physical body widths: this guard moves vehicles back,
+                    # it must not act on the corner reach (``body_sweep``)
+                    # that only keeps traffic clear of long bodies.
                     if abs(vehicle.current_lateral_shift - ahead.current_lateral_shift) >= (
-                            half_width + other_half_width + LATERAL_CLEARANCE):
+                            vehicle.half_width + ahead.half_width + LATERAL_CLEARANCE):
                         continue
                     clearance = max(1.0, vehicle.gap, ahead.gap)
                     if vehicle.speed < 0.5:
@@ -1993,7 +2596,9 @@ class LeVanLuongSimulator:
                         vehicle.target_lateral_shift = shift
                         vehicle.lane_change_progress = 1.0
                         vehicle.lane_change_from = -1
-                    self.road_safety_corrections += 1
+                    # Rounding residues (~1e-15 m) are not corrections.
+                    if correction > 1e-9:
+                        self.road_safety_corrections += 1
                     if correction > self.max_road_safety_correction:
                         self.largest_road_safety_event = (
                             self.cycle, road, vehicle.demand_row_id, correction)
@@ -2195,7 +2800,7 @@ class LeVanLuongSimulator:
             # Paper Eq: a_allow = 2.0 m/s^2, r = v^2 / a_allow, T_lc = sqrt(6 * W / a_allow)
             a_allow = 2.0
             base_duration = math.sqrt(6.0 * max(0.4, lateral_dist) / a_allow)
-            multiplier = 0.6 if vehicle.occupied == 1 else 1.0
+            multiplier = LATERAL_DURATION_FACTOR[vehicle.kind]
             vehicle.lateral_duration = max(0.4, base_duration * multiplier)
         else:
             vehicle.time_since_lane_change += DT
@@ -2319,7 +2924,7 @@ class LeVanLuongSimulator:
         def lateral_interacts(other, other_position=None):
             if self.mode != "safe":
                 return True
-            reach = self._half_width(vehicle) + self._half_width(other) + LATERAL_CLEARANCE
+            reach = self._interaction_reach(vehicle, other, other_position, position)
             if abs(candidate_shift - other.current_lateral_shift) < reach:
                 return True
             # A claimed merge counts as a leader only when the merger is
@@ -2373,7 +2978,7 @@ class LeVanLuongSimulator:
                 other_road, other_position = self._road_state(other)
                 if other_road != road:
                     return None
-                reach = half_width + self._half_width(other) + LATERAL_CLEARANCE
+                reach = self._interaction_reach(vehicle, other, other_position, position)
                 if abs(candidate_shift - other.current_lateral_shift) >= reach:
                     # Courtesy: a claimed merge ahead counts as a leader.
                     # Only when the merger is fully ahead; a vehicle already
@@ -2482,8 +3087,9 @@ class LeVanLuongSimulator:
                     entries = lane_maps[next_road][sublane]
                     for other_position, _, other in entries:
                         if self.mode == "safe":
-                            reach = (self._half_width(vehicle) +
-                                     self._half_width(other) + LATERAL_CLEARANCE)
+                            reach = self._interaction_reach(
+                                vehicle, other,
+                                self.roads[road]["length"] + other_position, position)
                             claim_interacts = (math.isfinite(other.merge_claim_shift) and
                                                abs(seam_shift - other.merge_claim_shift) < reach)
                             if (abs(seam_shift - other.current_lateral_shift) >= reach and
@@ -2579,6 +3185,7 @@ class LeVanLuongSimulator:
                       entries_during_yellow=self.entries_during_yellow,
                       entries_during_red=self.entries_during_red,
                       jam_removed=self.jam_removed,
+                      heavy_turns_rerouted=self.heavy_turns_rerouted,
                       hard_brake_events=self.hard_brake_events,
                       permitted_right_on_red_entries=self.permitted_right_on_red_entries)
         return result
@@ -2621,6 +3228,8 @@ def main():
     parser.add_argument("--sample-every", type=int, default=10)
     parser.add_argument("--flow-per-approach", type=float, default=2400)
     parser.add_argument("--motorbike-ratio", type=float, default=.85)
+    parser.add_argument("--heavy-ratio", type=float, default=DEFAULT_HEAVY_RATIO,
+                        help="share of heavy vehicles (trucks, buses) in random arrivals")
     parser.add_argument("--p-left", type=float, default=.2)
     parser.add_argument("--p-right", type=float, default=.2)
     parser.add_argument("--green-lvl", type=float, default=50)
@@ -2641,7 +3250,8 @@ def main():
                          "vehicle generation; will not match GAMA replay demand.\n")
     sim = LeVanLuongSimulator(seed=args.seed,
         flow_per_approach=args.flow_per_approach,
-        motorbike_ratio=args.motorbike_ratio, p_left=args.p_left, p_right=args.p_right,
+        motorbike_ratio=args.motorbike_ratio, heavy_ratio=args.heavy_ratio,
+        p_left=args.p_left, p_right=args.p_right,
         green_lvl=args.green_lvl, green_hdt=args.green_hdt, all_red=args.all_red,
         yellow=args.yellow,
         demand_file=args.demand_file, mode=args.mode)

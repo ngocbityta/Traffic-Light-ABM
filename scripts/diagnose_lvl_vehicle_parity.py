@@ -40,7 +40,7 @@ async def main(args):
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="lvl_micro_") as directory:
         demand = Path(directory) / "demand.csv"
-        digest = generate_demand(demand, args.seed, args.horizon)
+        digest = generate_demand(demand, args.seed, args.horizon, heavy_ratio=0.0)  # GAMA has no heavy vehicles
         python = LeVanLuongSimulator(seed=args.seed, demand_file=demand)
         manager = GamaServerManager(port=args.port, workdir=str(Path(directory) / "gama_ws"),
                                     log_file=str(output.with_suffix(".gama.log")))

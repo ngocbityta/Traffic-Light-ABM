@@ -121,10 +121,17 @@ class LeftoverTests(unittest.TestCase):
         self.assertIn("g", neg.clearing_holds)
 
 
-def green_standing(seed, ticks):
+def green_standing(seed, ticks, heavy_ratio=0.0):
     """Vehicle-seconds a front-row vehicle stands on green without a grant,
-    split by whether the keep-clear rule or a stop target holds it."""
-    sim = LeVanLuongSimulator(seed=seed)
+    split by whether the keep-clear rule or a stop target holds it.
+
+    Measured without heavy vehicles, as when the rework was made (16/11).
+    With 3 % trucks and buses the keep-clear rule still holds 150-840
+    vehicle-seconds per 600 s (seeds 1-4, 17/11): a leftover truck, a
+    new-phase vehicle weaving in, and a minor vehicle waiting for the truck
+    form a wait cycle that only the 8 s squeeze breaks. Open issue (README,
+    "Giữ ô trống khi có xe 3 sublane")."""
+    sim = LeVanLuongSimulator(seed=seed, heavy_ratio=heavy_ratio)
     green_ticks = {}
     held = {"box": 0, "seam": 0, "total": 0}
     for _ in range(ticks):

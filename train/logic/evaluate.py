@@ -46,6 +46,20 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COMPARISON_DIR = os.path.join(os.path.dirname(os.path.dirname(BASE_DIR)), "comparison_results")
 
 
+def _training_sim_config(training_summary):
+    """Simulator configuration a run was trained with.
+
+    Runs from before heavy vehicles existed have no ``heavy_ratio``: they
+    trained on motorbikes and cars only, so they are evaluated the same way.
+    """
+    config = training_summary.get("training_config", {}).get("simulation_config")
+    if config is None:
+        return None
+    config = dict(config)
+    config.setdefault("heavy_ratio", 0.0)
+    return config
+
+
 def write_sample(writer, state, episode, horizon, step_seconds=.1):
     if state["cycle"] % 10 != 0 or state["cycle"] >= horizon:
         return False
@@ -167,7 +181,7 @@ async def amain(args):
                              **({"python_sim_mode": training_summary.get("python_sim_mode", "safe")
                                 if os.path.exists(run_summary) else "safe",
                                 "sim_config": load_sim_config(args.sim_config) if args.sim_config else
-                                training_summary.get("training_config", {}).get("simulation_config")
+                                _training_sim_config(training_summary)
                                 if os.path.exists(run_summary) else None}
                                if args.scenario == "lvl" and args.backend == "python" else {}),
                              **reward_options)
@@ -224,7 +238,11 @@ async def amain(args):
                     demand_path = os.path.join(os.path.dirname(os.path.abspath(args.output)),
                                                "demand", f"seed_{seed}_h{args.episode_horizon}.csv")
                     if args.scenario == "lvl":
-                        generate_lvl_demand(demand_path, seed, args.episode_horizon)
+                        # Same vehicle mix as the simulator configuration;
+                        # the GAMA model has no heavy vehicles.
+                        generate_lvl_demand(demand_path, seed, args.episode_horizon,
+                                            heavy_ratio=(env.sim_config["heavy_ratio"]
+                                                         if args.backend == "python" else 0.0))
                         parameters = lvl_demand_parameters(demand_path)
                     else:
                         generate_demand(demand_path, seed, args.episode_horizon)

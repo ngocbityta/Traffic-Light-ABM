@@ -5,6 +5,8 @@ from typing import Iterable, Sequence
 
 CAR_WIDTH, CAR_LENGTH = 1.7, 4.5
 MOTORBIKE_WIDTH, MOTORBIKE_LENGTH = 0.7, 1.9
+# Trucks and buses merged into one class (see python_sim.DEFAULT_VEHICLE_PARAMS).
+HEAVY_WIDTH, HEAVY_LENGTH = 2.45, 9.0
 SUBLANE_WIDTH = 1.05
 
 
@@ -136,6 +138,7 @@ class RouteGeometry:
 def vehicle_size(kind="car"):
     if kind == "car": return CAR_LENGTH,CAR_WIDTH
     if kind in ("motorbike","motorcycle","bike"): return MOTORBIKE_LENGTH,MOTORBIKE_WIDTH
+    if kind in ("heavy","truck","bus"): return HEAVY_LENGTH,HEAVY_WIDTH
     raise ValueError(f"unknown vehicle kind: {kind!r}")
 
 

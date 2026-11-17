@@ -103,7 +103,7 @@ async def run(args):
     out = args.output.resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     demand_path = out.with_name(out.stem + "_demand.csv")
-    demand_hash = generate_demand(demand_path, args.seed, args.ticks)
+    demand_hash = generate_demand(demand_path, args.seed, args.ticks, heavy_ratio=0.0)  # GAMA has no heavy vehicles
     demand_rows = demand_path.read_text(encoding="utf-8").splitlines()
     demand_by_cycle = {}
     demand_meta = {}

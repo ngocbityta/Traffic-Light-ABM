@@ -119,7 +119,7 @@ async def main(args):
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     demand = output.with_name(output.stem + "_demand.csv")
-    demand_sha = generate_demand(demand, args.seed, args.horizon)
+    demand_sha = generate_demand(demand, args.seed, args.horizon, heavy_ratio=0.0)  # GAMA has no heavy vehicles
     source_hashes = {
         "python_sim_sha256": hashlib.sha256(
             (ROOT / "python-simulation/simulation/python_simulation/python_sim.py").read_bytes()).hexdigest(),

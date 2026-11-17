@@ -7,7 +7,9 @@ simulation loop pays only for a pose evaluation per vehicle.
 
 Columns (all 1-D, aligned):
     cycle, vid, road, progress, shift, x, y, heading, speed, accel, length,
-    half_width, is_car, movement, arm, maneuver
+    half_width, is_car, kind, movement, arm, maneuver
+``is_car`` is 1 for every vehicle that is not a motorbike; ``kind`` is the
+vehicle type code (0 motorbike, 1 car, 2 heavy vehicle).
 ``road``/``movement``/``arm``/``maneuver`` are integer codes; the code tables
 are stored alongside (``road_names``, ``movement_names``...). ``movement`` is
 the lane-level connector movement id while the vehicle is on a connector and
@@ -22,13 +24,13 @@ from pathlib import Path
 import numpy as np
 
 try:
-    from .python_sim import ARMS, DT
+    from .python_sim import ARMS, DT, VEHICLE_KINDS
 except ImportError:  # flat import
-    from python_sim import ARMS, DT
+    from python_sim import ARMS, DT, VEHICLE_KINDS
 
 FLOAT_COLUMNS = ("progress", "shift", "x", "y", "heading", "speed", "accel",
                  "length", "half_width", "sample_dt")
-INT_COLUMNS = ("cycle", "vid", "road", "is_car", "movement", "arm", "maneuver")
+INT_COLUMNS = ("cycle", "vid", "road", "is_car", "kind", "movement", "arm", "maneuver")
 MANEUVERS = ("left", "right", "through")
 PHASES = ("LVL", "HDT", "none")
 
@@ -109,11 +111,15 @@ class TrajectoryRecorder:
                 max(DT, (sim.cycle - v.created_cycle + 1) * DT))
                 if previous is None else elapsed)
             rows["length"].append(v.length)
-            rows["half_width"].append(sim._half_width(v))
+            # Physical half-width. ``sim._half_width`` adds the corner reach
+            # of a truck on a bend, an envelope for the lateral rules: a car
+            # 0.5 m beside the truck's body counted as a body overlap.
+            rows["half_width"].append(v.half_width)
             rows["cycle"].append(sim.cycle)
             rows["vid"].append(v.creation_id)
             rows["road"].append(self._road_code[road])
-            rows["is_car"].append(1 if v.occupied == 2 else 0)
+            rows["is_car"].append(0 if v.occupied == 1 else 1)
+            rows["kind"].append(VEHICLE_KINDS.index(v.kind))
             rows["movement"].append(movement)
             rows["arm"].append(ARMS.index(v.arm))
             rows["maneuver"].append(MANEUVERS.index(v.maneuver))
@@ -167,7 +173,7 @@ def movement_conflict_points(sim, recorder):
 
     Returns ``{(code_a, code_b): [(s_a, s_b), ...]}`` (``code_a < code_b``)
     where the two lane centrelines cross or come closer than the sum of the
-    widest half-widths (1.7 m); ``s`` are arc lengths along each movement.
+    occupants' half-widths; ``s`` are arc lengths along each movement.
     Movements from the same approach are skipped: they leave side by side in
     different sublanes (car-following/lateral interaction, covered by the
     rear-end measures), not a crossing.
@@ -190,8 +196,10 @@ def movement_conflict_points(sim, recorder):
                 continue
             b = defs[b_name]
             # Bodies overlap laterally when centrelines are closer than the
-            # sum of the occupants' half-widths (car 0.85 m, motorbike 0.35 m).
-            reach = sum(0.85 if name.endswith(":2") else 0.35 for name in (a_name, b_name))
+            # sum of the occupants' half-widths (motorbike 0.35 m, car
+            # 0.85 m, heavy vehicle 1.225 m).
+            reach = sum(sim._half_width_by_occupied[int(name.rsplit(":", 1)[1])]
+                        for name in (a_name, b_name))
             points = []
             for ia, (a0, a1) in enumerate(zip(a.points, a.points[1:])):
                 la = a.lengths[ia + 1] - a.lengths[ia]

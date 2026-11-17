@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Điều phối giao thông · Lê Văn Lương</title>
 <style>
-:root{color-scheme:dark;--bg:#090f15;--panel:#101a24;--line:#223342;--text:#edf4f6;--muted:#9aadb9;--teal:#53d8c4;--orange:#ffb65e;--red:#ff6878;--green:#62d79a;--amber:#ffbe3b}
+:root{color-scheme:dark;--bg:#090f15;--panel:#101a24;--line:#223342;--text:#edf4f6;--muted:#9aadb9;--teal:#53d8c4;--orange:#ffb65e;--violet:#b48cff;--red:#ff6878;--green:#62d79a;--amber:#ffbe3b}
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font:14px/1.4 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
 body{display:flex;flex-direction:column}
@@ -58,6 +58,7 @@ canvas:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
 .swatch{width:9px;height:9px;border-radius:50%;display:inline-block}
 .swatch.car{border-radius:2px;width:12px;height:7px;background:var(--orange)}
 .swatch.bike{background:var(--teal)}
+.swatch.heavy{border-radius:2px;width:16px;height:8px;background:var(--violet)}
 .swatch.blinker{background:var(--amber);box-shadow:0 0 5px var(--amber)}
 .signal{width:16px;height:5px;border-radius:4px;background:var(--green)}
 .signal.red{background:var(--red)}
@@ -111,6 +112,7 @@ canvas:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
  <div class="legend-hud" aria-hidden="true">
   <span class="legend-item"><i class="swatch bike"></i>Xe máy</span>
   <span class="legend-item"><i class="swatch car"></i>Ô tô</span>
+  <span class="legend-item"><i class="swatch heavy"></i>Xe nặng</span>
   <span class="legend-item"><i class="swatch blinker"></i>Xi-nhan</span>
   <span class="legend-item"><i class="signal"></i>Đèn xanh</span>
   <span class="legend-item"><i class="signal yellow"></i>Đèn vàng</span>
@@ -863,6 +865,7 @@ canvas:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
  const COL_HEAD=[1.0,0.988,0.902,1],COL_BRAKE_ON=[1.0,0.133,0.2,1],COL_BRAKE_OFF=[0.6,0.082,0.125,1];
  const COL_BLINK=[1.0,0.718,0.012,1],COL_BIKE=[0.243,0.902,0.808,1],COL_BIKE_ACT=[0.494,0.957,0.886,1];
  const COL_WHITE=[1,1,1,1];
+ const COL_HEAVY=[0.706,0.549,1.0,1],COL_HEAVY_ACT=[0.86,0.78,1.0,1],COL_HEAVY_CAB=[0.29,0.2,0.47,1];
 
  function drawVehicles(labelsOut){
   vehiclePoints=[];
@@ -908,8 +911,17 @@ canvas:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
      Boolean(currV.is_changing_lane || (currV.lane_change_progress!=null && currV.lane_change_progress<1.0));
     if(isChanging) changingCount++;
 
+    // Rigid body pose of a heavy vehicle, interpolated between snapshots.
+    let body=currV.body||null;
+    if(body&&prevV&&prevV.body&&snapshotDelta===1){
+     const pb=prevV.body;
+     const bx=pb[2]+(body[2]-pb[2])*alpha,by=pb[3]+(body[3]-pb[3])*alpha,bm=Math.hypot(bx,by)||1;
+     body=[pb[0]+(body[0]-pb[0])*alpha,pb[1]+(body[1]-pb[1])*alpha,bx/bm,by/bm];
+    }
+
     displayedVehicles.push({
      ...currV,
+     interp_body: body,
      interp_progress: prog,
      interp_lateral: lateral,
      interp_speed: speed,
@@ -923,7 +935,8 @@ canvas:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
   setTxt('activeLanesCount', `${changingCount} xe đang chuyển làn`);
 
   const listToDraw=displayedVehicles.length?displayedVehicles:vehicles;
-  const sorted=[...listToDraw].sort((a,b)=>Number(a.is_car)-Number(b.is_car));
+  // Small vehicles first so larger bodies are drawn on top of them.
+  const sorted=[...listToDraw].sort((a,b)=>(Number(a.occupied)||1)-(Number(b.occupied)||1));
   const blinkOn=Math.floor(now/180)%2===0;
 
   for(const v of sorted){
@@ -943,7 +956,8 @@ canvas:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
     dist=(numLanes - lane - (occupied-1)/2 - 0.5)*SUBLANE_W;
    }
 
-   const point=v.interp_world||[at.point[0]+ty*dist,at.point[1]-tx*dist];
+   const point=v.interp_body?[v.interp_body[0],v.interp_body[1]]:
+    (v.interp_world||[at.point[0]+ty*dist,at.point[1]-tx*dist]);
    const p=project(point);
    vehiclePoints.push({vehicle:v,x:p.x,y:p.y});
 
@@ -967,7 +981,28 @@ canvas:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
     const fx=tx*cs-ty*sn,fy=tx*sn+ty*cs;
     const rx=fy,ry=-fx;
     const cx=point[0],cy=point[1];
-    if(v.is_car){
+    if(v.kind==='heavy'){
+     // Truck / bus: one rigid body placed by its two axles in the simulator
+     // (front axle on the path, rear axle trailing it: the tail runs inside
+     // a turn). Cab and lights at the front end, rear lights at the back.
+     const L=Number(v.length)||9.0,hh=(Number(v.width)||2.45)/2*0.9,hw=L/2;
+     let bfx=fx,bfy=fy;
+     if(v.interp_body){bfx=v.interp_body[2];bfy=v.interp_body[3];}
+     const brx=bfy,bry=-bfx;
+     pushQuadDyn(cx,cy,bfx,bfy,brx,bry,hw,hh,active?COL_HEAVY_ACT:COL_HEAVY);
+     const cab=1.0;
+     pushQuadDyn(cx+bfx*(hw-cab-0.15),cy+bfy*(hw-cab-0.15),bfx,bfy,brx,bry,cab,hh*0.82,COL_HEAVY_CAB);
+     const lw=0.22,lh=0.2,ly=hh*0.6,bc=braking?COL_BRAKE_ON:COL_BRAKE_OFF;
+     pushQuadDyn(cx+bfx*(hw-lw)+brx*ly,cy+bfy*(hw-lw)+bry*ly,bfx,bfy,brx,bry,lw,lh,COL_HEAD);
+     pushQuadDyn(cx+bfx*(hw-lw)-brx*ly,cy+bfy*(hw-lw)-bry*ly,bfx,bfy,brx,bry,lw,lh,COL_HEAD);
+     pushQuadDyn(cx-bfx*(hw-lw)+brx*ly,cy-bfy*(hw-lw)+bry*ly,bfx,bfy,brx,bry,lw,lh,bc);
+     pushQuadDyn(cx-bfx*(hw-lw)-brx*ly,cy-bfy*(hw-lw)-bry*ly,bfx,bfy,brx,bry,lw,lh,bc);
+     if(showBlinkers&&v.is_changing&&blinkOn&&(blinkerLeft||blinkerRight)){
+      const bw=0.35,bh=0.2,side=blinkerLeft?-(hh+0.12):(hh+0.12);
+      pushQuadDyn(cx+bfx*(hw-bw)+brx*side,cy+bfy*(hw-bw)+bry*side,bfx,bfy,brx,bry,bw,bh,COL_BLINK);
+      pushQuadDyn(cx-bfx*(hw-bw)+brx*side,cy-bfy*(hw-bw)+bry*side,bfx,bfy,brx,bry,bw,bh,COL_BLINK);
+     }
+    }else if(v.is_car){
      const hw=2.25,hh=0.7;
      pushQuadDyn(cx,cy,fx,fy,rx,ry,hw,hh,active?COL_CAR_ACT:COL_CAR);
      pushQuadDyn(cx+fx*0.09,cy+fy*0.09,fx,fy,rx,ry,1.08,0.53,COL_CAR_CABIN);
@@ -999,7 +1034,7 @@ canvas:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
      }
     }
     if(active){
-     const rad=v.is_car?3.1:1.7;
+     const rad=v.kind==='heavy'?(Number(v.length)||9)/2+0.8:v.is_car?3.1:1.7;
      pushRingDyn(cx,cy,rad-0.25,rad,20,COL_WHITE);
     }
     if(labelsOut&&(cam.zoom>=3.8||active)&&(v.is_car||cam.zoom>=5.2||active)){
@@ -1012,8 +1047,33 @@ canvas:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
    // Canvas 2D fallback (zero shadowBlur)
    ctx.save();
    ctx.translate(p.x,p.y);
-   ctx.rotate(Math.atan2(-ty,tx)-steerAngle);
-   if(v.is_car){
+   if(v.kind==='heavy'&&v.interp_body) ctx.rotate(Math.atan2(-v.interp_body[3],v.interp_body[2]));
+   else ctx.rotate(Math.atan2(-ty,tx)-steerAngle);
+   if(v.kind==='heavy'){
+    const bodyW=(Number(v.length)||9.0)*worldScale, bodyH=(Number(v.width)||2.45)*0.9*worldScale;
+    const lw=Math.max(1.0,bodyW*0.05), lh=Math.max(0.8,bodyH*0.18), ly=bodyH*0.12;
+    ctx.fillStyle=active?'#dcc7ff':'#b48cff';
+    ctx.beginPath();
+    if(ctx.roundRect) ctx.roundRect(-bodyW/2, -bodyH/2, bodyW, bodyH, Math.min(3,bodyH*0.15));
+    else ctx.rect(-bodyW/2, -bodyH/2, bodyW, bodyH);
+    ctx.fill();
+    ctx.strokeStyle='#4a3378';ctx.lineWidth=Math.max(0.8,0.08*worldScale);ctx.stroke();
+    ctx.fillStyle='#4a3378';
+    ctx.fillRect(bodyW/2 - bodyW*0.13, -bodyH*0.41, bodyW*0.11, bodyH*0.82);
+    ctx.fillStyle='#fffce6';
+    ctx.fillRect(bodyW/2 - lw, -bodyH/2 + ly, lw, lh);
+    ctx.fillRect(bodyW/2 - lw, bodyH/2 - ly - lh, lw, lh);
+    ctx.fillStyle=braking?'#ff2233':'#991520';
+    ctx.fillRect(-bodyW/2, -bodyH/2 + ly, lw, lh);
+    ctx.fillRect(-bodyW/2, bodyH/2 - ly - lh, lw, lh);
+    if(showBlinkers && v.is_changing && blinkOn && (blinkerLeft||blinkerRight)){
+     ctx.fillStyle='#ffb703';
+     const bw=Math.max(1.5,bodyW*0.08), bh=Math.max(1.2,bodyH*0.2);
+     const y=blinkerLeft?-bodyH/2 - bh*0.4:bodyH/2 - bh*0.6;
+     ctx.fillRect(bodyW/2 - bw, y, bw, bh);
+     ctx.fillRect(-bodyW/2, y, bw, bh);
+    }
+   }else if(v.is_car){
     const carW=4.5*worldScale, carH=1.4*worldScale;
     const lw=Math.max(1.0,carW*0.09), lh=Math.max(0.8,carH*0.22), ly=carH*0.14;
     ctx.fillStyle=active?'#ffe4a0':'#ff9e42';
@@ -1079,7 +1139,8 @@ canvas:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
    }
    if(active){
     ctx.strokeStyle='#ffffff';ctx.lineWidth=1.5;ctx.beginPath();
-    ctx.arc(0,0,Math.max(v.is_car?10:6.5, (v.is_car?3.0:1.6)*worldScale),0,Math.PI*2);ctx.stroke();
+    const ringR=v.kind==='heavy'?(Number(v.length)||9)/2+0.7:(v.is_car?3.0:1.6);
+    ctx.arc(0,0,Math.max(v.is_car?10:6.5, ringR*worldScale),0,Math.PI*2);ctx.stroke();
    }
    ctx.restore();
 
@@ -1413,7 +1474,7 @@ canvas:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
 
  function vehicleLabel(v){
   const road=roadById.get(v.road),speed=v.speed_kmh??(v.speed==null?null:Number(v.speed)*3.6);
-  const type=v.is_car?'Ô tô':'Xe máy';
+  const type=v.kind==='heavy'?'Xe nặng':v.is_car?'Ô tô':'Xe máy';
   let roadName=road?.name||v.road||'đường —';
   if(road&&road.kind==='connector'){
    const turn=road.turn==='left'?'rẽ trái':road.turn==='right'?'rẽ phải':'đi thẳng';

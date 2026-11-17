@@ -240,8 +240,9 @@ def pet_events(data, conflict_points):
             times = []
             for m, s_point, other in ((ma, sa, mb), (mb, sb, ma)):
                 # The conflict area along this path is as wide as the other
-                # movement's occupant (car 1.7 m, motorbike 0.7 m).
-                other_hw = 0.85 if _movement_is_car(data, other) else 0.35
+                # movement's occupant (motorbike 0.7 m, car 1.7 m, heavy
+                # vehicle 2.45 m).
+                other_hw = _movement_half_width(data, other)
                 for vid, t, s, length in paths[m]:
                     crossing = _crossing_times(t, s, length, s_point, other_hw)
                     if crossing is not None:
@@ -261,9 +262,18 @@ def pet_events(data, conflict_points):
     return {key: np.asarray(value) for key, value in out.items()}
 
 
+# Half body width by sublanes occupied (lane movement ids end in ":<n>").
+_HALF_WIDTH_BY_OCCUPIED = {1: 0.35, 2: 0.85, 3: 1.225}
+
+
+def _movement_half_width(data, code):
+    occupied = int(str(data["movement_names"][code]).rsplit(":", 1)[1])
+    return _HALF_WIDTH_BY_OCCUPIED.get(occupied, 0.85)
+
+
 def _movement_is_car(data, code):
-    name = str(data["movement_names"][code])
-    return name.endswith(":2")
+    """True for a movement of a vehicle wider than a motorbike."""
+    return not str(data["movement_names"][code]).endswith(":1")
 
 
 # -------------------------------------------------------------- 2-D TTC

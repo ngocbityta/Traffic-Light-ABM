@@ -173,7 +173,10 @@ class DecideTests(unittest.TestCase):
         self.assertAlmostEqual(stop["f"][0], z.a_in - f.min_gap, places=6)
 
     def test_held_major_reclaims_after_patience(self):
-        neg = JunctionNegotiator(zmap(), NegotiationParams(impatience_base_moto=0.6))
+        # SUMO impatience semantics (gap_model="sumo"); the default logit
+        # gap model is covered in test_logit_evade_20261116.py.
+        neg = JunctionNegotiator(zmap(), NegotiationParams(impatience_base_moto=0.6,
+                                                           gap_model="sumo"))
         m = agent("m", "S_W@0:1", 8.5, 0.0, "left", "S")
         f = agent("f", "N_S@0:1", 17.0, 0.0, "through", "N", hold_time=2.5)
         z = neg.zones.zones("S_W@0:1", "N_S@0:1")[0]
@@ -183,7 +186,8 @@ class DecideTests(unittest.TestCase):
 
     def test_through_at_stop_line_is_not_forced_by_a_later_left(self):
         # SUMO: impatience only applies when the minor would arrive first.
-        neg = JunctionNegotiator(zmap(), NegotiationParams(impatience_base_moto=0.9))
+        neg = JunctionNegotiator(zmap(), NegotiationParams(impatience_base_moto=0.9,
+                                                           gap_model="sumo"))
         m = agent("m", "S_W@0:1", 2.0, 0.0, "left", "S")        # 7 m from the zone
         f = agent("f", "N_S@0:1", 17.5, 0.0, "through", "N")    # 1.6 m from the zone
         z = neg.zones.zones("S_W@0:1", "N_S@0:1")[0]

@@ -45,7 +45,7 @@ def run(simdir, seed, ticks, flow, extra):
             if road.endswith("_out") and prog > 12.0:
                 continue
             pose = sim._geometry_roads[road].pose(prog, v.current_lateral_shift)
-            kind = "car" if v.occupied == 2 else "motorbike"
+            kind = getattr(v, "kind", "car" if v.occupied == 2 else "motorbike")
             polys.append((vid, road, v, footprint(pose, kind)))
         for i in range(len(polys)):
             ia, ra, va, pa = polys[i]

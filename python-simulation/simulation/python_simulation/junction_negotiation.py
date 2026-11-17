@@ -32,8 +32,9 @@ progress; vehicles still on the approach have negative ``front`` values.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
+import zlib
 from typing import Callable, Iterable
 
 import numpy as np
@@ -143,6 +144,9 @@ class Agent:
     arm_green: bool
     wait_time: float = 0.0
     group_size: int = 1
+    # Motorcycles in its left-turn group (Vu & Shimizu 2010 grouping:
+    # members within 4 m of the next member, same movement), itself included.
+    group_moto: int = 1
     road: str = ""
     hold_time: float = 0.0  # time held by a junction stop target at low speed
     commit_time: float | None = None  # passed its wait point (SUMO conflict entry)
@@ -157,6 +161,10 @@ class Agent:
     # Pose in the plane (centre and unit heading); None when unknown.
     xy: tuple | None = None
     heading: tuple | None = None
+    # Points along the axis of a long rigid body (rear quarter, centre,
+    # front quarter) with its heading, ((x, y, tx, ty), ...); None for cars
+    # and motorbikes.
+    units: tuple | None = None
 
     @property
     def back(self):
@@ -197,8 +205,9 @@ class NegotiationParams:
     # (s) before it pushes into the conflict zone itself.
     reclaim_after_car: float = 3.0
     reclaim_after_moto: float = 2.0
-    # Longitudinal bunching (m) for a follower to join a crossing group.
-    group_gap: float = 2.5
+    # Longitudinal bunching (m) for a follower to join a crossing group:
+    # Vu & Shimizu (2010) l0 = 4 m to the nearest member.
+    group_gap: float = 4.0
     # Storage for minors waiting inside the junction, per approach, in
     # motorbike equivalents (car = 2). Further minors wait at the stop line.
     wait_storage: int = 10**6
@@ -218,6 +227,53 @@ class NegotiationParams:
     # longest-held vehicle is released to squeeze through (nhich qua): it
     # creeps forward under the body-overlap guard only.
     squeeze_after: float = 8.0
+    # Gap acceptance of left turners against a green through stream.
+    # "logit": binary logit of Vu & Shimizu (2010), Table 1, separate for
+    # motorcycle and car leaders, one random draw per (left turner, through
+    # vehicle) gap event. "sumo": deterministic time gap + impatience (the
+    # model before 16/11/2026).
+    gap_model: str = "logit"
+    # V = b_tg * TG + b_ewt * EWT + b_mc * MC1 + b_v1 * V1 + const
+    logit_moto: tuple = (2.449, -0.045, 0.198, 0.0, -2.257)
+    logit_car: tuple = (2.887, 0.127, 0.0, 0.165, -4.225)
+    # A gap that makes the through vehicle brake is taken only if it can stop
+    # before the zone at this share of its emergency deceleration.
+    logit_force_decel_share: float = 0.6
+    # Before the decision point (comfortable stopping distance + margin) a
+    # left turner only goes on when every driver would accept the gap.
+    logit_far_gap: float = 3.0
+    decision_margin: float = 2.0
+    # Lateral evasion of a through vehicle facing a crossing left turner:
+    # "cut tail" (pass behind it) or "run in front" (pass ahead of it) by a
+    # sideways move inside the junction. Propensity per gap event of a
+    # straight-go group leader (Vu & Shimizu 2010, Fig. 6: motorcycle leaders
+    # 20 % cut tail + 5 % run in front, car leaders 5 % + 2 %). The direction
+    # is the target band needing the smallest deviation that lets the
+    # vehicle go on without stopping (Trinh et al. 2018, Eq. 3). Heading
+    # limits: motorcycles may steer within the +-30 deg direction fan of
+    # Trinh et al. (2018); cars keep the +-0.2 rad cone of Kanagaraj &
+    # Treiber (2018).
+    evade: bool = True
+    # Willingness per gap event (independent draws). The realised shares
+    # are lower: the manoeuvre must also be possible (room, timing, heading
+    # cone). Calibrated so the realised shares match Vu & Shimizu (2010).
+    evade_cut_moto: float = 1.0
+    evade_front_moto: float = 0.18
+    evade_cut_car: float = 0.65
+    evade_front_car: float = 0.12
+    # Heavy vehicles (trucks, buses) hold their path: the observations above
+    # cover motorcycle and car leaders only.
+    evade_cut_heavy: float = 0.0
+    evade_front_heavy: float = 0.0
+    # Run in front forces the left turner to give way: only if it has not
+    # committed yet and can stop with this share of its maximum braking.
+    evade_force_decel_share: float = 0.5
+    lateral_cone_moto: float = 0.5236
+    lateral_cone_car: float = 0.2
+    evade_max_sublanes: int = 3
+    evade_min_speed: float = 1.0
+    evade_leader_gap: float = 4.0
+    evade_pet: float = 0.5
 
 
 def travel_time(distance, v0, accel, vmax):
@@ -273,10 +329,20 @@ class JunctionNegotiator:
         self.stats = {k: 0 for k in (
             "in_zone", "both_in_zone", "cannot_stop", "committed", "natural",
             "mutual", "stalled_foe", "diverge", "seam_follow", "deadlock_break",
-            "minor_wait", "minor_gap", "forced", "group", "major_patience", "committed_yields", "claimed", "clearing", "weave", "box_rule")}
+            "minor_wait", "minor_gap", "forced", "group", "major_patience", "committed_yields", "claimed", "clearing", "weave", "box_rule", "conceded",
+            "cut_tail", "run_in_front", "swerve")}
         self.last_decisions: list[PairDecision] = []
         self.forced_events: list[tuple[float, str]] = []
         self._hard_held: dict[str, list] = {}
+        # Random stream id (the simulator seed) and gap events already accepted.
+        self.seed = 0
+        self._accepted: set[tuple[str, str]] = set()
+        self._seen_gaps: set[tuple[str, str]] = set()
+        # (minor vid, major vid): the minor gave way to a major that ran in
+        # front of it with an evasive move (Vu & Shimizu strategy B1).
+        self._conceded: set[tuple[str, str]] = set()
+        # (left turner vid, through vid, TG, P(accept), accepted) per decision.
+        self.gap_events: list[tuple] = []
 
     # ------------------------------------------------------------ helpers
     def impatience(self, ag: Agent):
@@ -331,13 +397,24 @@ class JunctionNegotiator:
     @staticmethod
     def apart_in_plane(a: Agent, b: Agent, margin=0.15):
         """Sideways distance between the two centres, across the heading of
-        the rear vehicle, exceeds both half widths."""
+        the rear vehicle, exceeds both half widths.
+
+        A long rigid body is tested at several points of its axis: a turning
+        truck whose centre is already well to the side can still have its
+        rear right beside a vehicle that follows it out of the same approach.
+        """
         if a.xy is None or b.xy is None or a.heading is None or b.heading is None:
             return False
-        dx, dy = b.xy[0] - a.xy[0], b.xy[1] - a.xy[1]
-        rear = a if dx * a.heading[0] + dy * a.heading[1] >= 0.0 else b
-        side = abs(dx * rear.heading[1] - dy * rear.heading[0])
-        return side >= a.half_width + b.half_width + margin
+        units_a = a.units or ((a.xy[0], a.xy[1], a.heading[0], a.heading[1]),)
+        units_b = b.units or ((b.xy[0], b.xy[1], b.heading[0], b.heading[1]),)
+        need = a.half_width + b.half_width + margin
+        for ax, ay, atx, aty in units_a:
+            for bx, by, btx, bty in units_b:
+                dx, dy = bx - ax, by - ay
+                rear = (atx, aty) if dx * atx + dy * aty >= 0.0 else (btx, bty)
+                if abs(dx * rear[1] - dy * rear[0]) < need:
+                    return False
+        return True
 
     @staticmethod
     def clearing(ag: Agent):
@@ -350,6 +427,77 @@ class JunctionNegotiator:
     @staticmethod
     def in_zone(ag: Agent, z_in, z_out):
         return ag.front > z_in and ag.back < z_out
+
+    # ------------------------------------------------------------ gap acceptance
+    def total_gap(self, m: Agent, f: Agent, z: Zone):
+        """Vu & Shimizu (2010) total gap = longitudinal gap - lateral gap (s).
+
+        Longitudinal gap: time the through vehicle needs to reach the conflict
+        (its distance over its speed; accelerating from rest when slow).
+        Lateral gap: time the left turner needs to cross and clear it.
+        """
+        dist = z.b_in - f.front
+        if f.speed >= 2.0:
+            longitudinal = max(0.0, dist) / f.speed
+        else:
+            longitudinal = self.arrival(f, z.b_in)
+        return longitudinal - self.leave(m, z.a_out)
+
+    def accept_probability(self, m: Agent, tg: float):
+        b_tg, b_ewt, b_mc, b_v1, const = (self.p.logit_moto if m.motorbike
+                                          else self.p.logit_car)
+        v = (b_tg * tg + b_ewt * m.wait_time + b_mc * m.group_moto +
+             b_v1 * m.speed + const)
+        v = max(-60.0, min(60.0, v))
+        return 1.0 / (1.0 + math.exp(-v))
+
+    def _draw(self, a: str, b: str):
+        """Uniform draw fixed per (driver, gap): independent of tick and of
+        the process hash seed."""
+        return zlib.crc32(f"{self.seed}:{a}:{b}".encode()) / 2.0 ** 32
+
+    def logit_verdict(self, m: Agent, f: Agent, z: Zone, leader, first_over,
+                      tm_in, tm_out, tf_in):
+        """Left turner ``m`` against green through vehicle ``f`` (Vu & Shimizu)."""
+        if f.stalled or (f.speed < 0.5 and
+                         any(first is not m for first in self._hard_held.get(f.vid, ()))):
+            return "ok", "forced"  # f is not coming now
+        if f.speed < 0.5 and f.hold_time > 0.0:
+            reclaim = self.p.reclaim_after_moto if f.motorbike else self.p.reclaim_after_car
+            if f.hold_time >= reclaim:
+                self.stats["major_patience"] += 1
+                return "block", "reclaim"
+        clear_ahead = tf_in >= tm_out + self.timegap(m)
+        can_brake = self.can_stop(f, z.b_in, self.p.logit_force_decel_share * f.max_decel)
+        if (leader is not None and any(g is leader for g in first_over.get(f.vid, ()))
+                and (clear_ahead or can_brake)):
+            # Assumption 1 of Vu & Shimizu: the group follows its leader.
+            return "ok", "group"
+        tg = self.total_gap(m, f, z)
+        key = (m.vid, f.vid)
+        if key not in self._accepted:
+            decision_dist = (m.speed * m.speed / (2.0 * max(m.decel, 0.1)) +
+                             m.min_gap + self.p.decision_margin)
+            if z.a_in - m.front > decision_dist:
+                # Not yet at the decision point.
+                if tg >= self.p.logit_far_gap and clear_ahead:
+                    return "ok", "ahead"
+                return "block", "approach"
+            p = self.accept_probability(m, tg)
+            accepted = self._draw(m.vid, f.vid) < p
+            if key not in self._seen_gaps:
+                # One record per gap event (the first decision), as observed
+                # in the field; later re-evaluations use the same draw.
+                self._seen_gaps.add(key)
+                self.gap_events.append((m.vid, f.vid, tg, p, accepted, m.motorbike))
+            if not accepted:
+                return "block", "gap"
+            self._accepted.add(key)
+        if clear_ahead:
+            return "ok", "ahead"
+        if can_brake:
+            return "ok", "forced"
+        return "block", "cannot_stop"
 
     # ------------------------------------------------------------ pair order
     def order_active(self, a: Agent, b: Agent, z: Zone):
@@ -521,6 +669,12 @@ class JunctionNegotiator:
         tf_in, tf_out = self.arrival(f, z.b_in), self.leave(f, z.b_out)
         if tf_out + self.follow_gap(m) <= tm_in:
             return "ok", "behind"
+        if (m.vid, f.vid) in self._conceded and not self.in_zone(m, z.a_in, z.a_out):
+            # f runs in front of m: m brakes for it like for any major.
+            return "block", "conceded"
+        if (self.p.gap_model == "logit" and m.turn == "left" and f.arm_green and
+                not self.is_minor(f) and f.commit_time is None):
+            return self.logit_verdict(m, f, z, leader, first_over, tm_in, tm_out, tf_in)
         need = tm_out + self.timegap(m)
         if tf_in >= need:
             return "ok", "ahead"
@@ -593,6 +747,10 @@ class JunctionNegotiator:
         """
         agents = list(agents)
         stop = {ag.vid: (INF, 0.0) for ag in agents}
+        live = {ag.vid for ag in agents}
+        self._accepted = {k for k in self._accepted if k[0] in live and k[1] in live}
+        self._seen_gaps = {k for k in self._seen_gaps if k[0] in live and k[1] in live}
+        self._conceded = {k for k in self._conceded if k[0] in live and k[1] in live}
         decisions = []
         edges = []  # [first, second, zones seen from second, reason]
         pending = [ag for ag in agents if not ag.passive and self.is_minor(ag)
@@ -643,6 +801,16 @@ class JunctionNegotiator:
                             lead, foll = (a, b) if a_down else (b, a)
                         else:
                             lead, foll = (a, b) if a.front >= b.front else (b, a)
+                        if ((lead.units is not None or foll.units is not None) and
+                                lead.front - lead.length / 2.0 <= foll.front):
+                            # Beside a long rigid body, not ahead of it: more
+                            # than half of the "leader" is alongside, so only
+                            # the lateral checks apply. A stop at
+                            # ``lead.back`` lay metres behind the truck's own
+                            # nose (a stop from speed in one tick). A body
+                            # mostly ahead stays a leader: across the seam
+                            # jog the two paths converge.
+                            continue
                         target = lead.back - foll.min_gap
                         if target < stop[foll.vid][0]:
                             stop[foll.vid] = (target, lead.speed)
@@ -1012,6 +1180,7 @@ class SimulatorAdapter:
             params = NegotiationParams(**params)
         self.zone_map = ZoneMap(self._sample, lateral_margin=lateral_margin)
         self.negotiator = JunctionNegotiator(self.zone_map, params)
+        self.negotiator.seed = int(getattr(sim, "seed", 0))
         self.wait: dict[int, float] = {}
         self.hold: dict[int, float] = {}
         self.commit: dict[int, float] = {}
@@ -1027,11 +1196,20 @@ class SimulatorAdapter:
         # through path has none, a tight right turn up to this bound.
         self.sweep_car = 0.75
         self.sweep_moto = 0.0
+        # Upper bound of the band widening of a two-axle heavy vehicle (m),
+        # see ``_rigid_band``.
+        self.sweep_heavy = 2.5
+        self._rigid_band_cache: dict[tuple, tuple[float, float]] = {}
         self._sweep_cache: dict[tuple[str, int], float] = {}
         self.box_clear = self.negotiator.p.box_clear
         self.filter_enabled = True
         self.filter_cooldown = 1.0
         self.filter_moves = 0
+        # Evasion bookkeeping: gap events of through leaders facing a left
+        # turner (first time seen), and manoeuvres actually performed.
+        self._evade_seen: set[tuple[str, str]] = set()
+        self.evade_gap_events = {"moto": 0, "car": 0, "heavy": 0}
+        self.evade_events: list[tuple] = []  # (time, vid, kind, motorbike, sublanes)
 
     def _sample(self, movement_id):
         if "#" in movement_id:
@@ -1042,14 +1220,67 @@ class SimulatorAdapter:
             base, spec = movement_id.split("@", 1)
             lane, occupied = (int(x) for x in spec.split(":"))
             shift = (lane + (occupied - 1) / 2.0) * 1.05
-            half_width = 0.85 if occupied == 2 else 0.35
+            half_width = self.sim._half_width_by_occupied[occupied]
         road = self.sim._geometry_roads[base]
         n = max(2, int(math.ceil(road.length / self.sample_step)) + 1)
         s = np.linspace(0.0, road.length, n)
         pts = np.array([(p.x, p.y) for p in (road.pose(float(x), shift) for x in s)])
         return PathSample(pts, s, half_width, road.length)
 
-    def _sweep(self, base, shift, length):
+    def _body_half(self, v, base, shift):
+        """Half width of the band a body sweeps on path ``base`` at ``shift``:
+        half its width plus the swing of its corners on curves."""
+        if v.occupied == 1:
+            return v.half_width + self.sweep_moto
+        if getattr(v, "wheelbase", 0.0) > 0.0:
+            return v.half_width + self._rigid_band(v, base, shift)[1]
+        return v.half_width + self._sweep(base, shift, v.length, self.sweep_car)
+
+    def _rigid_band(self, v, base, shift):
+        """(centre offset, half-width extra) of the band a two-axle rigid
+        body sweeps when its front axle follows the path at ``shift``.
+
+        On the tightest curve of the path, radius R of the front axle path,
+        the rear axle runs at sqrt(R^2 - wb^2): the body reaches
+        R - sqrt(R^2 - wb^2) inside the front axle path, and its outer front
+        corner sqrt((R_rear + w/2)^2 + (wb + fo)^2) - (R + w/2) outside it.
+        The band is shifted towards the inside of the turn by half the
+        difference and widened by half the sum (+0.1 m). Shifts grow to the
+        left, so a left (counter-clockwise) turn has its inside at +shift.
+        """
+        key = (base, int(round(shift / 0.35)), round(v.wheelbase, 2),
+               round(v.front_overhang, 2), round(v.half_width, 3))
+        cached = self._rigid_band_cache.get(key)
+        if cached is not None:
+            return cached
+        road = self.sim._geometry_roads[base]
+        step = 0.5
+        n = max(3, int(road.length / step))
+        poses = [road.pose(min(road.length, i * step), key[1] * 0.35) for i in range(n + 1)]
+        window = 8  # 4 m of reference progress
+        curvature, direction = 0.0, 1.0
+        for i in range(len(poses) - window):
+            a, b = poses[i], poses[i + window]
+            cross = a.tx * b.ty - a.ty * b.tx
+            turn = abs(math.atan2(cross, a.tx * b.tx + a.ty * b.ty))
+            arc = sum(math.hypot(poses[j + 1].x - poses[j].x, poses[j + 1].y - poses[j].y)
+                      for j in range(i, i + window))
+            if arc > 1e-6 and turn / arc > curvature:
+                curvature, direction = turn / arc, (1.0 if cross >= 0 else -1.0)
+        wb, fo, hw = v.wheelbase, v.front_overhang, v.half_width
+        if curvature < 1e-6:
+            result = (0.0, 0.1)
+        else:
+            radius = max(1.0 / curvature, wb + 0.1)
+            rear = math.sqrt(radius * radius - wb * wb)
+            inner = radius - rear
+            outer = max(0.0, math.hypot(rear + hw, wb + fo) - (radius + hw))
+            result = (direction * (inner - outer) / 2.0,
+                      min(self.sweep_heavy, (inner + outer) / 2.0 + 0.1))
+        self._rigid_band_cache[key] = result
+        return result
+
+    def _sweep(self, base, shift, length, cap=None):
         """Corner sweep of a ``length`` m rectangle centred on a path.
 
         A rectangle kept tangent to a curve of radius R leaves the centre-line
@@ -1059,7 +1290,8 @@ class SimulatorAdapter:
         constant 0.75 m used to be added to every car path, straight ones
         included, so through cars held vehicles in the next sublane.
         """
-        key = (base, int(round(shift / 0.35)), int(round(length * 10)))
+        cap = self.sweep_car if cap is None else cap
+        key = (base, int(round(shift / 0.35)), int(round(length * 10)), cap)
         cached = self._sweep_cache.get(key)
         if cached is not None:
             return cached
@@ -1078,7 +1310,7 @@ class SimulatorAdapter:
                       for j in range(i, i + window))
             if arc > 1e-6:
                 curvature = max(curvature, turn / arc)
-        sweep = min(self.sweep_car, (length / 2.0) ** 2 * curvature / 2.0 + 0.1)
+        sweep = min(cap, (length / 2.0) ** 2 * curvature / 2.0 + 0.1)
         self._sweep_cache[key] = sweep
         return sweep
 
@@ -1092,13 +1324,27 @@ class SimulatorAdapter:
         sim = self.sim
         # Body half width plus the sweep of a rectangle on a curved path
         # (front/rear corners leave the centre-line band; SUMO adds a sagitta).
-        if v.occupied == 2:
+        rigid_offset = 0.0
+        if v.occupied == 1:
+            half = self._body_half(v, base, 0.0)
+        else:
             ref = (v.current_lateral_shift if on_conn else
                    sim._continuous_seam_pose(f"{v.arm}_in", base, v.current_lateral_shift)[1])
-            half = 0.85 + self._sweep(base, ref, v.length)
-        else:
-            half = 0.35 + self.sweep_moto
-        if on_conn:
+            if getattr(v, "wheelbase", 0.0) > 0.0 and not on_conn:
+                # It will drive the sublane it is mapped to (a heavy vehicle
+                # swings out on a right turn).
+                lane = sim._mapped_lane(v, v.lane, f"{v.arm}_in", base)
+                ref = (lane + (v.occupied - 1) / 2.0) * 1.05
+            half = self._body_half(v, base, ref)
+            if getattr(v, "wheelbase", 0.0) > 0.0:
+                rigid_offset = self._rigid_band(v, base, ref)[0]
+        if on_conn and getattr(v, "evading", False) and v.lane_change_progress < 1.0:
+            # Evasive move checked when it was started: the vehicle reaches
+            # every remaining conflict already at its target shift.
+            lo = hi = v.target_lateral_shift
+        elif on_conn:
+            if getattr(v, "evading", False):
+                v.evading = False
             lo = min(v.current_lateral_shift, v.target_lateral_shift)
             hi = max(v.current_lateral_shift, v.target_lateral_shift)
         else:
@@ -1108,10 +1354,12 @@ class SimulatorAdapter:
             n_lanes = sim.roads[base]["num_lanes"]
             min_shift = (v.occupied - 1) / 2.0 * 1.05
             max_shift = (n_lanes - 1 - (v.occupied - 1) / 2.0) * 1.05
-            if min_shift - 0.05 <= shift <= max_shift + 0.05:
+            if (min_shift - 0.05 <= shift <= max_shift + 0.05 and
+                    not (getattr(v, "wheelbase", 0.0) > 0.0 and abs(shift - target) > 0.3)):
                 lo = hi = shift
             else:
                 lo, hi = min(shift, target), max(shift, target)
+        lo, hi = lo + rigid_offset, hi + rigid_offset
         q = 0.15
         centre = round((lo + hi) / 2.0 / q) * q
         extra = math.ceil(((hi - lo) / 2.0 + abs((lo + hi) / 2.0 - centre)) / 0.1) * 0.1
@@ -1187,6 +1435,8 @@ class SimulatorAdapter:
                                         max(v.current_lateral_shift, v.target_lateral_shift))
                                        if on_conn else (seam_shift, seam_shift)),
                        xy=(pose.x, pose.y), heading=(pose.tx, pose.ty),
+                       units=(sim._body_axis_points(v)
+                              if getattr(v, "wheelbase", 0.0) > 0.0 else None),
                        wait_time=self.wait[vid], road=road, hold_time=self.hold[vid],
                        commit_time=self.commit.get(vid), passive=passive,
                        stalled=(v.speed < 0.5 and v.leading_distance < max(0.5, v.gap) + 1.5))
@@ -1209,6 +1459,21 @@ class SimulatorAdapter:
                 ag.group_size = 1 + sum(
                     1 for other in members[i + 1:]
                     if ag.front - other.front <= self.group_window and other.speed < 4.0)
+            # Vu & Shimizu (2010) group: a vehicle joins when it is within
+            # l0 of the nearest member (bumper gap) and moves the same way
+            # (same connector). MC1 counts the motorcycles of the group.
+            chain, chains = [], []
+            for ag in members:
+                if chain and min(other.back for other in chain) - ag.front > self.negotiator.p.group_gap:
+                    chains.append(chain)
+                    chain = []
+                chain.append(ag)
+            if chain:
+                chains.append(chain)
+            for chain in chains:
+                motos = sum(1 for other in chain if other.motorbike)
+                for ag in chain:
+                    ag.group_moto = max(1, motos)
         for ag in agents:
             vid = int(ag.vid)
             if ag.on_junction and not ag.arm_green and vid not in self.commit:
@@ -1230,6 +1495,15 @@ class SimulatorAdapter:
             if (leader is None or follower is None or
                     leader.arm != follower.arm or leader.to_arm != follower.to_arm or
                     leader.position <= follower.position):
+                continue
+            if ((leader.wheelbase > 0.0 or follower.wheelbase > 0.0) and
+                    leader.position <= follower.position + follower.length / 2.0):
+                # Beside a long body, not ahead of it: with a 9 m truck the
+                # centres say little about order. When the other centre is
+                # still alongside the truck, the truck's band envelope
+                # touches the other body's band, the bodies do not (lateral
+                # checks keep them apart). Taking its rear as the stop put
+                # the stop metres behind the truck's own nose.
                 continue
             stopping_front = (leader.position - leader.length / 2.0 -
                               follower.gap)
@@ -1297,7 +1571,9 @@ class SimulatorAdapter:
         storage = {}
         for ag in agents:
             if ag.on_junction and ag.turn == "left" and ag.commit_time is None:
-                storage[ag.arm] = storage.get(ag.arm, 0) + (1 if ag.motorbike else 2)
+                # Motorbike equivalents: a car counts 2, a 9 m heavy vehicle 4.
+                storage[ag.arm] = storage.get(ag.arm, 0) + (
+                    1 if ag.motorbike else max(2, int(round(ag.length / 2.25))))
         for ag in agents:
             v = by_vid[ag.vid]
             s, obstacle_speed = stop[ag.vid]
@@ -1329,7 +1605,24 @@ class SimulatorAdapter:
             # a tick or two while its leader pulled away (stop-and-go
             # discharge and one-tick stops from crawl speed).
             following = obstacle_speed > 0.5 and ag.vid in seam_followers
-            if ((s > self.creep_min or not math.isfinite(s) or following)
+            # A truck or bus granted entry a moment ago cannot always stop
+            # on the line when the grant is withdrawn (a foe enters the zone
+            # it will cross later): its hard braking is about 4.2 m/s^2
+            # (passengers standing, load), so stopping metres before the
+            # line from 3.6 m/s is not possible. It keeps its entry and
+            # brakes to the negotiator's stop point before the conflict
+            # zone instead, which it can reach (SUMO MSLink: an approaching
+            # vehicle that cannot brake in time keeps its link).
+            brake_through = False
+            if (v.wheelbase > 0.0 and v.creation_id in sim._junction_grants and
+                    v.speed > 0.5 and math.isfinite(s) and not ag.passive):
+                hard = max(4.2, 1.4 * v.decel)
+                to_line = sim._stop_position(v) - v.position
+                front = v.position + v.length / 2.0 - v.approach_end
+                brake_through = (
+                    v.speed * v.speed > 2.0 * hard * max(0.0, to_line) and
+                    s - front >= v.speed * v.speed / (2.0 * hard))
+            if brake_through or ((s > self.creep_min or not math.isfinite(s) or following)
                     and room_ok and store_ok
                     and not ag.passive and ag.vid not in blocked_by_clearing):
                 grants.add(v.creation_id)
@@ -1344,6 +1637,8 @@ class SimulatorAdapter:
                                if d.reason not in ("seam_follow", "diverge")}
         if self.filter_enabled:
             self._filter(agents, by_vid, stop, dt)
+        if self.negotiator.p.evade:
+            self._evade(agents, by_vid, stop, now)
         return stop
 
     # ------------------------------------------------------------ filtering
@@ -1396,14 +1691,14 @@ class SimulatorAdapter:
                         continue
                     olo = min(o.current_lateral_shift, o.target_lateral_shift)
                     ohi = max(o.current_lateral_shift, o.target_lateral_shift)
-                    if max(lo - ohi, olo - hi, 0.0) < 0.35 + (0.85 if o.occupied == 2 else 0.35) + 0.1:
+                    if max(lo - ohi, olo - hi, 0.0) < v.half_width + o.half_width + 0.1:
                         room = False
                         break
                 if not room:
                     continue
                 q = 0.15
                 centre = round(target / q) * q
-                cand = f"{road}#{centre:.2f}:{0.35 + self.sweep_moto + math.ceil(abs(target - centre) / 0.1) * 0.1:.2f}"
+                cand = f"{road}#{centre:.2f}:{v.half_width + self.sweep_moto + math.ceil(abs(target - centre) / 0.1) * 0.1:.2f}"
                 # the new band must get past every foe that holds the bike now
                 clear = True
                 for f in foes:
@@ -1440,3 +1735,207 @@ class SimulatorAdapter:
             dist = abs(v.target_lateral_shift - v.start_lateral_shift)
             v.lateral_duration = max(0.4, math.sqrt(6.0 * max(0.4, dist) / 2.0) * 0.6)
             self.filter_moves += 1
+
+    # ------------------------------------------------------------ evasion
+    def _target_band(self, v, road, target):
+        half = self._body_half(v, road, target)
+        q = 0.15
+        centre = round(target / q) * q
+        extra = math.ceil(abs(target - centre) / 0.1) * 0.1
+        return f"{road}#{centre:.2f}:{half + extra:.2f}"
+
+    def _evade_clear(self, alt, ego, main, agents, d_move, swept, force=False):
+        """Can ``alt`` (ego in its target band) go on without stopping?
+
+        Returns (ok, kind) with kind "cut_tail" / "run_in_front" relative to
+        the left turner ``main`` that holds ego now, or "swerve" when the new
+        band no longer meets its path at all. With ``force`` the left turner
+        ``main`` may be made to give way (kind "run_in_front_forced") if it
+        has not committed and can still brake comfortably. When not ok, kind
+        describes the blocking conflict (for diagnostics).
+        """
+        neg = self.negotiator
+        # The same margins the negotiation itself grants: a time gap to pass
+        # ahead of a vehicle, the follow gap to pass behind it.
+        ahead_gap = max(self.negotiator.p.evade_pet, neg.timegap(ego))
+        behind_gap = neg.follow_gap(ego)
+        kind = None
+        for g in agents:
+            if g is ego or g.corridor == ego.corridor or (g.passive and not g.on_junction):
+                continue
+            checks = [(alt, z) for z in self.zone_map.zones(alt.movement, g.movement)
+                      if alt.back < z.a_out and g.back < z.b_out]
+            # conflicts reached while the body is still moving sideways
+            checks += [(swept, z) for z in self.zone_map.zones(swept.movement, g.movement)
+                       if swept.back < z.a_out and g.back < z.b_out and
+                       z.a_in < ego.front + d_move]
+            # A crossing minor that has not committed, has not accepted a gap
+            # in front of ego and can still brake will yield to ego as it
+            # yields to any major (only the left turner that holds ego now
+            # is passed by timing alone).
+            yields = (g is not main and neg.is_minor(g) and g.commit_time is None and
+                      (g.vid, ego.vid) not in neg._accepted)
+            forceable = (force and g is main and g.commit_time is None and
+                         not g.passive)
+            for who, z in checks:
+                if neg.in_zone(g, z.b_in, z.b_out) and g.speed < 0.5:
+                    return False, ("stalled", g is main, g.turn, who is swept)
+                if (yields and not neg.in_zone(g, z.b_in, z.b_out) and
+                        neg.can_stop(g, z.b_in, 0.6 * g.max_decel)):
+                    continue
+                e_in, e_out = neg.arrival(who, z.a_in), neg.leave(who, z.a_out)
+                g_in, g_out = neg.arrival(g, z.b_in), neg.leave(g, z.b_out)
+                if neg.in_zone(g, z.b_in, z.b_out):
+                    g_in = 0.0
+                if e_out + ahead_gap <= g_in:
+                    side = "run_in_front"
+                elif e_in >= g_out + behind_gap:
+                    side = "cut_tail"
+                elif (forceable and not neg.in_zone(g, z.b_in, z.b_out) and
+                      neg.can_stop(g, z.b_in, self.negotiator.p.evade_force_decel_share *
+                                   g.max_decel)):
+                    side = "run_in_front_forced"
+                else:
+                    return False, ("timing", g is main, g.turn, who is swept,
+                                   neg.in_zone(g, z.b_in, z.b_out), g.speed < 0.5)
+                if g is main and who is alt:
+                    if side == "run_in_front_forced" or kind == "run_in_front_forced":
+                        kind = "run_in_front_forced"
+                    elif kind is None or kind == side:
+                        kind = side
+                    else:
+                        kind = "cut_tail"
+        if kind is None:
+            passed = any(z.b_out <= main.back for z in
+                         self.zone_map.zones(alt.movement, main.movement))
+            kind = "cut_tail" if passed else "swerve"
+        return True, kind
+
+    def _evade(self, agents, by_vid, stop, now):
+        """Cut tail / run in front for straight-go group leaders.
+
+        A through vehicle inside the junction that has to brake for a
+        crossing left turner may, with the propensity of Vu & Shimizu (2010),
+        move sideways to a band where it passes behind the left turner's tail
+        or ahead of it without stopping. Candidate bands are 1..3 sublanes
+        either side; the one needing the smallest deviation wins (maximum
+        progress along the desired direction, Trinh et al. 2018). The lateral
+        speed stays inside a heading cone (motorcycles +-30 deg as Trinh et
+        al. 2018, cars +-0.2 rad as Kanagaraj & Treiber 2018), so a slow
+        vehicle can only shift a little before the conflict.
+        """
+        sim = self.sim
+        p = self.negotiator.p
+        ag_by_vid = {ag.vid: ag for ag in agents}
+        holders = {}
+        for d in self.negotiator.last_decisions:
+            if d.reason not in ("seam_follow", "diverge"):
+                holders.setdefault(d.second, []).append(d.first)
+        live = set(ag_by_vid)
+        self._evade_seen = {k for k in self._evade_seen if k[0] in live}
+        for ag in agents:
+            if ag.turn != "through" or not ag.on_junction or ag.vid not in holders:
+                continue
+            v = by_vid[ag.vid]
+            road = v.conn_road
+            if (v.road != road or v.lane_change_progress < 1.0 or
+                    v.speed < p.evade_min_speed or v.leading_distance < p.evade_leader_gap):
+                continue
+            s_stop = stop[ag.vid][0]
+            if not math.isfinite(s_stop):
+                continue
+            if s_stop - ag.front > v.speed * v.speed / (2.0 * max(v.decel, 0.1)) + 2.0 * v.speed + 3.0:
+                continue  # not affected yet
+            mains = [ag_by_vid[f] for f in holders[ag.vid]
+                     if f in ag_by_vid and ag_by_vid[f].turn == "left"]
+            if not mains:
+                continue
+            main = min(mains, key=lambda g: abs(g.front))
+            key = (ag.vid, main.vid)
+            if key not in self._evade_seen:
+                self._evade_seen.add(key)
+                self.evade_gap_events["moto" if ag.motorbike else v.kind] += 1
+            if ag.motorbike:
+                p_cut, p_front = p.evade_cut_moto, p.evade_front_moto
+            elif v.kind == "car":
+                p_cut, p_front = p.evade_cut_car, p.evade_front_car
+            else:
+                p_cut, p_front = p.evade_cut_heavy, p.evade_front_heavy
+            draw = self.negotiator._draw
+            will_cut = draw("cut:" + ag.vid, main.vid) < p_cut
+            will_front = draw("front:" + ag.vid, main.vid) < p_front
+            if not (will_cut or will_front):
+                continue
+            allowed = set()
+            if will_cut:
+                allowed |= {"cut_tail", "swerve"}
+            if will_front:
+                allowed |= {"run_in_front", "run_in_front_forced"}
+            n_lanes = sim.roads[road]["num_lanes"]
+            cur = v.current_lateral_shift
+            lat_cap = 1.75 if v.occupied == 1 else 0.9
+            cone = p.lateral_cone_moto if v.occupied == 1 else p.lateral_cone_car
+            lat_speed = min(lat_cap, v.speed * math.tan(cone))
+            prog = v.position - v.approach_end
+            best = None
+            for k in range(1, p.evade_max_sublanes + 1):
+                for dl in (k, -k):
+                    lane = v.lane + dl
+                    if not 0 <= lane <= n_lanes - v.occupied:
+                        continue
+                    target = (lane + (v.occupied - 1) / 2.0) * 1.05
+                    dist = abs(target - cur)
+                    # Bezier lateral profile: peak rate 1.5 x mean rate.
+                    duration = max(0.4, 1.5 * dist / max(lat_speed, 1e-6))
+                    d_move = v.speed * duration
+                    lo, hi = min(cur, target), max(cur, target)
+                    room = True
+                    for o in sim.vehicles:
+                        if o is v or o.road != road:
+                            continue
+                        op = o.position - o.approach_end
+                        ahead = op - prog
+                        behind_reach = 1.0 + max(0.0, o.speed - v.speed) * duration
+                        if not (-behind_reach - (o.length + v.length) / 2 < ahead <
+                                d_move + 2.0 + (o.length + v.length) / 2):
+                            continue
+                        olo = min(o.current_lateral_shift, o.target_lateral_shift)
+                        ohi = max(o.current_lateral_shift, o.target_lateral_shift)
+                        if max(lo - ohi, olo - hi, 0.0) < (sim._half_width(v) +
+                                                           sim._half_width(o) + 0.1):
+                            room = False
+                            break
+                    if not room:
+                        continue
+                    alt = replace(ag, movement=self._target_band(v, road, target),
+                                  connector_shift=target, connector_span=(target, target))
+                    q = 0.15
+                    centre = round((lo + hi) / 2.0 / q) * q
+                    extra = math.ceil(((hi - lo) / 2.0 + abs((lo + hi) / 2.0 - centre)) / 0.1) * 0.1
+                    half = (self._body_half(v, road, cur) if v.occupied > 1
+                            else v.half_width)
+                    swept = replace(ag, movement=f"{road}#{centre:.2f}:{half + extra:.2f}",
+                                    connector_shift=(lo + hi) / 2.0, connector_span=(lo, hi))
+                    ok, kind = self._evade_clear(alt, ag, main, agents, d_move, swept,
+                                                 force=will_front)
+                    if ok and kind in allowed:
+                        best = (lane, target, duration, kind, k)
+                        break
+                if best is not None:
+                    break
+            if best is None:
+                continue
+            lane, target, duration, kind, k = best
+            v.lane_change_from = v.lane
+            v.lane = lane
+            v.start_lateral_shift = cur
+            v.target_lateral_shift = target
+            v.lane_change_progress = 0.0
+            v.time_since_lane_change = 0.0
+            v.lateral_duration = duration
+            v.evading = True
+            if kind == "run_in_front_forced":
+                self.negotiator._conceded.add((main.vid, ag.vid))
+                kind = "run_in_front"
+            self.negotiator.stats[kind] = self.negotiator.stats.get(kind, 0) + 1
+            self.evade_events.append((now, v.creation_id, kind, v.occupied == 1, k))

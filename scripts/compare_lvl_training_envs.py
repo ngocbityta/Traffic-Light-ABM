@@ -38,7 +38,7 @@ async def main(args):
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     demand = output.with_name(output.stem + "_demand.csv")
-    digest = generate_demand(demand, args.seed, args.horizon)
+    digest = generate_demand(demand, args.seed, args.horizon, heavy_ratio=0.0)  # GAMA has no heavy vehicles
     source_files = (ROOT / "train/logic/lvl_env.py", ROOT / "train/logic/train.py",
                     ROOT / "python-simulation/simulation/python_simulation/python_sim.py",
                     ROOT / "python-simulation/simulation/python_simulation/demand.py",

@@ -25,10 +25,12 @@ from pathlib import Path
 import numpy as np
 
 try:
-    from .python_sim import ARMS, DT, LeVanLuongSimulator
+    from .python_sim import (ARMS, DEFAULT_VEHICLE_PARAMS, DT, VEHICLE_KINDS,
+                             LeVanLuongSimulator, kind_from_draw, occupied_sublanes)
     from .vehicle_geometry import SUBLANE_WIDTH
 except ImportError:  # flat import
-    from python_sim import ARMS, DT, LeVanLuongSimulator
+    from python_sim import (ARMS, DEFAULT_VEHICLE_PARAMS, DT, VEHICLE_KINDS,
+                            LeVanLuongSimulator, kind_from_draw, occupied_sublanes)
     from vehicle_geometry import SUBLANE_WIDTH
 
 # Parameter space: name -> (where, kind, key, low, high)
@@ -39,6 +41,9 @@ PARAMETER_SPACE = {
     "car_headway": ("vehicle", "car", "headway", 0.6, 2.0),
     "car_gap": ("vehicle", "car", "gap", 0.5, 2.5),
     "car_accel": ("vehicle", "car", "accel", 1.0, 3.5),
+    "heavy_headway": ("vehicle", "heavy", "headway", 0.8, 3.0),
+    "heavy_gap": ("vehicle", "heavy", "gap", 0.5, 3.0),
+    "heavy_accel": ("vehicle", "heavy", "accel", 0.5, 2.0),
     "reaction_delay": ("startup", None, "reaction_delay", 0.0, 2.0),
     "discharge_headway": ("startup", None, "discharge_headway", 0.2, 2.0),
 }
@@ -57,7 +62,7 @@ def params_to_kwargs(params):
 
 
 def _queue_demand(path, arm, seed, until_cycle, motorbike_ratio, p_left, p_right,
-                  per_tick=1, roads=None):
+                  per_tick=1, roads=None, heavy_ratio=0.0):
     rng = random.Random(seed)
     origin = ARMS.index(arm)
     num_lanes = roads[f"{arm}_in"]["num_lanes"]
@@ -67,14 +72,16 @@ def _queue_demand(path, arm, seed, until_cycle, motorbike_ratio, p_left, p_right
             for _ in range(per_tick):
                 draw = rng.random()
                 turn = 0 if draw < p_left else 1 if draw < p_left + p_right else 2
-                is_car = rng.random() < 1.0 - motorbike_ratio
-                lane = rng.randrange(0, num_lanes - (2 if is_car else 1) + 1)
-                speed = max(1.0, rng.gauss(50 if is_car else 40, 5))
-                writer.writerow((cycle, origin, int(is_car), speed, turn, lane))
+                kind = kind_from_draw(rng.random(), motorbike_ratio, heavy_ratio)
+                occupied = occupied_sublanes(DEFAULT_VEHICLE_PARAMS[kind]["width"])
+                lane = rng.randrange(0, num_lanes - occupied + 1)
+                params = DEFAULT_VEHICLE_PARAMS[kind]
+                speed = max(1.0, rng.gauss(params["speed_mean"], params["speed_sd"]))
+                writer.writerow((cycle, origin, VEHICLE_KINDS.index(kind), speed, turn, lane))
 
 
 def measure_discharge(seed=1, arm="SE", motorbike_ratio=0.85, p_left=0.2, p_right=0.2,
-                      fit_start=10.0, **sim_kwargs):
+                      fit_start=10.0, heavy_ratio=0.0, **sim_kwargs):
     """Saturated discharge of one approach in the first green after a full red.
 
     Vehicles arrive on ``arm`` at one per tick from t = 0 until its green
@@ -94,7 +101,7 @@ def measure_discharge(seed=1, arm="SE", motorbike_ratio=0.85, p_left=0.2, p_righ
     with tempfile.TemporaryDirectory() as tmp:
         demand = Path(tmp) / "queue.csv"
         _queue_demand(demand, arm, seed, onset - 1, motorbike_ratio, p_left, p_right,
-                      roads=probe.roads)
+                      roads=probe.roads, heavy_ratio=heavy_ratio)
         sim = LeVanLuongSimulator(seed=seed, flow_per_approach=0, demand_file=demand,
                                   **sim_kwargs)
         on_approach = set()
@@ -214,23 +221,23 @@ def _default_value(name):
 
 
 def demand_from_counts(path):
-    """Hourly flow and motorbike share per station from a count CSV.
+    """Hourly flow and vehicle shares per station from a count CSV.
 
     Expects the columns of ``train/benchmarks/gama/data/traffic_data_NT_KDT.csv``
     (motorbike, car, small_truck_bus, heavy_truck_bus, trailer, total_flow).
-    Heavier classes are counted as "car-sized" because the simulator has two
-    vehicle types.
+    Trucks, buses and trailers form the simulator's "heavy" type.
     """
     rows = []
     with Path(path).open(encoding="utf-8-sig", newline="") as stream:
         for row in csv.DictReader(stream):
             moto = float(row["motorbike"])
-            other = sum(float(row[k]) for k in ("car", "small_truck_bus",
+            heavy = sum(float(row[k]) for k in ("small_truck_bus",
                                                 "heavy_truck_bus", "trailer"))
-            total = moto + other
+            total = moto + float(row["car"]) + heavy
             rows.append({"time_slot": row["time_slot"], "station": row["station_name"],
                          "flow_veh_h": total,
-                         "motorbike_ratio": moto / total if total else float("nan")})
+                         "motorbike_ratio": moto / total if total else float("nan"),
+                         "heavy_ratio": heavy / total if total else float("nan")})
     return rows
 
 

@@ -19,7 +19,8 @@ sys.path.insert(0, str(REPO))
 PYTHON_SIM_ROOT = REPO / "python-simulation" / "simulation"
 sys.path.insert(0, str(PYTHON_SIM_ROOT))
 from python_simulation.python_sim import LeVanLuongSimulator
-from python_simulation.vehicle_geometry import Road, SUBLANE_WIDTH, footprint, polygons_overlap
+from python_simulation.vehicle_geometry import (Road, SUBLANE_WIDTH, footprint, polygons_overlap,
+                                               vehicle_size)
 
 
 def sha256(path):
@@ -89,7 +90,7 @@ def vehicle_state(v, routes):
         rid = sim_road
     except StopIteration:
         pose = route_pose
-    kind = "car" if v.occupied == 2 else "motorbike"
+    kind = getattr(v, "kind", "car" if v.occupied == 2 else "motorbike")
     return {"id": str(v.demand_row_id if v.demand_row_id >= 0 else id(v)),
             "road": rid, "sim_road": sim_road,
             "arm": v.arm, "to_arm": v.to_arm, "maneuver": v.maneuver,
@@ -208,7 +209,7 @@ def audit(seed=1, cycles=100, mode="safe", clearance=0.0, roads_path=None, deman
             p = previous.get(s["id"])
             if not p:
                 continue
-            radius = 2.25 if s["kind"] == "car" else 0.95
+            radius = {"car": 2.25, "heavy": 4.5}.get(s["kind"], 0.95)
             pa = p["pose"]
             moving.append((s, p, (min(pa.x, s["pose"].x)-radius-clearance,
                                   min(pa.y, s["pose"].y)-radius-clearance,
@@ -287,8 +288,8 @@ def _sampled_sweep(pa, a, pb, b, clearance):
         t = i / n
         xa = path_a["pose_at"](t)
         xb = path_b["pose_at"](t)
-        la, wa = (4.5, 1.7) if a["kind"] == "car" else (1.9, .7)
-        lb, wb = (4.5, 1.7) if b["kind"] == "car" else (1.9, .7)
+        la, wa = vehicle_size(a["kind"])
+        lb, wb = vehicle_size(b["kind"])
         if polygons_overlap(footprint(xa, length=la + 2*pad, width=wa + 2*pad),
                             footprint(xb, length=lb + 2*pad, width=wb + 2*pad), clearance):
             return True

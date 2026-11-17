@@ -128,7 +128,10 @@ class LeVanLuongTests(unittest.TestCase):
                     for ahead_progress, ahead in entries[index + 1:]:
                         if ahead_progress - behind_progress > 6.0:
                             break
-                        widths = sim._half_width(behind) + sim._half_width(ahead) + LATERAL_CLEARANCE
+                        # Physical widths on the path: the rigid outline of
+                        # a long body on a bend is checked against the other
+                        # bodies' polygons in test_heavy_vehicles_20261116.
+                        widths = behind.half_width + ahead.half_width + LATERAL_CLEARANCE
                         if widths - abs(behind.current_lateral_shift -
                                         ahead.current_lateral_shift) <= 0:
                             continue
@@ -588,8 +591,17 @@ class SpatialIndexEquivalenceTests(unittest.TestCase):
             finally:
                 self._road_index = saved
             checked[0] += 1
-            assert fast[0] is slow[0] and fast[2] is slow[2], (fast, slow)
             assert fast[1] == slow[1] and fast[3] == slow[3], (fast, slow)
+            # Same vehicle, unless two stand side by side at exactly the
+            # same clearance (motorbikes held by a truck's guard): then both
+            # scans are right and only their visiting order differs.
+            for one, other, gap in ((fast[0], slow[0], fast[1]),
+                                    (fast[2], slow[2], fast[3])):
+                if one is not other:
+                    assert one is not None and other is not None, (fast, slow)
+                    assert abs(self._road_state(one)[1] -
+                               self._road_state(other)[1]) < 1e-9, (fast, slow)
+                    assert one.length == other.length, (fast, slow)
             return fast
 
         sim._neighbors = checked_neighbors.__get__(sim)
