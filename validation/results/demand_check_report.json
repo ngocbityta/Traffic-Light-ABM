@@ -1,0 +1,738 @@
+{
+  "python": {
+    "params": [
+      {
+        "name": "số xe tổng (20 seed × 8000 tick × 4 nhánh)",
+        "expected": 85333.3,
+        "observed": 84989,
+        "z": -1.27,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "số xe mỗi nhánh (độ lệch lớn nhất)",
+        "expected": 21333.3,
+        "observed": {
+          "1": 21095,
+          "3": 21244,
+          "2": 21227,
+          "0": 21423
+        },
+        "z": -1.75,
+        "status": "PASS",
+        "note": "z từng nhánh: {'NE': 0.66, 'SE': -1.75, 'SW': -0.78, 'NW': -0.66}"
+      },
+      {
+        "name": "tỷ lệ loại xe: xe máy",
+        "expected": "0.850",
+        "observed": "0.8504",
+        "z": 0.32,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tỷ lệ loại xe: ô tô",
+        "expected": "0.120",
+        "observed": "0.1190",
+        "z": -0.91,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tỷ lệ loại xe: xe nặng",
+        "expected": "0.030",
+        "observed": "0.0306",
+        "z": 1.07,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "không có loại xe ngoài danh sách",
+        "expected": "{}",
+        "observed": [],
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tỷ lệ hướng rẽ: trái (mã 0)",
+        "expected": "0.200",
+        "observed": "0.1999",
+        "z": -0.1,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tỷ lệ hướng rẽ: phải (mã 1)",
+        "expected": "0.200",
+        "observed": "0.1995",
+        "z": -0.39,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tỷ lệ hướng rẽ: thẳng (mã 2)",
+        "expected": "0.600",
+        "observed": "0.6007",
+        "z": 0.4,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tốc độ trung bình xe máy (km/h)",
+        "expected": 40.0,
+        "observed": 39.991,
+        "z": -0.48,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "độ lệch chuẩn tốc độ xe máy (km/h)",
+        "expected": 5.0,
+        "observed": 5.018,
+        "z": 1.37,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tốc độ trung bình ô tô (km/h)",
+        "expected": 50.0,
+        "observed": 49.996,
+        "z": -0.08,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "độ lệch chuẩn tốc độ ô tô (km/h)",
+        "expected": 5.0,
+        "observed": 4.993,
+        "z": -0.19,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tốc độ trung bình xe nặng (km/h)",
+        "expected": 50.0,
+        "observed": 50.028,
+        "z": 0.56,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "độ lệch chuẩn tốc độ xe nặng (km/h)",
+        "expected": 2.5,
+        "observed": 2.49,
+        "z": -0.3,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tốc độ nhỏ nhất",
+        "expected": ">= 1 km/h",
+        "observed": 17.909,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      }
+    ],
+    "structure": [
+      {
+        "name": "6 cột mỗi dòng",
+        "expected": 0,
+        "observed": 0,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "cycle trong 1..8000",
+        "expected": 0,
+        "observed": 0,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "nhánh trong 0..3",
+        "expected": 0,
+        "observed": 0,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tối đa 1 xe mỗi (cycle, nhánh)",
+        "expected": 0,
+        "observed": 0,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "sắp theo (cycle, nhánh)",
+        "expected": 0,
+        "observed": 0,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "làn nằm trong giới hạn của hướng rẽ và loại xe",
+        "expected": 0,
+        "observed": 0,
+        "z": null,
+        "status": "PASS",
+        "note": "36 tổ hợp (nhánh, loại, hướng) đã gặp"
+      }
+    ],
+    "seed_data": [
+      {
+        "name": "hash hàm trả về = sha256 của file",
+        "expected": 0,
+        "observed": 0,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "read_demand đọc lại không lỗi",
+        "expected": 0,
+        "observed": 0,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "replay (horizon 300): số xe simulator tạo = số dòng CSV",
+        "expected": {
+          "12": 158,
+          "1001": 164,
+          "1002": 155
+        },
+        "observed": {
+          "12": 158,
+          "1001": 164,
+          "1002": 155
+        },
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      }
+    ]
+  },
+  "gama": {
+    "params": [
+      {
+        "name": "số xe tổng (20 seed × 8000 tick × 4 nhánh)",
+        "expected": 42666.7,
+        "observed": 42670,
+        "z": 0.02,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "số xe mỗi nhánh (độ lệch lớn nhất)",
+        "expected": 10666.7,
+        "observed": {
+          "1": 10504,
+          "2": 10658,
+          "3": 10631,
+          "0": 10877
+        },
+        "z": 2.11,
+        "status": "PASS",
+        "note": "z từng nhánh: {0: 2.11, 1: -1.63, 2: -0.09, 3: -0.36}"
+      },
+      {
+        "name": "tỷ lệ loại xe: xe máy",
+        "expected": "0.850",
+        "observed": "0.8516",
+        "z": 0.9,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tỷ lệ loại xe: ô tô",
+        "expected": "0.150",
+        "observed": "0.1484",
+        "z": -0.9,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "không có loại xe ngoài danh sách",
+        "expected": "{}",
+        "observed": [],
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tỷ lệ hướng rẽ: thẳng (mã 0)",
+        "expected": "0.600",
+        "observed": "0.5992",
+        "z": -0.33,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tỷ lệ hướng rẽ: trái (mã 1)",
+        "expected": "0.200",
+        "observed": "0.1998",
+        "z": -0.08,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tỷ lệ hướng rẽ: phải (mã 2)",
+        "expected": "0.200",
+        "observed": "0.2009",
+        "z": 0.48,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tốc độ trung bình xe máy (km/h)",
+        "expected": 40.0,
+        "observed": 40.039,
+        "z": 1.5,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "độ lệch chuẩn tốc độ xe máy (km/h)",
+        "expected": 5.0,
+        "observed": 5.014,
+        "z": 0.76,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tốc độ trung bình ô tô (km/h)",
+        "expected": 50.0,
+        "observed": 50.008,
+        "z": 0.13,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "độ lệch chuẩn tốc độ ô tô (km/h)",
+        "expected": 5.0,
+        "observed": 4.968,
+        "z": -0.71,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tốc độ nhỏ nhất",
+        "expected": ">= 1 km/h",
+        "observed": 20.8,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      }
+    ],
+    "structure": [
+      {
+        "name": "6 cột mỗi dòng",
+        "expected": 0,
+        "observed": 0,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "cycle trong 0..7999",
+        "expected": 0,
+        "observed": 0,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "nhánh trong 0..3",
+        "expected": 0,
+        "observed": 0,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "tối đa 1 xe mỗi (cycle, nhánh)",
+        "expected": 0,
+        "observed": 0,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "sắp theo (cycle, nhánh)",
+        "expected": 0,
+        "observed": 0,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "làn luôn bằng 0 (GAMA tự chọn làn)",
+        "expected": 0,
+        "observed": 0,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      }
+    ],
+    "seed_data": [
+      {
+        "name": "hash hàm trả về = sha256 của file",
+        "expected": 0,
+        "observed": 0,
+        "z": null,
+        "status": "PASS",
+        "note": ""
+      },
+      {
+        "name": "file GAMA qua read_demand của Python (thông tin)",
+        "expected": "-",
+        "observed": "bị từ chối: Demand line 1: invalid cycle, arm, or vehicle type",
+        "z": null,
+        "status": "INFO",
+        "note": "không dùng chéo"
+      }
+    ]
+  },
+  "determinism": [
+    {
+      "name": "cùng seed, sinh 2 lần trong 1 process: cùng hash",
+      "expected": "trùng",
+      "observed": "trùng",
+      "z": null,
+      "status": "PASS",
+      "note": ""
+    },
+    {
+      "name": "so hash: subprocess PYTHONHASHSEED=0 (Python 3.12.13)",
+      "expected": "trùng",
+      "observed": "trùng",
+      "z": null,
+      "status": "PASS",
+      "note": ""
+    },
+    {
+      "name": "so hash: subprocess PYTHONHASHSEED=1 (Python 3.12.13)",
+      "expected": "trùng",
+      "observed": "trùng",
+      "z": null,
+      "status": "PASS",
+      "note": ""
+    },
+    {
+      "name": "so hash: subprocess PYTHONHASHSEED=12345 (Python 3.12.13)",
+      "expected": "trùng",
+      "observed": "trùng",
+      "z": null,
+      "status": "PASS",
+      "note": ""
+    },
+    {
+      "name": "so hash: Python 3.10 (uv) (Python 3.10.20)",
+      "expected": "trùng",
+      "observed": "trùng",
+      "z": null,
+      "status": "PASS",
+      "note": ""
+    },
+    {
+      "name": "so hash: Python 3.11 (uv) (Python 3.11.15)",
+      "expected": "trùng",
+      "observed": "trùng",
+      "z": null,
+      "status": "PASS",
+      "note": ""
+    },
+    {
+      "name": "so hash: Python 3.14 (uv) (Python 3.14.9)",
+      "expected": "trùng",
+      "observed": "trùng",
+      "z": null,
+      "status": "PASS",
+      "note": ""
+    },
+    {
+      "name": "khác seed thì khác hash",
+      "expected": "8 hash khác nhau",
+      "observed": "8 hash khác nhau",
+      "z": null,
+      "status": "PASS",
+      "note": ""
+    }
+  ],
+  "hash_runs": [
+    {
+      "label": "process chính",
+      "python_version": "3.12.13",
+      "hashes": {
+        "python/1001": [
+          "a2204feacd6b5e4ed0cd3f5a90c39f01de1102c6f52d8466ee29d0bf3c0df427",
+          4299
+        ],
+        "python/1002": [
+          "58cdf7285f8b8dfeef0ab7df67a367ad218ba2eaf1994378fa9cce5ed7ff684e",
+          4246
+        ],
+        "python/10000001": [
+          "b7327108279a899ed6f0d460af817b053a3fa9c9a6c48dcaa7fecc71de354180",
+          4246
+        ],
+        "python/20000000": [
+          "49b200b6a43bed6e4e70a1fd465bfb29d7a2a0c554b5a206b9ea2e4451db4c41",
+          4361
+        ],
+        "gama/1001": [
+          "447b8bb0d6795902fcfbe1ee8646510fa9c4b8aa05d959d0720a314096d42196",
+          2164
+        ],
+        "gama/1002": [
+          "f7937b43b82049fc769bff2bb91f0543a7b86271b9751ca28a98f07f3e9f85cd",
+          2061
+        ],
+        "gama/10000001": [
+          "5176153fc07f18342f4983150b69570845f9d846a71fd4ceddd70f17e3789bd8",
+          2121
+        ],
+        "gama/20000000": [
+          "5b9692ffc48cab223b92b91d6ad5d4ac4f414702dd6c4d692cedda0df9b7d5e8",
+          2084
+        ]
+      }
+    },
+    {
+      "python_version": "3.12.13",
+      "hashes": {
+        "python/1001": [
+          "a2204feacd6b5e4ed0cd3f5a90c39f01de1102c6f52d8466ee29d0bf3c0df427",
+          4299
+        ],
+        "python/1002": [
+          "58cdf7285f8b8dfeef0ab7df67a367ad218ba2eaf1994378fa9cce5ed7ff684e",
+          4246
+        ],
+        "python/10000001": [
+          "b7327108279a899ed6f0d460af817b053a3fa9c9a6c48dcaa7fecc71de354180",
+          4246
+        ],
+        "python/20000000": [
+          "49b200b6a43bed6e4e70a1fd465bfb29d7a2a0c554b5a206b9ea2e4451db4c41",
+          4361
+        ],
+        "gama/1001": [
+          "447b8bb0d6795902fcfbe1ee8646510fa9c4b8aa05d959d0720a314096d42196",
+          2164
+        ],
+        "gama/1002": [
+          "f7937b43b82049fc769bff2bb91f0543a7b86271b9751ca28a98f07f3e9f85cd",
+          2061
+        ],
+        "gama/10000001": [
+          "5176153fc07f18342f4983150b69570845f9d846a71fd4ceddd70f17e3789bd8",
+          2121
+        ],
+        "gama/20000000": [
+          "5b9692ffc48cab223b92b91d6ad5d4ac4f414702dd6c4d692cedda0df9b7d5e8",
+          2084
+        ]
+      },
+      "label": "subprocess PYTHONHASHSEED=0"
+    },
+    {
+      "python_version": "3.12.13",
+      "hashes": {
+        "python/1001": [
+          "a2204feacd6b5e4ed0cd3f5a90c39f01de1102c6f52d8466ee29d0bf3c0df427",
+          4299
+        ],
+        "python/1002": [
+          "58cdf7285f8b8dfeef0ab7df67a367ad218ba2eaf1994378fa9cce5ed7ff684e",
+          4246
+        ],
+        "python/10000001": [
+          "b7327108279a899ed6f0d460af817b053a3fa9c9a6c48dcaa7fecc71de354180",
+          4246
+        ],
+        "python/20000000": [
+          "49b200b6a43bed6e4e70a1fd465bfb29d7a2a0c554b5a206b9ea2e4451db4c41",
+          4361
+        ],
+        "gama/1001": [
+          "447b8bb0d6795902fcfbe1ee8646510fa9c4b8aa05d959d0720a314096d42196",
+          2164
+        ],
+        "gama/1002": [
+          "f7937b43b82049fc769bff2bb91f0543a7b86271b9751ca28a98f07f3e9f85cd",
+          2061
+        ],
+        "gama/10000001": [
+          "5176153fc07f18342f4983150b69570845f9d846a71fd4ceddd70f17e3789bd8",
+          2121
+        ],
+        "gama/20000000": [
+          "5b9692ffc48cab223b92b91d6ad5d4ac4f414702dd6c4d692cedda0df9b7d5e8",
+          2084
+        ]
+      },
+      "label": "subprocess PYTHONHASHSEED=1"
+    },
+    {
+      "python_version": "3.12.13",
+      "hashes": {
+        "python/1001": [
+          "a2204feacd6b5e4ed0cd3f5a90c39f01de1102c6f52d8466ee29d0bf3c0df427",
+          4299
+        ],
+        "python/1002": [
+          "58cdf7285f8b8dfeef0ab7df67a367ad218ba2eaf1994378fa9cce5ed7ff684e",
+          4246
+        ],
+        "python/10000001": [
+          "b7327108279a899ed6f0d460af817b053a3fa9c9a6c48dcaa7fecc71de354180",
+          4246
+        ],
+        "python/20000000": [
+          "49b200b6a43bed6e4e70a1fd465bfb29d7a2a0c554b5a206b9ea2e4451db4c41",
+          4361
+        ],
+        "gama/1001": [
+          "447b8bb0d6795902fcfbe1ee8646510fa9c4b8aa05d959d0720a314096d42196",
+          2164
+        ],
+        "gama/1002": [
+          "f7937b43b82049fc769bff2bb91f0543a7b86271b9751ca28a98f07f3e9f85cd",
+          2061
+        ],
+        "gama/10000001": [
+          "5176153fc07f18342f4983150b69570845f9d846a71fd4ceddd70f17e3789bd8",
+          2121
+        ],
+        "gama/20000000": [
+          "5b9692ffc48cab223b92b91d6ad5d4ac4f414702dd6c4d692cedda0df9b7d5e8",
+          2084
+        ]
+      },
+      "label": "subprocess PYTHONHASHSEED=12345"
+    },
+    {
+      "python_version": "3.10.20",
+      "hashes": {
+        "python/1001": [
+          "a2204feacd6b5e4ed0cd3f5a90c39f01de1102c6f52d8466ee29d0bf3c0df427",
+          4299
+        ],
+        "python/1002": [
+          "58cdf7285f8b8dfeef0ab7df67a367ad218ba2eaf1994378fa9cce5ed7ff684e",
+          4246
+        ],
+        "python/10000001": [
+          "b7327108279a899ed6f0d460af817b053a3fa9c9a6c48dcaa7fecc71de354180",
+          4246
+        ],
+        "python/20000000": [
+          "49b200b6a43bed6e4e70a1fd465bfb29d7a2a0c554b5a206b9ea2e4451db4c41",
+          4361
+        ],
+        "gama/1001": [
+          "447b8bb0d6795902fcfbe1ee8646510fa9c4b8aa05d959d0720a314096d42196",
+          2164
+        ],
+        "gama/1002": [
+          "f7937b43b82049fc769bff2bb91f0543a7b86271b9751ca28a98f07f3e9f85cd",
+          2061
+        ],
+        "gama/10000001": [
+          "5176153fc07f18342f4983150b69570845f9d846a71fd4ceddd70f17e3789bd8",
+          2121
+        ],
+        "gama/20000000": [
+          "5b9692ffc48cab223b92b91d6ad5d4ac4f414702dd6c4d692cedda0df9b7d5e8",
+          2084
+        ]
+      },
+      "label": "Python 3.10 (uv)"
+    },
+    {
+      "python_version": "3.11.15",
+      "hashes": {
+        "python/1001": [
+          "a2204feacd6b5e4ed0cd3f5a90c39f01de1102c6f52d8466ee29d0bf3c0df427",
+          4299
+        ],
+        "python/1002": [
+          "58cdf7285f8b8dfeef0ab7df67a367ad218ba2eaf1994378fa9cce5ed7ff684e",
+          4246
+        ],
+        "python/10000001": [
+          "b7327108279a899ed6f0d460af817b053a3fa9c9a6c48dcaa7fecc71de354180",
+          4246
+        ],
+        "python/20000000": [
+          "49b200b6a43bed6e4e70a1fd465bfb29d7a2a0c554b5a206b9ea2e4451db4c41",
+          4361
+        ],
+        "gama/1001": [
+          "447b8bb0d6795902fcfbe1ee8646510fa9c4b8aa05d959d0720a314096d42196",
+          2164
+        ],
+        "gama/1002": [
+          "f7937b43b82049fc769bff2bb91f0543a7b86271b9751ca28a98f07f3e9f85cd",
+          2061
+        ],
+        "gama/10000001": [
+          "5176153fc07f18342f4983150b69570845f9d846a71fd4ceddd70f17e3789bd8",
+          2121
+        ],
+        "gama/20000000": [
+          "5b9692ffc48cab223b92b91d6ad5d4ac4f414702dd6c4d692cedda0df9b7d5e8",
+          2084
+        ]
+      },
+      "label": "Python 3.11 (uv)"
+    },
+    {
+      "python_version": "3.14.9",
+      "hashes": {
+        "python/1001": [
+          "a2204feacd6b5e4ed0cd3f5a90c39f01de1102c6f52d8466ee29d0bf3c0df427",
+          4299
+        ],
+        "python/1002": [
+          "58cdf7285f8b8dfeef0ab7df67a367ad218ba2eaf1994378fa9cce5ed7ff684e",
+          4246
+        ],
+        "python/10000001": [
+          "b7327108279a899ed6f0d460af817b053a3fa9c9a6c48dcaa7fecc71de354180",
+          4246
+        ],
+        "python/20000000": [
+          "49b200b6a43bed6e4e70a1fd465bfb29d7a2a0c554b5a206b9ea2e4451db4c41",
+          4361
+        ],
+        "gama/1001": [
+          "447b8bb0d6795902fcfbe1ee8646510fa9c4b8aa05d959d0720a314096d42196",
+          2164
+        ],
+        "gama/1002": [
+          "f7937b43b82049fc769bff2bb91f0543a7b86271b9751ca28a98f07f3e9f85cd",
+          2061
+        ],
+        "gama/10000001": [
+          "5176153fc07f18342f4983150b69570845f9d846a71fd4ceddd70f17e3789bd8",
+          2121
+        ],
+        "gama/20000000": [
+          "5b9692ffc48cab223b92b91d6ad5d4ac4f414702dd6c4d692cedda0df9b7d5e8",
+          2084
+        ]
+      },
+      "label": "Python 3.14 (uv)"
+    }
+  ]
+}
