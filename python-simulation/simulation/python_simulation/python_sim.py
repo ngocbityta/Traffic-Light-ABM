@@ -441,6 +441,48 @@ class LeVanLuongSimulator:
             here, s = there, s_next
         return s
 
+    def _walk_many(self, vehicle, s0, distances, step=0.5):
+        """``[self._walk(vehicle, s0, d) for d in distances]`` for distances
+        of one sign, in one pass along the path (identical arithmetic: the
+        walks only differ in where they stop)."""
+        if not (all(d >= 0 for d in distances) or all(d <= 0 for d in distances)):
+            return [self._walk(vehicle, s0, d, step) for d in distances]
+        results = [None] * len(distances)
+        pending = []
+        for k, distance in enumerate(distances):
+            if abs(distance) < 1e-9:
+                results[k] = s0
+            else:
+                pending.append((abs(distance), int(4.0 * abs(distance) / step) + 8, k))
+        if not pending:
+            return results
+        direction = 1.0 if distances[pending[0][2]] > 0 else -1.0
+        pending.sort()
+        here = self._route_pose(vehicle, s0)
+        travelled, s = 0.0, s0
+        iteration = 0
+        index = 0
+        while index < len(pending):
+            target, limit, k = pending[index]
+            if iteration >= limit:
+                results[k] = s
+                index += 1
+                continue
+            s_next = s + direction * step
+            there = self._route_pose(vehicle, s_next)
+            d = math.hypot(there.x - here.x, there.y - here.y)
+            while index < len(pending):
+                target, limit, k = pending[index]
+                if travelled + d >= target:
+                    results[k] = s + direction * step * ((target - travelled) / d if d > 1e-9 else 0.0)
+                    index += 1
+                else:
+                    break
+            travelled += d
+            here, s = there, s_next
+            iteration += 1
+        return results
+
     AXLE_STEP = 0.25  # m of front-axle travel per tractrix integration step
 
     def _axles(self, vehicle):
@@ -558,10 +600,15 @@ class LeVanLuongSimulator:
             rear_overhang = vehicle.length - vehicle.wheelbase - vehicle.front_overhang
             reach = 0.0
             # Distances behind the front axle along the body axis.
-            for back in (-vehicle.front_overhang, 0.0, vehicle.wheelbase / 2.0,
-                         vehicle.wheelbase, vehicle.wheelbase + rear_overhang):
+            backs = (-vehicle.front_overhang, 0.0, vehicle.wheelbase / 2.0,
+                     vehicle.wheelbase, vehicle.wheelbase + rear_overhang)
+            # The three walks backwards share one pass along the path.
+            walked = self._walk_many(vehicle, s_front, [-b for b in backs[2:]])
+            path_s = [self._walk(vehicle, s_front, -backs[0]),
+                      self._walk(vehicle, s_front, -backs[1])] + walked
+            for back, s_path in zip(backs, path_s):
                 ax, ay = front.x - tx * back, front.y - ty * back
-                path = self._route_pose(vehicle, self._walk(vehicle, s_front, -back))
+                path = self._route_pose(vehicle, s_path)
                 side = abs((ax - path.x) * path.ty - (ay - path.y) * path.tx)
                 reach = max(reach, side)
             vehicle.body_sweep = min(2.5, reach + 0.1) if reach > 0.05 else 0.0
@@ -611,6 +658,18 @@ class LeVanLuongSimulator:
 
     def _continuous_seam_pose(self, old_road, next_road, old_shift):
         """Return next-road progress and lateral shift at the old center point."""
+        # Pure function of the fixed road geometry: memoised.
+        key = (old_road, next_road, old_shift)
+        cache = self.__dict__.setdefault("_seam_pose_cache", {})
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        if len(cache) >= 50000:
+            cache.clear()
+        result = cache[key] = self._continuous_seam_pose_uncached(old_road, next_road, old_shift)
+        return result
+
+    def _continuous_seam_pose_uncached(self, old_road, next_road, old_shift):
         old, new = self._geometry_roads[old_road], self._geometry_roads[next_road]
         before = old.pose(old.length, old_shift)
         origin = new.pose(0.0, new.num_lanes * SUBLANE_WIDTH - SUBLANE_WIDTH / 2.0)
@@ -1772,11 +1831,19 @@ class LeVanLuongSimulator:
                                 (self.green_lvl, self.green_hdt, self.all_red),
                                 self.cycle)
                             break
+        # Vehicles grouped by destination arm for ``_destination_has_room``
+        # (list order kept). Membership of ``self.vehicles`` does not change
+        # until the end of this method.
+        dest_groups = {}
+        for item in self.vehicles:
+            dest_groups.setdefault(item.to_arm, []).append(item)
         if self.mode == "safe":
             if self._negotiation is not None:
+                self._dest_groups = dest_groups
                 self._negotiation.step(DT)
             else:
                 self._reserve_junction()
+        self._dest_groups = dest_groups
         for vehicle in self.vehicles:
             pending_entry = self.mode == "gama_2025_6_4" and not vehicle.gama_entered
             if pending_entry:
@@ -1791,11 +1858,17 @@ class LeVanLuongSimulator:
             max_lane = max(0, self.roads[road]["num_lanes"] - vehicle.occupied)
             if vehicle.lane > max_lane:
                 vehicle.lane = max_lane
-            entry = (progress, id(vehicle), vehicle)
+            entry = (progress, vehicle.creation_id, vehicle)
             for sub in self._footprint(vehicle):
                 bisect.insort(lane_maps[road][sub], entry)
         survivors = []
         moved_ids = set()
+        # Same-approach candidates for the seam-following scan below, in
+        # ``self.vehicles`` order (the list itself is not changed until the
+        # tick ends, see ``self.vehicles = survivors``).
+        vehicles_by_arm = {}
+        for item in self.vehicles:
+            vehicles_by_arm.setdefault(item.arm, []).append(item)
         for vehicle in self.vehicles:
             moved_ids.add(id(vehicle))
             old_road, old_progress = self._neighbor_road_state[id(vehicle)]
@@ -1856,9 +1929,14 @@ class LeVanLuongSimulator:
                 survivors.append(vehicle)
                 continue
 
+            self._neighbors_reuse = None
             lane_decision = self._choose_lane(vehicle, lane_maps)
             move_lane = vehicle.lane
-            leader, gap, _, _ = self._neighbors(vehicle, vehicle.lane, lane_maps)
+            reuse = self._neighbors_reuse
+            if reuse is not None and reuse[0] is vehicle and reuse[1] == vehicle.lane:
+                leader, gap, _, _ = reuse[2]
+            else:
+                leader, gap, _, _ = self._neighbors(vehicle, vehicle.lane, lane_maps)
             if self.mode == "safe":
                 lane_centre = (vehicle.lane + (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
                 if abs(vehicle.current_lateral_shift - lane_centre) > 1e-6:
@@ -1881,7 +1959,7 @@ class LeVanLuongSimulator:
                 # share the first metres of the junction and only diverge
                 # after their bodies have cleared one another.
                 own_pose = None
-                for ahead in self.vehicles:
+                for ahead in vehicles_by_arm[vehicle.arm]:
                     if (ahead is vehicle or ahead.arm != vehicle.arm or
                             ahead.position <= vehicle.position or
                             ahead.position - vehicle.position > 40.0 or
@@ -2010,7 +2088,7 @@ class LeVanLuongSimulator:
                     vehicle.lane_change_from = -1
                 vehicle.gama_entered = True
                 self._neighbor_road_state[id(vehicle)] = (old_road, old_progress)
-                spawn_entry = (old_progress, id(vehicle), vehicle)
+                spawn_entry = (old_progress, vehicle.creation_id, vehicle)
                 for sub in self._footprint(vehicle):
                     bisect.insort(lane_maps[old_road][sub], spawn_entry)
             if predicted_speed < 0:
@@ -2088,7 +2166,7 @@ class LeVanLuongSimulator:
                 remaining = min(DT, max(0.0, DT - to_boundary * scale / predicted_speed))
                 pre_transition_speed = initial_speed
                 pre_transition_lane = vehicle.lane
-                old_entry = (old_progress, id(vehicle), vehicle)
+                old_entry = (old_progress, vehicle.creation_id, vehicle)
                 for sub in self._footprint(vehicle):
                     entries = lane_maps[old_road][sub]
                     index = bisect.bisect_left(entries, old_entry)
@@ -2145,7 +2223,7 @@ class LeVanLuongSimulator:
                     lane_maps[next_road] = self._new_road_lanes(next_road)
                 self._neighbor_road_state[id(vehicle)] = (next_road, seam_progress)
                 self._free_idm_cache.pop(id(vehicle), None)
-                new_entry = (seam_progress, id(vehicle), vehicle)
+                new_entry = (seam_progress, vehicle.creation_id, vehicle)
                 for sub in self._footprint(vehicle):
                     bisect.insort(lane_maps[next_road][sub], new_entry)
                 if self.mode == "gama_2025_6_4":
@@ -2179,14 +2257,14 @@ class LeVanLuongSimulator:
                         vehicle.road = old_road
                         vehicle.speed = 0.0
                         vehicle.lane = pre_transition_lane
-                        new_entry = (0.0, id(vehicle), vehicle)
+                        new_entry = (0.0, vehicle.creation_id, vehicle)
                         for sub in self._footprint(vehicle):
                             entries = lane_maps[next_road][sub]
                             index = bisect.bisect_left(entries, new_entry)
                             if index < len(entries) and entries[index] == new_entry:
                                 entries.pop(index)
                         self._neighbor_road_state[id(vehicle)] = (old_road, old_progress)
-                        restored_entry = (old_progress, id(vehicle), vehicle)
+                        restored_entry = (old_progress, vehicle.creation_id, vehicle)
                         for sub in self._footprint(vehicle):
                             bisect.insort(lane_maps[old_road][sub], restored_entry)
                         survivors.append(vehicle)
@@ -2219,14 +2297,14 @@ class LeVanLuongSimulator:
                     vehicle.speed = min(vehicle.speed, max(
                         0.0, 2.0 * new_distance * new_scale / remaining - crossing_speed))
                 vehicle.position += max(0.0, new_distance)
-                curr_entry = (seam_progress, id(vehicle), vehicle)
+                curr_entry = (seam_progress, vehicle.creation_id, vehicle)
                 for sub in self._footprint(vehicle):
                     entries = lane_maps[next_road][sub]
                     index = bisect.bisect_left(entries, curr_entry)
                     if index < len(entries) and entries[index] == curr_entry:
                         entries.pop(index)
                 final_progress = seam_progress + new_distance
-                final_entry = (final_progress, id(vehicle), vehicle)
+                final_entry = (final_progress, vehicle.creation_id, vehicle)
                 for sub in self._footprint(vehicle):
                     bisect.insort(lane_maps[next_road][sub], final_entry)
                 self._neighbor_road_state[id(vehicle)] = (next_road, final_progress)
@@ -2243,7 +2321,7 @@ class LeVanLuongSimulator:
                     vehicle.position = max(hold_from, stop_position)
                     vehicle.speed = 0.0
                 self._free_idm_cache.pop(id(vehicle), None)
-                old_entry = (old_progress, id(vehicle), vehicle)
+                old_entry = (old_progress, vehicle.creation_id, vehicle)
                 for sub in self._footprint(vehicle):
                     entries = lane_maps[old_road][sub]
                     index = bisect.bisect_left(entries, old_entry)
@@ -2263,7 +2341,7 @@ class LeVanLuongSimulator:
                 self._neighbor_road_state[id(vehicle)] = (new_road, new_progress)
                 if new_road not in lane_maps:
                     lane_maps[new_road] = self._new_road_lanes(new_road)
-                new_entry = (new_progress, id(vehicle), vehicle)
+                new_entry = (new_progress, vehicle.creation_id, vehicle)
                 for sub in self._footprint(vehicle):
                     bisect.insort(lane_maps[new_road][sub], new_entry)
             if vehicle.position >= vehicle.route_end - 0.01:
@@ -2417,6 +2495,7 @@ class LeVanLuongSimulator:
                     vehicle.junction_standstill = 0.0
                 kept.append(vehicle)
             survivors = kept
+        self._dest_groups = None
         self.vehicles = survivors
         # The index is only valid inside this tick's movement pass.
         self._road_index = None
@@ -2640,12 +2719,16 @@ class LeVanLuongSimulator:
                 max(20.0, vehicle.speed * (vehicle.lateral_duration + DT) + 5.0)):
             vehicle.time_since_lane_change += DT
             return
-        old_leader, old_gap, old_follower, _ = self._neighbors(
-            vehicle, vehicle.lane, lane_maps)
+        old_result = self._neighbors(vehicle, vehicle.lane, lane_maps)
+        old_leader, old_gap, old_follower, _ = old_result
+        # On the early returns below nothing the query depends on changes,
+        # so ``_move`` reuses this result for its own query of the same lane.
+        reuse = (vehicle, vehicle.lane, old_result)
         overlap = old_gap < 0
         if (not mandatory and not queue_filter and not overlap and
                 old_gap < vehicle.gap + vehicle.speed * vehicle.headway):
             vehicle.time_since_lane_change += DT
+            self._neighbors_reuse = reuse
             return
         if not overlap and not mandatory and not queue_filter:
             if (old_gap > max(25.0, vehicle.speed * 3.0) or
@@ -2655,11 +2738,13 @@ class LeVanLuongSimulator:
                 vehicle.time_since_lane_change += DT
                 vehicle.leading_distance = old_gap
                 vehicle.leading_speed = old_leader.speed if old_leader else 0.0
+                self._neighbors_reuse = reuse
                 return
         if not overlap and vehicle.time_since_lane_change < (0.8 if mandatory or queue_filter else 4.0):
             vehicle.time_since_lane_change += DT
             vehicle.leading_distance = old_gap
             vehicle.leading_speed = old_leader.speed if old_leader else 0.0
+            self._neighbors_reuse = reuse
             return
         old_leader_speed = old_leader.speed if old_leader else 0.0
         old_acc = (-sys.float_info.max if overlap else
@@ -2779,7 +2864,7 @@ class LeVanLuongSimulator:
                 best_leader, best_front_gap = leader, front_gap
         if best_lane != vehicle.lane:
             vehicle.lane_change_from = vehicle.lane
-            entry = (progress, id(vehicle), vehicle)
+            entry = (progress, vehicle.creation_id, vehicle)
             for sub in self._footprint(vehicle):
                 entries = lane_maps[road][sub]
                 index = bisect.bisect_left(entries, entry)
@@ -2870,7 +2955,7 @@ class LeVanLuongSimulator:
         vehicle.time_since_lane_change = result.time_since_lane_change
         if result.lane != vehicle.lane and vehicle.gama_entered:
             old_lane = vehicle.lane
-            entry = (progress, id(vehicle), vehicle)
+            entry = (progress, vehicle.creation_id, vehicle)
             for sub in range(old_lane, old_lane + vehicle.occupied):
                 entries = lane_maps[road][sub]
                 index = bisect.bisect_left(entries, entry)
@@ -3011,24 +3096,66 @@ class LeVanLuongSimulator:
             else:
                 # Outward scans in progress order; stop once even the longest
                 # vehicle could not beat the best gap found (+ margin).
+                # ``consider`` and ``offer`` are inlined in the two scans
+                # (same arithmetic, same order): they ran ~2,000 times a tick.
                 entries = road_index.entries
                 start = bisect.bisect_left(entries, (position - INDEX_MARGIN, -1))
+                road_state = self._road_state
+                v_half, v_sweep, v_length = vehicle.half_width, vehicle.body_sweep, vehicle.length
                 for k in range(start, len(entries)):
                     p_other, _, other = entries[k]
                     if p_other - position - reach_len >= front + INDEX_MARGIN:
                         break
-                    if other is not vehicle:
-                        delta = consider(other)
-                        if delta is not None:
-                            offer(other, delta)
+                    if other is vehicle:
+                        continue
+                    other_road, other_position = road_state(other)
+                    if other_road != road:
+                        continue
+                    reach = v_half + other.half_width + LATERAL_CLEARANCE
+                    pair_length = (v_length + other.length) / 2
+                    if v_sweep or other.body_sweep:
+                        if abs(other_position - position) >= pair_length:
+                            reach += v_sweep + other.body_sweep
+                    if abs(candidate_shift - other.current_lateral_shift) >= reach:
+                        if not (other_position - position >= pair_length
+                                and abs(candidate_shift - other.merge_claim_shift) < reach):
+                            continue
+                    delta = other_position - position
+                    if delta >= 0:
+                        gap = delta - pair_length
+                        if gap < front:
+                            leader, front = other, gap
+                    else:
+                        gap = -delta - pair_length
+                        if gap < back:
+                            follower, back = other, gap
                 for k in range(start - 1, -1, -1):
                     p_other, _, other = entries[k]
                     if position - p_other - reach_len >= back + INDEX_MARGIN:
                         break
-                    if other is not vehicle:
-                        delta = consider(other)
-                        if delta is not None:
-                            offer(other, delta)
+                    if other is vehicle:
+                        continue
+                    other_road, other_position = road_state(other)
+                    if other_road != road:
+                        continue
+                    reach = v_half + other.half_width + LATERAL_CLEARANCE
+                    pair_length = (v_length + other.length) / 2
+                    if v_sweep or other.body_sweep:
+                        if abs(other_position - position) >= pair_length:
+                            reach += v_sweep + other.body_sweep
+                    if abs(candidate_shift - other.current_lateral_shift) >= reach:
+                        if not (other_position - position >= pair_length
+                                and abs(candidate_shift - other.merge_claim_shift) < reach):
+                            continue
+                    delta = other_position - position
+                    if delta >= 0:
+                        gap = delta - pair_length
+                        if gap < front:
+                            leader, front = other, gap
+                    else:
+                        gap = -delta - pair_length
+                        if gap < back:
+                            follower, back = other, gap
                 pool = self._exited_this_tick
             for other in pool:
                 if other is not vehicle:

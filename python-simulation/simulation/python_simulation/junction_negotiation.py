@@ -40,6 +40,8 @@ from typing import Callable, Iterable
 import numpy as np
 
 TURN_RANK = {"through": 0, "right": 1, "left": 2}
+# movement id -> corridor (pure function of the string; read ~10^4 times a tick)
+_CORRIDORS: dict[str, str] = {}
 INF = math.inf
 
 
@@ -77,6 +79,7 @@ class ZoneMap:
         self.lateral_margin = float(lateral_margin)
         self.split_gap = float(split_gap)
         self._cache: dict[tuple[str, str], tuple[Zone, ...]] = {}
+        self._oriented: dict[tuple[str, str], tuple[Zone, ...]] = {}
         self._samples: dict[str, PathSample] = {}
 
     def sample(self, movement):
@@ -85,13 +88,20 @@ class ZoneMap:
         return self._samples[movement]
 
     def zones(self, a: str, b: str) -> tuple[Zone, ...]:
+        # Both orientations are memoised: the swapped tuple used to be
+        # rebuilt on every call (hundreds of thousands per 1,000 ticks).
+        cached = self._oriented.get((a, b))
+        if cached is not None:
+            return cached
         if a == b:
             return ()
         key = (a, b) if a < b else (b, a)
         if key not in self._cache:
             self._cache[key] = self._compute(*key)
         zones = self._cache[key]
-        return zones if key[0] == a else tuple(z.swapped() for z in zones)
+        zones = zones if key[0] == a else tuple(z.swapped() for z in zones)
+        self._oriented[(a, b)] = zones
+        return zones
 
     def _compute(self, a, b):
         pa, pb = self.sample(a), self.sample(b)
@@ -172,7 +182,11 @@ class Agent:
 
     @property
     def corridor(self):
-        return self.movement.replace("#", "@").split("@", 1)[0]
+        movement = self.movement
+        corridor = _CORRIDORS.get(movement)
+        if corridor is None:
+            corridor = _CORRIDORS[movement] = movement.replace("#", "@").split("@", 1)[0]
+        return corridor
 
 
 @dataclass
@@ -770,9 +784,26 @@ class JunctionNegotiator:
                                  if a.back < z.a_out and b.back < z.b_out]
             return zone_cache[k]
 
+        zone_lookup = self.zones.zones
+        oriented_get = self.zones._oriented.get
+        # (corridor, passive, movement) per agent, read once per tick.
+        keys = [(ag.corridor, ag.passive, ag.movement) for ag in agents]
+        n_agents = len(agents)
         for i, a in enumerate(agents):
-            for b in agents[i + 1:]:
-                if a.corridor == b.corridor:
+            a_corridor, a_passive, a_movement = keys[i]
+            for j in range(i + 1, n_agents):
+                b_corridor, b_passive, b_movement = keys[j]
+                if a_corridor != b_corridor:
+                    if a_passive or b_passive:
+                        continue
+                    # Paths that never meet: nothing to decide (as before).
+                    met = oriented_get((a_movement, b_movement))
+                    if met is None:
+                        met = zone_lookup(a_movement, b_movement)
+                    if not met:
+                        continue
+                b = agents[j]
+                if a_corridor == b_corridor:
                     # Same connector: car following is done by the simulator
                     # on each road, but not across the stop-line seam.
                     if a.road != b.road and (a.movement == b.movement or
@@ -816,8 +847,6 @@ class JunctionNegotiator:
                             stop[foll.vid] = (target, lead.speed)
                         self.stats["seam_follow"] += 1
                         decisions.append(PairDecision(lead.vid, foll.vid, None, "seam_follow"))
-                    continue
-                if a.passive or b.passive:
                     continue
                 zones = uncleared(a, b)
                 if not zones:
@@ -934,8 +963,11 @@ class JunctionNegotiator:
         claimed = []      # (minor, zones on its path it may enter this tick)
         for m in sorted(pending, key=lambda g: -g.front):
             items = []  # (zone on m's path, foe)
+            m_corridor, m_arm, m_movement = m.corridor, m.arm, m.movement
             for f in active + [c for c, _ in claimed]:
-                if f is m or f.corridor == m.corridor or f.arm == m.arm:
+                if f is m or f.corridor == m_corridor or f.arm == m_arm:
+                    continue
+                if not zone_lookup(m_movement, f.movement):
                     continue
                 for q in uncleared(m, f):
                     items.append((q, f))
@@ -1455,19 +1487,27 @@ class SimulatorAdapter:
             groups.setdefault((ag.arm, ag.corridor), []).append(ag)
         for members in groups.values():
             members.sort(key=lambda g: -g.front)
+            slow_prefix = [0]
+            for ag in members:
+                slow_prefix.append(slow_prefix[-1] + (ag.speed < 4.0))
+            end = 1
             for i, ag in enumerate(members):
-                ag.group_size = 1 + sum(
-                    1 for other in members[i + 1:]
-                    if ag.front - other.front <= self.group_window and other.speed < 4.0)
+                end = max(end, i + 1)
+                while end < len(members) and ag.front - members[end].front <= self.group_window:
+                    end += 1
+                ag.group_size = 1 + slow_prefix[end] - slow_prefix[i + 1]
             # Vu & Shimizu (2010) group: a vehicle joins when it is within
             # l0 of the nearest member (bumper gap) and moves the same way
             # (same connector). MC1 counts the motorcycles of the group.
             chain, chains = [], []
+            min_back = math.inf
             for ag in members:
-                if chain and min(other.back for other in chain) - ag.front > self.negotiator.p.group_gap:
+                if chain and min_back - ag.front > self.negotiator.p.group_gap:
                     chains.append(chain)
                     chain = []
+                    min_back = math.inf
                 chain.append(ag)
+                min_back = min(min_back, ag.back)
             if chain:
                 chains.append(chain)
             for chain in chains:

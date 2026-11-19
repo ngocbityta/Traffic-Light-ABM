@@ -1,0 +1,11 @@
+{
+ "flow_per_approach": 1500.0,
+ "motorbike_ratio": 0.68,
+ "heavy_ratio": 0.06,
+ "p_left": 0.11,
+ "p_right": 0.14,
+ "green_lvl": 30.0,
+ "green_hdt": 44.0,
+ "all_red": 3.0,
+ "yellow": 4.0
+}

@@ -70,6 +70,14 @@ def parse_args(argv=None):
                    help="Tu khoi dong gama-server (neu chua chay)")
     p.add_argument("--workers", type=int, default=1,
                    help="Independent simulation workers; one learner merges batches in seed order")
+    p.add_argument("--rollout-mode", choices=("async", "sync"), default="async",
+                   help="Python workers: async = each worker gets a new rollout as soon as "
+                        "its last one is learned (no waiting for the slowest worker); "
+                        "sync = the previous lock-step rounds (reproducible order)")
+    p.add_argument("--replay-ratio", type=float, default=1.0,
+                   help="Gradient updates per stored transition (1.0 = previous behaviour)")
+    p.add_argument("--learner-threads", type=int, default=None,
+                   help="torch threads of the learner (default: free cores beside the workers)")
     p.add_argument("--rollout-decisions", type=int, default=16,
                    help="Decisions per worker before refreshing the shared policy (multiworker only)")
     p.add_argument("--gama-heap-mb", type=int, default=2048,
@@ -140,6 +148,8 @@ def parse_args(argv=None):
             args.validate_every <= 0 or args.checkpoint_every <= 0 or
             args.workers <= 0 or args.rollout_decisions <= 0 or args.gama_heap_mb < 512 or
             args.buffer_size < args.batch_size or args.warmup < 0 or
+            not (args.replay_ratio > 0) or
+            (args.learner_threads is not None and args.learner_threads < 1) or
             min(args.r1_ref, args.r2_ref, args.b_ref) <= 0 or
             min(args.r2_lambda, args.r3_beta, args.pressure_lambda) < 0):
         p.error("Horizon must exceed 100 cycles; total-steps and validate-every must be positive")
@@ -182,7 +192,7 @@ def parse_args(argv=None):
 
 def training_config(args):
     fields = ("algorithm", "scenario", "backend", "python_sim_mode", "episode_horizon", "max_train_seconds", "validate_every", "checkpoint_every",
-              "workers", "rollout_decisions", "gama_heap_mb", "fast_simulation", "device", "seed_base",
+              "workers", "rollout_decisions", "rollout_mode", "replay_ratio", "gama_heap_mb", "fast_simulation", "device", "seed_base",
               "validation_seed_base", "lr", "gamma",
               "reward_mode", "r1_ref", "r2_ref", "b_ref", "r2_lambda", "r3_beta",
               "pressure_lambda", "demand_mode", "max_delay_sq", "buffer_size", "warmup", "batch_size",
@@ -218,8 +228,10 @@ def training_config(args):
                   "python-simulation/simulation/python_simulation/junction_negotiation.py",
                   "python-simulation/simulation/python_simulation/sim_config.py",
                   "python-simulation/simulation/python_simulation/safe_collision_guard.py")
+    # gama-simulation/ was removed on 2026-11-16; hash only files present.
     config["code_sha256"] = {name: hashlib.sha256(
-        (REPO_DIR / name).read_bytes()).hexdigest() for name in files}
+        (REPO_DIR / name).read_bytes()).hexdigest() for name in files
+        if (REPO_DIR / name).exists()}
     return config
 
 
@@ -286,8 +298,17 @@ def spatial_kwargs(args):
                 reward_settings=reward_settings(args))
 
 
+_UPDATE_CREDIT = [0.0]
+
+
 def learn_emitted(agent, args, emitted):
     updates = emitted if args.algorithm == "rainbow" else 1
+    ratio = getattr(args, "replay_ratio", 1.0)
+    if ratio != 1.0:
+        # Fractional replay ratio: carry the remainder between calls.
+        _UPDATE_CREDIT[0] += updates * ratio
+        updates = int(_UPDATE_CREDIT[0])
+        _UPDATE_CREDIT[0] -= updates
     for _ in range(updates):
         if agent.can_update():
             agent.update()
@@ -342,6 +363,9 @@ def collect_python_rollout_process(actor_payload, args, seed, decision_limit,
     """Keep one Python simulation alive in each dedicated worker process."""
     global _PYTHON_PROCESS_ENV
     if _PYTHON_PROCESS_ENV is None:
+        # The actor evaluates one small observation per decision; torch's
+        # default (one thread per core) in every worker oversubscribes the CPU.
+        torch.set_num_threads(1)
         _PYTHON_PROCESS_ENV = LVLPythonEnv(
             model_path=args.model_path, reward_mode=args.reward_mode,
             python_sim_mode=args.python_sim_mode,
@@ -358,7 +382,9 @@ def collect_python_rollout_process(actor_payload, args, seed, decision_limit,
     result = asyncio.run(collect_rollout(
         _PYTHON_PROCESS_ENV, actor, args, seed, decision_limit, force_warmup,
         parameters=parameters, deadline=deadline, initial_state=initial_state))
-    result["sim_payload"] = pickle.dumps(_PYTHON_PROCESS_ENV.sim)
+    result["sim_payload"] = (None if result["state"]["cycle"] >= args.episode_horizon
+                             else pickle.dumps(_PYTHON_PROCESS_ENV.sim,
+                                               protocol=pickle.HIGHEST_PROTOCOL))
     return result
 
 async def amain(args):
@@ -541,7 +567,160 @@ async def amain(args):
             return (args.max_train_seconds is not None and
                     time.monotonic() - train_started >= args.max_train_seconds)
 
-        while (agent.decisions < args.total_steps and
+        if process_executors:
+            learner_threads = args.learner_threads or max(
+                1, (os.cpu_count() or 2) // 2 - args.workers)
+            torch.set_num_threads(learner_threads)
+            print(f"[Train] rollouts: {args.rollout_mode} | learner threads: {learner_threads} | "
+                  f"replay ratio: {args.replay_ratio}")
+        # Resumed workers rebuild their simulation from the checkpoint once.
+        payload_pending = [worker_states[i] is not None for i in range(args.workers)]
+
+        async def validate_and_checkpoint(completed_episode, finished):
+            """Validation and checkpoint cadence of one learned rollout."""
+            nonlocal best_validation_queue
+            marker = ""
+            if (not time_budget_reached() and
+                    ((completed_episode and
+                      episodes_done % args.validate_every == 0) or finished)):
+                normalizer = env._worst_delay_sq
+                scores = []
+                try:
+                    for validation_seed in (args.validation_seed_base + 1,
+                                            args.validation_seed_base + 2):
+                        last, _, _, _ = await evaluate_episode(
+                            env, agent, validation_seed, args.episode_horizon,
+                            DiscardSamples(), 0, collect_samples=False,
+                            parameters=episode_parameters(validation_seed))
+                        wait = (env.reward_cost_from_state(last)
+                                if args.reward_mode in ("r1", "r2", "r3", "r4")
+                                else last["queue_time_integral"])
+                        if args.reward_mode == "total_wait":
+                            wait += last["external_wait_integral"]
+                        dt = getattr(env, "step_seconds", .2 if args.scenario == "lvl" else .1)
+                        scores.append(wait / (args.episode_horizon * dt))
+                finally:
+                    env._worst_delay_sq = normalizer
+                score = sum(scores) / len(scores)
+                with open(os.path.join(outdir, "validation_log.csv"), "a", newline="") as f:
+                    csv.writer(f).writerow([episodes_done, agent.decisions, *scores, score])
+                if score < best_validation_queue:
+                    best_validation_queue = score
+                    agent.save(os.path.join(outdir, "best_weights.pt"))
+                    marker = "  <- best validation queue"
+            if (time_budget_reached() or finished or
+                    (completed_episode and
+                     episodes_done % args.checkpoint_every == 0)):
+                agent.save(os.path.join(outdir, "checkpoint.pt"))
+                save_training_snapshot()
+            return marker
+
+        async def run_async_rollouts():
+            """Each worker process gets its next rollout as soon as its last
+            one has been learned; nobody waits for the slowest simulation.
+
+            The learner runs in this process between results while the other
+            workers keep simulating. Arrival order depends on timing, so the
+            order of replay insertions is not reproducible run to run
+            (``--rollout-mode sync`` keeps the lock-step order).
+            """
+            nonlocal ep, episodes_done, next_seed
+            loop = asyncio.get_running_loop()
+            inflight = {}
+            reserved = [0]  # decisions promised to rollouts in flight
+
+            def submit(i):
+                nonlocal next_seed
+                if (agent.decisions >= args.total_steps or time_budget_reached() or
+                        (deadline is not None and deadline - time.monotonic() < 5.0)):
+                    return False
+                quota = min(args.rollout_decisions,
+                            args.total_steps - agent.decisions - reserved[0])
+                if quota <= 0:
+                    return False
+                parameters = None
+                if worker_states[i] is None:
+                    started = next_seed - args.seed_base - 1
+                    if args.episodes and started >= args.episodes:
+                        return False
+                    worker_seeds[i] = next_seed
+                    next_seed += 1
+                    parameters = episode_parameters(worker_seeds[i])
+                actor = make_actor(agent_class, agent, args,
+                                   actor_seed(worker_seeds[i], agent.decisions, i))
+                payload = worker_sim_payloads[i] if payload_pending[i] else None
+                payload_pending[i] = False
+                future = loop.run_in_executor(
+                    process_executors[i], collect_python_rollout_process,
+                    pickle.dumps(actor, protocol=pickle.HIGHEST_PROTOCOL),
+                    args, worker_seeds[i], quota,
+                    args.algorithm != "qlearning" and len(agent.buffer) < args.warmup,
+                    parameters, deadline, worker_states[i], payload)
+                inflight[future] = (i, quota)
+                reserved[0] += quota
+                return True
+
+            for i in range(args.workers):
+                submit(i)
+            try:
+                while inflight:
+                    done, _ = await asyncio.wait(
+                        list(inflight), return_when=asyncio.FIRST_COMPLETED)
+                    for future in sorted(done, key=lambda f: inflight[f][0]):
+                        i, quota = inflight.pop(future)
+                        reserved[0] -= quota
+                        item = future.result()
+                        if item["decisions"] == 0:
+                            continue
+                        ep += 1
+                        seed = item["seed"]
+                        for observation, action, reward, next_observation, seconds, mask, terminal in item["transitions"]:
+                            emitted = agent.store(observation, action, reward, next_observation, terminal,
+                                                  seconds=seconds, next_mask=mask)
+                            learn_emitted(agent, args, emitted)
+                        if args.algorithm == "rainbow":
+                            learn_emitted(agent, args, agent.finish_episode())
+                        for _ in range(item["decisions"]):
+                            agent.decay_epsilon()
+                        state = item["state"]
+                        completed_episode = state["cycle"] >= args.episode_horizon
+                        worker_states[i] = None if completed_episode else state
+                        if completed_episode:
+                            worker_seeds[i] = None
+                            episodes_done += 1
+                        worker_sim_payloads[i] = (None if completed_episode else
+                                                  item["sim_payload"])
+                        finished = (agent.decisions >= args.total_steps or
+                                    (args.episodes and episodes_done >= args.episodes))
+                        row = [ep, seed, state["cycle"], item["decisions"], round(item["reward"], 2),
+                               round(agent.eps, 4), round(agent.avg_loss, 5), agent.update_count,
+                               state["total_vehicles_passed"], state["total_vehicles_created"],
+                               state["average_waiting_time"], state["max_waiting_time"],
+                               state["average_speed"], state["average_travel_time"],
+                               state["current_queue_length"], round(item["wall"], 1),
+                               item["simulated_cycles"], int(completed_episode)]
+                        with open(log_path, "a", newline="") as f:
+                            csv.writer(f).writerow(row)
+                        marker = await validate_and_checkpoint(completed_episode, finished)
+                        print(f"[Rollout {ep:5d} | worker {i} | episode {episodes_done:4d} | "
+                              f"step {agent.decisions}/{args.total_steps}] "
+                              f"reward={item['reward']:8.1f} | decisions={item['decisions']:3d} | "
+                              f"eps={agent.eps:.3f} | loss={agent.avg_loss:.4f} | "
+                              f"passed={state['total_vehicles_passed']:3d} | "
+                              f"queue={state['current_queue_length']:2d} | "
+                              f"{item['wall']:5.1f}s{marker}", flush=True)
+                        if not finished:
+                            submit(i)
+            except BaseException:
+                for future in inflight:
+                    future.cancel()
+                raise
+
+        if process_executors and args.rollout_mode == "async":
+            await run_async_rollouts()
+
+        while (not (process_executors and args.rollout_mode == "async") and
+               agent.decisions < args.total_steps and
                (args.episodes == 0 or episodes_done < args.episodes) and
                not time_budget_reached()):
             if args.workers > 1:
@@ -577,7 +756,8 @@ async def amain(args):
                     loop = asyncio.get_running_loop()
                     tasks = [loop.run_in_executor(
                         process_executors[i], collect_python_rollout_process,
-                        pickle.dumps(actors[k]), args, worker_seeds[i], quotas[k],
+                        pickle.dumps(actors[k], protocol=pickle.HIGHEST_PROTOCOL),
+                        args, worker_seeds[i], quotas[k],
                         args.algorithm != "qlearning" and len(agent.buffer) < args.warmup,
                         episode_parameters(worker_seeds[i]) if worker_states[i] is None else None,
                         deadline, worker_states[i], worker_sim_payloads[i])

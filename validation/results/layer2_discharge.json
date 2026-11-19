@@ -1,0 +1,62 @@
+{
+ "car_only": {
+  "SE": {
+   "approach_width_m": 12.600000000000001,
+   "lanes": 3.733333333333334,
+   "saturation_flow": 4390.9046030962445,
+   "saturation_flow_sd": 576.946482091889,
+   "lost_time": 1.1517790111886121,
+   "first_10s": 11.5,
+   "seeds": [
+    1,
+    2
+   ]
+  },
+  "NW": {
+   "approach_width_m": 11.55,
+   "lanes": 3.4222222222222225,
+   "saturation_flow": 4125.967179611277,
+   "saturation_flow_sd": 91.85183833688347,
+   "lost_time": -0.8827910912155437,
+   "first_10s": 12.5,
+   "seeds": [
+    1,
+    2
+   ]
+  }
+ },
+ "hanoi_mix": {
+  "SE": {
+   "approach_width_m": 12.600000000000001,
+   "lanes": 3.733333333333334,
+   "saturation_flow": 9700.439138063775,
+   "saturation_flow_sd": 1225.374330386925,
+   "lost_time": -8.618559251417313,
+   "first_10s": 50.5,
+   "seeds": [
+    1,
+    2
+   ]
+  },
+  "NW": {
+   "approach_width_m": 11.55,
+   "lanes": 3.4222222222222225,
+   "saturation_flow": 12763.837810159286,
+   "saturation_flow_sd": 3214.720730052103,
+   "lost_time": -3.0275434361115483,
+   "first_10s": 42.5,
+   "seeds": [
+    1,
+    2
+   ]
+  }
+ },
+ "car_checks": {
+  "idm_qmax_per_column": 1851.2429079197473,
+  "idm_speed_at_qmax": 9.010840210052512,
+  "sim_per_physical_lane_mean": 1190.8874609098295,
+  "sim_per_car_column_mean": 778.5054348858148,
+  "hcm_base_per_lane": 1900.0,
+  "note": "car columns = floor(width / 2.1 m): two 1.05 m sublanes per car"
+ }
+}

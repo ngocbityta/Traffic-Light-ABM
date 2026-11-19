@@ -1,6 +1,7 @@
 """Small, dependency-free road and vehicle geometry helpers (metres, EPSG:32648)."""
 from dataclasses import dataclass
 import math
+from bisect import bisect_right
 from typing import Iterable, Sequence
 
 CAR_WIDTH, CAR_LENGTH = 1.7, 4.5
@@ -71,11 +72,32 @@ class Road:
 
     def pose(self, progress: float, lateral_shift: float = 0.0) -> Pose:
         """Return lane-center pose. lateral_shift follows observer.html's SUBLANE_WIDTH convention."""
+        # Pure function of (progress, shift); about half of the calls in a
+        # tick repeat an earlier one (Pose is immutable, so it is shared).
+        if not progress:
+            # 0.0 and -0.0 share a dict key but not Pose.progress.
+            return self._pose(progress, lateral_shift)
+        key = (progress, lateral_shift)
+        cache = self.__dict__.get("_pose_cache")
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_pose_cache", cache)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        if len(cache) >= 50000:
+            cache.clear()
+        result = cache[key] = self._pose(progress, lateral_shift)
+        return result
+
+    def _pose(self, progress: float, lateral_shift: float = 0.0) -> Pose:
         s=float(progress)
         if s < 0: i=0; t=s/self.lengths[0]
         elif s >= self.length: i=len(self.lengths)-1; t=(s-self.cumulative[i])/self.lengths[i]
         else:
-            i=next(j for j in range(len(self.lengths)) if s < self.cumulative[j+1])
+            # First segment whose end lies beyond s (cumulative is strictly
+            # increasing), found by bisection instead of a linear scan.
+            i=bisect_right(self.cumulative, s, 1)-1
             t=(s-self.cumulative[i])/self.lengths[i]
         a,b=self.points[i],self.points[i+1]; dx,dy=b[0]-a[0],b[1]-a[1]; seg=self.lengths[i]
         if self.vertex_tangents:

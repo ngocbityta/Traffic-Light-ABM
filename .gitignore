@@ -57,3 +57,13 @@ gama-simulation/simulation/models/tmp_*.gaml
 
 # Claude outputs
 Claude outputs/
+
+# validation: simulator trajectories (large, reproducible)
+validation/sim_runs/
+validation/__pycache__/
+
+# Local reports
+/reports/
+
+# Local Colab CLI checkout
+/google-colab-cli/

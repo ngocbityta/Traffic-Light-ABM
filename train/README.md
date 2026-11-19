@@ -29,3 +29,7 @@ train/venv/bin/python -m train.logic.evaluate \
 ```
 
 Các script so sánh và audit dùng chung vẫn nằm trong `scripts/` ở repo root.
+
+## Colab
+
+Mở [`colab/train_hybrid_python.ipynb`](../colab/train_hybrid_python.ipynb) để train Hybrid LVL với Python simulator trên CPU và learner trên GPU. Notebook nhúng bản mã đã dùng cho phép đo 2 giờ ngày 18/11/2026, tự chọn số worker theo CPU/RAM được cấp và đồng bộ checkpoint lên Drive. Đặt `SOURCE_ARCHIVE` hoặc `USE_GIT=True` trong notebook khi muốn train một bản mã khác.
