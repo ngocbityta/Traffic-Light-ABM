@@ -7,7 +7,6 @@ reduces but does not mathematically eliminate errors from sharp polyline bends.
 """
 import argparse
 import hashlib
-import inspect
 import json
 import math
 import sys
@@ -258,7 +257,9 @@ def audit(seed=1, cycles=100, mode="safe", clearance=0.0, roads_path=None, deman
                       "sweep": "sampled at <=0.05m route distance with half-step rectangle inflation; not a continuous proof",
                       "baseline_expectation": "Existing safe mode has not been validated for connector footprint collisions; any event is reported as a baseline violation, with no simulator correction applied",
                       "limitations": "road polylines approximate geometry; sampled sweep may miss behavior between samples or at heading discontinuities"},
-            "source_hashes": {"python_sim.py": sha256(inspect.getsourcefile(LeVanLuongSimulator)), "vehicle_geometry.py": sha256(inspect.getsourcefile(footprint)), "roads.geojson": sha256(roads_path)},
+            "source_hashes": {"python_sim.py": sha256(ROOT / "python_sim.py"),
+                              "vehicle_geometry.py": sha256(ROOT / "vehicle_geometry.py"),
+                              "roads.geojson": sha256(roads_path)},
             "demand_file_sha256": sha256(demand_file) if demand_file else None,
             "static_event_count": len(static_events), "swept_event_count": len(swept_events),
             "static_event_groups": event_groups(static_events),

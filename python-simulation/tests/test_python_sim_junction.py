@@ -68,6 +68,29 @@ class JunctionIntegrationTests(unittest.TestCase):
         blocker.current_lateral_shift = entering.current_lateral_shift
         self.assertFalse(sim._destination_has_room(entering))
 
+    def test_exit_room_updates_when_a_nose_crosses_mid_tick(self):
+        sim = self.make_sim()
+        through = self.create(sim, "SW", "through")
+        entering = self.create(sim, "SE", "right")
+        through.road = through.conn_road
+        through.position = through.connector_end - through.length / 2 - 0.05
+        through.speed = 3.0
+        self.assertTrue(sim._destination_has_room(entering))
+
+        # The through vehicle moves first. Its centre stays on the connector,
+        # but the right turner must now see the occupied exit on its own move.
+        room = []
+        choose_lane = sim._choose_lane
+        def observe(vehicle, lanes):
+            if vehicle is entering:
+                room.append(sim._destination_has_room(entering))
+            return choose_lane(vehicle, lanes)
+
+        sim._choose_lane = observe
+        sim.step()
+        self.assertEqual(through.road, through.conn_road)
+        self.assertEqual(room, [False])
+
     def test_same_connector_following_uses_idm_and_stable_creation_ids(self):
         sim = self.make_sim()
         leader = self.create(sim, "NE", "through")

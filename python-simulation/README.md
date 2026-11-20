@@ -12,6 +12,36 @@ python3 python-simulation/simulation/python_simulation/python_sim.py \
   --seed 1 --cycles 4000 --output train/results/lvl_python.csv
 ```
 
+### Tăng tốc trên CPython
+
+Để biên dịch phần di chuyển, nhường đường và hình học từ cùng mã Python, chạy
+từ thư mục gốc của repo với trình biên dịch C và môi trường Python dùng cho mô phỏng:
+
+```bash
+python3 -m pip install "Cython==3.3.1" setuptools
+python3 python-simulation/scripts/build_native.py
+```
+
+Lần khởi động kế tiếp tự dùng bản biên dịch phù hợp với mã nguồn, kiến trúc máy
+và Python hiện tại. Sau khi sửa các mô-đun này, chạy lại lệnh build. Đặt
+`LVL_PURE_PYTHON=1` để chạy đối chiếu bằng Python. Cython chỉ cần lúc build.
+
+Nếu train bằng môi trường của repo, build bằng đúng trình thông dịch đó để cả
+sáu worker nạp được extension tương ứng:
+
+```bash
+train/venv/bin/python -m pip install "Cython==3.3.1" setuptools
+train/venv/bin/python python-simulation/scripts/build_native.py
+```
+
+Đo riêng 1.000 tick với cấu hình mặc định, seed 1 và `cProfile`:
+
+```bash
+PYTHONPATH=python-simulation/simulation python3 -c 'import cProfile, pstats; from python_simulation.python_sim import LeVanLuongSimulator; sim = LeVanLuongSimulator(seed=1); p = cProfile.Profile(); p.runcall(sim.step, 1000); pstats.Stats(p).strip_dirs().sort_stats("cumtime").print_stats(10)'
+```
+
+Các hàm như `_move`, `_neighbors` và `decide` vẫn xuất hiện trong profile.
+
 ## Giao diện quan sát
 
 ```bash

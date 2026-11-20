@@ -66,6 +66,12 @@ class ZoneTests(unittest.TestCase):
         # 3 m apart, two motorbikes: no conflict -> filtering past is free.
         self.assertEqual(zmap().zones("N_S@0:1", "N_S@3:1"), ())
 
+    def test_squared_distance_for_integer_coordinates(self):
+        # Both differences fit in int8 when squared, but their sum (128) does not.
+        paths = {key: PathSample(np.array([point], dtype=np.int8), np.array([0.0]), 5.0, 0.0)
+                 for key, point in (("a", (0, 0)), ("b", (8, 8)))}
+        self.assertEqual(ZoneMap(paths.__getitem__, lateral_margin=0).zones("a", "b"), ())
+
 
 class KinematicsTests(unittest.TestCase):
     def test_travel_time(self):

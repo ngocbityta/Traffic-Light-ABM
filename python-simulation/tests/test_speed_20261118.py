@@ -9,10 +9,11 @@ import random
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from python_simulation.demand import generate_demand
 from python_simulation.junction_negotiation import Agent, ZoneMap
-from python_simulation.python_sim import LeVanLuongSimulator
+from python_simulation.python_sim import LeVanLuongSimulator, _SeamFollowIndex
 from python_simulation.sim_config import load_sim_config
 
 
@@ -24,6 +25,26 @@ def heavy_sim(ticks=300, seed=11):
     sim = LeVanLuongSimulator(seed=seed, demand_file=str(path), train_mode=True, **cfg)
     sim.step(ticks)
     return sim
+
+
+class SeamFollowIndexTests(unittest.TestCase):
+    def test_boundary_crossing_keeps_live_candidates_in_original_order(self):
+        def vehicle(road, position):
+            return SimpleNamespace(arm="NE", in_road="NE_in", conn_road="NE_SW",
+                                   out_road="SW_out", road=road, position=position)
+
+        # The follower at 80 m can see a leader at exactly 120 m.
+        vehicles = [vehicle("NE_in", 79.9), vehicle("NE_SW", 120.0),
+                    vehicle("NE_in", 100.0), vehicle("SW_out", 105.0)]
+        index = _SeamFollowIndex(vehicles)
+        self.assertEqual(index.by_arm["NE"][2], [1, 2])
+        vehicles[0].position = 81.0
+        vehicles[0].road = "NE_SW"
+        index.update(0, vehicles[0], 1)
+        self.assertEqual(index.by_arm["NE"][2], [0, 1, 2])
+        vehicles[1].road = "SW_out"
+        index.update(1, vehicles[1], 3)
+        self.assertEqual(index.by_arm["NE"][2], [0, 2])
 
 
 class LaneEntryOrderTests(unittest.TestCase):

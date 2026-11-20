@@ -4,7 +4,6 @@ Repo này hiện được chia thành ba phần chính:
 
 | Thư mục | Nội dung |
 | --- | --- |
-| [`gama-simulation/`](gama-simulation/README.md) | Mô phỏng GAMA ngã tư Lê Văn Lương – Hoàng Đạo Thúy |
 | [`python-simulation/`](python-simulation/README.md) | Mô phỏng Python độc lập và giao diện quan sát trên web |
 | [`train/`](train/README.md) | Logic huấn luyện, script, benchmark và kết quả DQN |
 | `scripts/` | Công cụ phân tích, đối chiếu và kiểm toán dùng chung |

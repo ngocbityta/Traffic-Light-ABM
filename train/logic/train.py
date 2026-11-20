@@ -10,6 +10,7 @@ import asyncio
 import concurrent.futures
 import csv
 import hashlib
+import io
 import json
 import math
 import multiprocessing
@@ -212,6 +213,8 @@ def training_config(args):
     files = files + ("train/logic/hybrid_agent.py",)
     if args.scenario == "lvl":
         files += ("train/logic/lvl_env.py", "python-simulation/simulation/python_simulation/python_sim.py",
+                  "python-simulation/simulation/python_simulation/python_sim.pxd",
+                  "python-simulation/simulation/python_simulation/_native.py",
                   "python-simulation/simulation/python_simulation/demand.py",
                   "gama-simulation/simulation/models/LeVanLuong.gaml",
                   "python-simulation/simulation/python_simulation/includes/roads.geojson",
@@ -382,10 +385,28 @@ def collect_python_rollout_process(actor_payload, args, seed, decision_limit,
     result = asyncio.run(collect_rollout(
         _PYTHON_PROCESS_ENV, actor, args, seed, decision_limit, force_warmup,
         parameters=parameters, deadline=deadline, initial_state=initial_state))
-    result["sim_payload"] = (None if result["state"]["cycle"] >= args.episode_horizon
+    result["sim_payload"] = (None if result["state"] is None or result["state"]["cycle"] >= args.episode_horizon
                              else pickle.dumps(_PYTHON_PROCESS_ENV.sim,
                                                protocol=pickle.HIGHEST_PROTOCOL))
     return result
+
+def evaluate_rainbow_worker(env, actor_bytes, seed, horizon, parameters, threads):
+    # Each validation seed owns its environment and evaluates the same frozen
+    # policy. The executor still owns its separate training environment.
+    previous = torch.get_num_threads()
+    try:
+        torch.set_num_threads(threads)
+        actor = pickle.loads(actor_bytes)
+        state, _, _, _ = asyncio.run(evaluate_episode(
+            env, actor, seed, horizon, None, 0, collect_samples=False, parameters=parameters))
+        wait = (env.reward_cost_from_state(state) if env.reward_mode in ("r1", "r2", "r3", "r4")
+                else state["queue_time_integral"])
+        if env.reward_mode == "total_wait":
+            wait += state["external_wait_integral"]
+        return wait / (horizon * env.step_seconds)
+    finally:
+        torch.set_num_threads(previous)
+
 
 async def amain(args):
     stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -514,6 +535,8 @@ async def amain(args):
         worker_states = [None] * args.workers
         worker_seeds = [None] * args.workers
         worker_sim_payloads = [None] * args.workers
+        pending_validation = None
+        validation_future = None
         if args.resume_dir:
             snapshot = torch.load(os.path.join(outdir, "training_state.pt"),
                                   map_location=agent.device, weights_only=False)
@@ -523,6 +546,13 @@ async def amain(args):
             ep = snapshot["episode"]
             next_seed = snapshot["next_seed"]
             best_validation_queue = snapshot["best_validation_queue"]
+            pending_validation = snapshot.get("pending_validation")
+            if pending_validation is not None and "best_before_validation" in snapshot:
+                # A validation newer than this checkpoint may have replaced the file.
+                best_path = Path(outdir, "best_weights.pt")
+                tmp = best_path.with_suffix(".pt.tmp")
+                tmp.write_bytes(snapshot["best_before_validation"])
+                os.replace(tmp, best_path)
             if process_executors:
                 worker_states = snapshot["worker_states"]
                 worker_seeds = snapshot["worker_seeds"]
@@ -553,6 +583,10 @@ async def amain(args):
                         "best_validation_queue": best_validation_queue,
                         "normalizers": [worker._worst_delay_sq for worker in envs],
                         "agent": agent.training_state()}
+            if pending_validation is not None:
+                snapshot["pending_validation"] = pending_validation
+                if math.isfinite(best_validation_queue):
+                    snapshot["best_before_validation"] = Path(outdir, "best_weights.pt").read_bytes()
             if process_executors:
                 snapshot.update(worker_states=worker_states,
                                 worker_seeds=worker_seeds,
@@ -576,41 +610,80 @@ async def amain(args):
         # Resumed workers rebuild their simulation from the checkpoint once.
         payload_pending = [worker_states[i] is not None for i in range(args.workers)]
 
+        def start_validation(job):
+            loop = asyncio.get_running_loop()
+            return asyncio.gather(*[
+                loop.run_in_executor(process_executors[i], evaluate_rainbow_worker, env,
+                                     job["actor"], seed, args.episode_horizon,
+                                     episode_parameters(seed), learner_threads)
+                for i, seed in enumerate((args.validation_seed_base + 1,
+                                          args.validation_seed_base + 2))
+            ])
+
+        async def finish_validation():
+            nonlocal best_validation_queue, pending_validation, validation_future
+            if validation_future is None:
+                return
+            scores = await validation_future
+            score = sum(scores) / len(scores)
+            episode, step = pending_validation["episode"], pending_validation["step"]
+            if score < best_validation_queue:
+                best_validation_queue = score
+                path = Path(outdir, "best_weights.pt")
+                tmp = path.with_suffix(".pt.tmp")
+                tmp.write_bytes(pending_validation["weights"])
+                os.replace(tmp, path)
+            with open(os.path.join(outdir, "validation_log.csv"), "a", newline="") as f:
+                csv.writer(f).writerow([episode, step, *scores, score])
+            print(f"[Validation] episode {episode} | step {step} | score {score:.4f}", flush=True)
+            pending_validation = validation_future = None
+
         async def validate_and_checkpoint(completed_episode, finished):
             """Validation and checkpoint cadence of one learned rollout."""
-            nonlocal best_validation_queue
+            nonlocal best_validation_queue, pending_validation, validation_future
+            if validation_future is not None and validation_future.done():
+                await finish_validation()
             marker = ""
             if (not time_budget_reached() and
                     ((completed_episode and
                       episodes_done % args.validate_every == 0) or finished)):
-                normalizer = env._worst_delay_sq
-                scores = []
-                try:
-                    for validation_seed in (args.validation_seed_base + 1,
-                                            args.validation_seed_base + 2):
-                        last, _, _, _ = await evaluate_episode(
-                            env, agent, validation_seed, args.episode_horizon,
-                            DiscardSamples(), 0, collect_samples=False,
-                            parameters=episode_parameters(validation_seed))
-                        wait = (env.reward_cost_from_state(last)
-                                if args.reward_mode in ("r1", "r2", "r3", "r4")
-                                else last["queue_time_integral"])
-                        if args.reward_mode == "total_wait":
-                            wait += last["external_wait_integral"]
-                        dt = getattr(env, "step_seconds", .2 if args.scenario == "lvl" else .1)
-                        scores.append(wait / (args.episode_horizon * dt))
-                finally:
-                    env._worst_delay_sq = normalizer
-                score = sum(scores) / len(scores)
-                with open(os.path.join(outdir, "validation_log.csv"), "a", newline="") as f:
-                    csv.writer(f).writerow([episodes_done, agent.decisions, *scores, score])
-                if score < best_validation_queue:
-                    best_validation_queue = score
-                    agent.save(os.path.join(outdir, "best_weights.pt"))
-                    marker = "  <- best validation queue"
-            if (time_budget_reached() or finished or
-                    (completed_episode and
-                     episodes_done % args.checkpoint_every == 0)):
+                if args.algorithm == "rainbow" and agent.device.type == "cpu":
+                    await finish_validation()
+                    weights = io.BytesIO()
+                    agent.save(weights)
+                    actor = make_actor(agent_class, agent, args, args.validation_seed_base)
+                    pending_validation = dict(episode=episodes_done, step=agent.decisions,
+                                              actor=pickle.dumps(actor, protocol=pickle.HIGHEST_PROTOCOL),
+                                              weights=weights.getvalue())
+                    validation_future = start_validation(pending_validation)
+                else:
+                    normalizer = env._worst_delay_sq
+                    scores = []
+                    try:
+                        for validation_seed in (args.validation_seed_base + 1,
+                                                args.validation_seed_base + 2):
+                            last, _, _, _ = await evaluate_episode(
+                                env, agent, validation_seed, args.episode_horizon,
+                                DiscardSamples(), 0, collect_samples=False,
+                                parameters=episode_parameters(validation_seed))
+                            wait = (env.reward_cost_from_state(last)
+                                    if args.reward_mode in ("r1", "r2", "r3", "r4")
+                                    else last["queue_time_integral"])
+                            if args.reward_mode == "total_wait":
+                                wait += last["external_wait_integral"]
+                            dt = getattr(env, "step_seconds", .2 if args.scenario == "lvl" else .1)
+                            scores.append(wait / (args.episode_horizon * dt))
+                    finally:
+                        env._worst_delay_sq = normalizer
+                    score = sum(scores) / len(scores)
+                    with open(os.path.join(outdir, "validation_log.csv"), "a", newline="") as f:
+                        csv.writer(f).writerow([episodes_done, agent.decisions, *scores, score])
+                    if score < best_validation_queue:
+                        best_validation_queue = score
+                        agent.save(os.path.join(outdir, "best_weights.pt"))
+                        marker = "  <- best validation queue"
+            if (completed_episode and episodes_done % args.checkpoint_every == 0
+                    and not time_budget_reached() and not finished):
                 agent.save(os.path.join(outdir, "checkpoint.pt"))
                 save_training_snapshot()
             return marker
@@ -717,7 +790,24 @@ async def amain(args):
                 raise
 
         if process_executors and args.rollout_mode == "async":
+            if pending_validation is not None:
+                # A checkpoint can be written while the frozen policy is being
+                # evaluated. Discard newer scores when replaying that validation.
+                path = Path(outdir, "validation_log.csv")
+                if path.exists():
+                    with path.open(newline="") as f:
+                        previous = [row for row in csv.reader(f)
+                                    if int(row[1]) < pending_validation["step"]]
+                    tmp = path.with_suffix(".csv.tmp")
+                    with tmp.open("w", newline="") as f:
+                        csv.writer(f).writerows(previous)
+                    os.replace(tmp, path)
+                validation_future = start_validation(pending_validation)
             await run_async_rollouts()
+            await finish_validation()
+            # All in-flight results are now reflected in one resumable checkpoint.
+            agent.save(os.path.join(outdir, "checkpoint.pt"))
+            save_training_snapshot()
 
         while (not (process_executors and args.rollout_mode == "async") and
                agent.decisions < args.total_steps and

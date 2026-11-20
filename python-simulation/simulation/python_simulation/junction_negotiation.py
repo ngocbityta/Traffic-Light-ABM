@@ -110,8 +110,12 @@ class ZoneMap:
         lo_b, hi_b = pb.points.min(0), pb.points.max(0)
         if (hi_a < lo_b).any() or (hi_b < lo_a).any():
             return ()
-        diff = pa.points[:, None, :] - pb.points[None, :, :]
-        close = (diff * diff).sum(-1) < thr * thr
+        dx = pa.points[:, None, 0] - pb.points[None, :, 0]
+        dy = pa.points[:, None, 1] - pb.points[None, :, 1]
+        # Add the two squared coordinates directly. For integer samples,
+        # preserve the accumulator dtype NumPy uses for sum().
+        sum_dtype = dx[:0].sum().dtype if dx.dtype.kind in "iu" else dx.dtype
+        close = np.add(dx * dx, dy * dy, dtype=sum_dtype) < thr * thr
         rows = np.flatnonzero(close.any(1))
         if rows.size == 0:
             return ()
@@ -1194,6 +1198,13 @@ class JunctionNegotiator:
 # Adapter for python_sim.LeVanLuongSimulator (safe mode)
 # ---------------------------------------------------------------------------
 
+class _SimulatorZoneMap(ZoneMap):
+    def __getstate__(self):
+        # SimulatorAdapter._sample uses immutable road geometry and the band
+        # encoded in the movement ID. A resumed worker rebuilds these tables.
+        return dict(vars(self), _cache={}, _oriented={}, _samples={})
+
+
 class SimulatorAdapter:
     """Builds agents from a ``LeVanLuongSimulator`` and publishes, per tick,
 
@@ -1210,7 +1221,7 @@ class SimulatorAdapter:
         self.sample_step = float(sample_step)
         if isinstance(params, dict):
             params = NegotiationParams(**params)
-        self.zone_map = ZoneMap(self._sample, lateral_margin=lateral_margin)
+        self.zone_map = _SimulatorZoneMap(self._sample, lateral_margin=lateral_margin)
         self.negotiator = JunctionNegotiator(self.zone_map, params)
         self.negotiator.seed = int(getattr(sim, "seed", 0))
         self.wait: dict[int, float] = {}
@@ -1979,3 +1990,8 @@ class SimulatorAdapter:
                 kind = "run_in_front"
             self.negotiator.stats[kind] = self.negotiator.stats.get(kind, 0) + 1
             self.evade_events.append((now, v.creation_id, kind, v.occupied == 1, k))
+
+
+if __package__:
+    from ._native import load_if_built
+    load_if_built(__name__, __file__)

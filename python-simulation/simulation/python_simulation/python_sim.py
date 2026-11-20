@@ -20,7 +20,9 @@ import json
 import math
 import random
 import sys
-from dataclasses import dataclass
+from dataclasses import fields
+from copyreg import __newobj__
+from functools import cached_property, lru_cache
 from pathlib import Path
 
 if __package__:
@@ -57,9 +59,13 @@ except ImportError:
     from vehicle_geometry import Pose
 
 
-ROOT = Path(__file__).resolve().parent
+if __package__:
+    from ._native import ROOT
+else:
+    ROOT = Path(__file__).resolve().parent
 ARMS = ("NE", "SE", "SW", "NW")
 DT = 0.2
+SEAM_FOLLOW_DISTANCE = 40.0
 STOP_MARGIN = 0.5
 LATERAL_CLEARANCE = 0.1
 # A stationary entry grant older than this is withdrawn and re-requested.
@@ -71,6 +77,7 @@ TOKEN_STALL_COOLDOWN = 1.0
 MERGE_PATIENCE = 8.0
 
 
+@lru_cache(maxsize=256)
 def turn_lane_bounds(lane_count, occupied, maneuver):
     """Turn corridors and the required through queue corridor, from the right curb."""
     last = lane_count - occupied
@@ -84,6 +91,44 @@ def turn_lane_bounds(lane_count, occupied, maneuver):
     first = min(last, lane_count // 4)
     final = max(first, left_first - occupied)
     return first, final
+
+
+class _SeamFollowIndex:
+    """Candidates per approach and 40 m query cell, in simulation order."""
+
+    def __init__(self, vehicles):
+        self.by_arm = {}
+        for order, vehicle in enumerate(vehicles):
+            if vehicle.road not in (vehicle.in_road, vehicle.conn_road):
+                continue
+            cells = self.by_arm.setdefault(vehicle.arm, {})
+            cell = math.floor(vehicle.position / SEAM_FOLLOW_DISTANCE)
+            # A follower in either of these cells can see this vehicle.
+            cells.setdefault(cell - 1, []).append(order)
+            cells.setdefault(cell, []).append(order)
+
+    def update(self, order, vehicle, old_cell):
+        new_cell = (math.floor(vehicle.position / SEAM_FOLLOW_DISTANCE)
+                    if vehicle.road != vehicle.out_road else None)
+        if new_cell == old_cell:
+            return
+        cells = self.by_arm[vehicle.arm]
+        for cell in (old_cell - 1, old_cell):
+            cells[cell].remove(order)
+        if new_cell is not None:
+            for cell in (new_cell - 1, new_cell):
+                bisect.insort(cells.setdefault(cell, []), order)
+
+
+def _replace_sorted(entries, old_entry, new_entry):
+    """Move one existing entry, usually without passing another vehicle."""
+    index = bisect.bisect_left(entries, old_entry)
+    if ((index == 0 or entries[index - 1] < new_entry) and
+            (index + 1 == len(entries) or new_entry < entries[index + 1])):
+        entries[index] = new_entry
+    else:
+        del entries[index]
+        list.insert(entries, bisect.bisect_left(entries, new_entry), new_entry)
 
 
 class _RoadIndex:
@@ -119,6 +164,14 @@ class _RoadIndex:
                 and self.entries[index][1] == key[1]):
             del self.entries[index]
 
+    def move(self, lanes, footprint, old_entry, new_entry):
+        if old_entry[0] == new_entry[0]:
+            return
+        for sublane in footprint:
+            _replace_sorted(lanes[sublane], old_entry, new_entry)
+        _replace_sorted(self.entries, old_entry, new_entry)
+        self.counts[new_entry[:2]] = self.counts.pop(old_entry[:2])
+
     def window(self, low, high):
         """Vehicles whose indexed progress lies in ``[low, high]``."""
         entries = self.entries
@@ -144,7 +197,7 @@ class _Sublane(list):
         self.road_index.add(entry)
 
     def pop(self, index=-1):
-        entry = list.pop(self, index)
+        entry = super().pop(index)
         self.road_index.discard(entry)
         return entry
 
@@ -279,7 +332,22 @@ def road_lengths(path=ROOT / "includes" / "roads.geojson"):
     return roads
 
 
-@dataclass(slots=True)
+try:
+    import cython
+except ImportError:
+    if __package__:
+        from ._native import cython
+    else:
+        from _native import cython
+
+if cython.compiled:
+    from dataclasses import dataclass as vehicle_dataclass
+else:
+    from dataclasses import dataclass
+    vehicle_dataclass = dataclass(slots=True)
+
+
+@vehicle_dataclass
 class Vehicle:
     arm: str
     to_arm: str
@@ -356,6 +424,14 @@ class Vehicle:
     conn_road: str = ""
     out_road: str = ""
 
+    def __reduce_ex__(self, protocol):
+        state = {field.name: getattr(self, field.name) for field in fields(self)}
+        return __newobj__, (type(self),), (None, state)
+
+    def __setstate__(self, state):
+        for name, value in state[1].items():
+            setattr(self, name, value)
+
     def __post_init__(self):
         self.in_road = f"{self.arm}_in"
         self.conn_road = f"{self.arm}_{self.to_arm}"
@@ -383,16 +459,40 @@ class Vehicle:
         return speed * speed / a_allow
 
 
+def _vehicle_road_state(vehicle):
+    road = vehicle.road
+    in_road, conn_road = vehicle.in_road, vehicle.conn_road
+    if road:
+        if road == in_road and vehicle.position > vehicle.approach_end:
+            road = vehicle.road = conn_road
+        elif road == conn_road and vehicle.position > vehicle.connector_end:
+            road = vehicle.road = vehicle.out_road
+    if not road:
+        if vehicle.position <= vehicle.approach_end:
+            road = vehicle.road = in_road
+        elif vehicle.position <= vehicle.connector_end:
+            road = vehicle.road = conn_road
+        else:
+            road = vehicle.road = vehicle.out_road
+    if road == in_road:
+        return road, vehicle.position
+    if road == conn_road:
+        return road, vehicle.position - vehicle.approach_end
+    return road, vehicle.position - vehicle.connector_end
+
+
 class LeVanLuongSimulator:
     """Le Van Luong simulation with safe (default) or GAMA 2025.6.4 mode."""
     @staticmethod
-    def _half_width(vehicle):
+    @cython.annotation_typing(True)
+    def _half_width(vehicle: Vehicle):
         # Physical widths from the model: 0.7 m motorbikes, 1.7 m cars and
         # 2.45 m heavy vehicles (``vehicle_params``), plus the corner reach
         # of a long body on a bending path.
         return vehicle.half_width + vehicle.body_sweep
 
-    def _route_pose(self, vehicle, s):
+    @cython.annotation_typing(True)
+    def _route_pose(self, vehicle: Vehicle, s):
         """Pose of the vehicle's own sublane path at route coordinate ``s``."""
         road, _ = self._road_state(vehicle)
         if s <= vehicle.approach_end:
@@ -402,6 +502,8 @@ class LeVanLuongSimulator:
         else:
             target, progress = vehicle.out_road, s - vehicle.connector_end
         shift = vehicle.current_lateral_shift
+        if road == target:
+            return self._geometry_roads[target].pose(progress, shift)
         order = (vehicle.in_road, vehicle.conn_road, vehicle.out_road)
         here, there = order.index(road) if road in order else 0, order.index(target)
         # Lateral shifts are road-local: carry the shift across each seam.
@@ -629,7 +731,8 @@ class LeVanLuongSimulator:
                 best = min(best, arc / turn)
         return best
 
-    def _interaction_reach(self, vehicle, other, other_position, position):
+    @cython.annotation_typing(True)
+    def _interaction_reach(self, vehicle: Vehicle, other: Vehicle, other_position, position):
         """Lateral distance below which ``other`` leads or follows ``vehicle``.
 
         The corner reach of a long body (``body_sweep``) widens the band for
@@ -638,6 +741,7 @@ class LeVanLuongSimulator:
         gap when the reach grows on a bend; the physical body guards keep the
         two apart. Without long bodies this is the original rule.
         """
+        reach: cython.double
         reach = vehicle.half_width + other.half_width + LATERAL_CLEARANCE
         if vehicle.body_sweep or other.body_sweep:
             if (other_position is None or abs(other_position - position) >=
@@ -649,7 +753,8 @@ class LeVanLuongSimulator:
         """Excess length (m) of the longest vehicle over a passenger car."""
         return max(0.0, self._max_vehicle_length - LIGHT_VEHICLE_LENGTH)
 
-    def _footprint(self, vehicle):
+    @cython.annotation_typing(True)
+    def _footprint(self, vehicle: Vehicle):
         first, last = vehicle.lane, vehicle.lane + vehicle.occupied
         if vehicle.lane_change_progress < 1.0 and vehicle.lane_change_from >= 0:
             first = min(first, vehicle.lane_change_from)
@@ -680,15 +785,17 @@ class LeVanLuongSimulator:
         shift = new.num_lanes * SUBLANE_WIDTH - SUBLANE_WIDTH / 2.0 - offset
         return along, shift
 
-    def _route_target_lane(self, vehicle):
-        if vehicle.road != f"{vehicle.arm}_in":
+    @cython.annotation_typing(True)
+    def _route_target_lane(self, vehicle: Vehicle):
+        if vehicle.road != vehicle.in_road:
             return vehicle.lane
-        incoming = self.roads[f"{vehicle.arm}_in"]
+        incoming = self.roads[vehicle.in_road]
         minimum, maximum = turn_lane_bounds(
             incoming["num_lanes"], vehicle.occupied, vehicle.maneuver)
         return min(max(vehicle.lane, minimum), maximum)
 
-    def _release_mutual_merge(self, vehicle, buffer_stop):
+    @cython.annotation_typing(True)
+    def _release_mutual_merge(self, vehicle: Vehicle, buffer_stop):
         """Hold point of a merger blocked by a merger standing beside it.
 
         Two vehicles that both still have to merge into their route corridor
@@ -701,9 +808,14 @@ class LeVanLuongSimulator:
         in front of it; the other then merges behind. The real stop line
         still applies.
         """
+        other: Vehicle
         reach_long = (vehicle.length + self._max_vehicle_length) / 2 + 1.0
         release = buffer_stop
-        for other in self.vehicles:
+        nearby = (self._nearby(vehicle.road, vehicle.position - reach_long,
+                               vehicle.position + reach_long)
+                  if vehicle.road == vehicle.in_road and getattr(self, "_road_index", None)
+                  else self.vehicles)
+        for other in nearby:
             if (other is vehicle or other.road != vehicle.road or other.speed >= 0.5 or
                     abs(other.position - vehicle.position) > reach_long or
                     other.lane == self._route_target_lane(other)):
@@ -723,10 +835,16 @@ class LeVanLuongSimulator:
             release = max(release, ahead)
         return min(release, self._stop_position(vehicle))
 
+    @cached_property
+    def _connectors_by_turn(self):
+        connectors = {}
+        for road in self.roads.values():
+            if road["kind"] == "connector":
+                connectors.setdefault((road["arm"], road["turn"]), road)
+        return connectors
+
     def _right_target(self, arm):
-        return next(road["to_arm"] for road in self.roads.values()
-                    if road["kind"] == "connector" and road["arm"] == arm and
-                    road["turn"] == "right")
+        return self._connectors_by_turn[arm, "right"]["to_arm"]
 
     def _mapped_lane(self, vehicle, lane, old_road, next_road):
         old_max = self.roads[old_road]["num_lanes"] - vehicle.occupied
@@ -807,7 +925,8 @@ class LeVanLuongSimulator:
         self._curve_profiles[key] = profile
         return profile
 
-    def _path_scale(self, vehicle):
+    @cython.annotation_typing(True)
+    def _path_scale(self, vehicle: Vehicle):
         """Physical metres travelled per metre of route progress."""
         if (self.mode != "safe" or
                 not vehicle.approach_end <= vehicle.position < vehicle.connector_end):
@@ -816,8 +935,10 @@ class LeVanLuongSimulator:
         index = int((vehicle.position - vehicle.approach_end) / self.CURVE_STEP)
         return scales[min(len(scales) - 1, max(0, index))]
 
-    def _curve_speed_cap(self, vehicle):
+    @cython.annotation_typing(True)
+    def _curve_speed_cap(self, vehicle: Vehicle):
         """Speed the vehicle's path geometry allows here (m/s, physical)."""
+        distance: cython.double
         if self.curve_lat_accel <= 0:
             return math.inf
         if vehicle.position >= vehicle.connector_end:
@@ -852,7 +973,8 @@ class LeVanLuongSimulator:
         return math.sqrt(entry * entry + 2.0 * self.curve_decel * distance)
 
     @staticmethod
-    def _stop_position(vehicle):
+    @cython.annotation_typing(True)
+    def _stop_position(vehicle: Vehicle):
         return (vehicle.approach_end - vehicle.length / 2 - STOP_MARGIN
                 - vehicle.queue_stop_offset)
 
@@ -1225,9 +1347,7 @@ class LeVanLuongSimulator:
             # vehicle's minimum turning radius: it goes straight on instead.
             turn = "through"
             self.heavy_turns_rerouted += 1
-        connector = next(road for road in self.roads.values()
-                         if road["kind"] == "connector" and
-                         road["arm"] == arm and road["turn"] == turn)
+        connector = self._connectors_by_turn[arm, turn]
         target = connector["to_arm"]
         incoming = self.roads[f"{arm}_in"]
         outgoing = self.roads[f"{target}_out"]
@@ -1317,14 +1437,16 @@ class LeVanLuongSimulator:
             gama_entered=self.mode != "gama_2025_6_4"))
         self.created += 1
 
-    def _destination_has_room(self, vehicle):
+    @cython.annotation_typing(True)
+    def _destination_has_room(self, vehicle: Vehicle):
         """Require the complete vehicle plus a buffer to fit beyond the connector."""
+        other: Vehicle
         target = vehicle.to_arm
         target_road = f"{target}_out"
         out_length = self.roads[target_road]["length"]
         target_shift = (self._mapped_lane(vehicle, vehicle.lane,
-                                          f"{vehicle.arm}_in",
-                                          f"{vehicle.arm}_{vehicle.to_arm}") +
+                                          vehicle.in_road,
+                                          vehicle.conn_road) +
                         (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
         groups = getattr(self, "_dest_groups", None)
         pool = (groups.get(target, ()) if groups is not None else self.vehicles)
@@ -1356,12 +1478,13 @@ class LeVanLuongSimulator:
         return out_length >= vehicle.length + max(1.0, vehicle.gap)
 
     def _lane_movement_id(self, vehicle, on_connector=False):
-        base = f"{vehicle.arm}_{vehicle.to_arm}"
+        base = vehicle.conn_road
         lane = (vehicle.lane if on_connector else self._mapped_lane(
-            vehicle, vehicle.lane, f"{vehicle.arm}_in", base))
+            vehicle, vehicle.lane, vehicle.in_road, base))
         return f"{base}@{lane}:{vehicle.occupied}"
 
-    def _leader_advance(self, leader, road, moved_ids):
+    @cython.annotation_typing(True)
+    def _leader_advance(self, leader: Vehicle | None, road, moved_ids):
         """Distance the leader is still expected to cover this tick.
 
         A leader processed earlier in this sequential pass has already moved
@@ -1429,7 +1552,8 @@ class LeVanLuongSimulator:
             return other_lo >= current
         return False
 
-    def _can_enter_lane(self, vehicle):
+    @cython.annotation_typing(True)
+    def _can_enter_lane(self, vehicle: Vehicle):
         """Whether the vehicle's current sublane lets it cross the stop line.
 
         Single source for the lane condition used by ``can_cross`` in
@@ -1447,7 +1571,8 @@ class LeVanLuongSimulator:
         return ((arm in ("NE", "SW") and self.yellow_phase == "LVL") or
                 (arm in ("SE", "NW") and self.yellow_phase == "HDT"))
 
-    def _green_for(self, vehicle):
+    @cython.annotation_typing(True)
+    def _green_for(self, vehicle: Vehicle):
         """Whether this vehicle may proceed through its stop line now.
 
         Green for its arm, or yellow with a "go" decision. In GAMA mode (no
@@ -1552,7 +1677,7 @@ class LeVanLuongSimulator:
         # stood still for TOKEN_STALL_LIMIT s: a motionless committed request
         # would otherwise block every conflicting movement indefinitely.
         for vehicle in self.vehicles:
-            if not (vehicle.junction_entry_token and vehicle.road == f"{vehicle.arm}_in"
+            if not (vehicle.junction_entry_token and vehicle.road == vehicle.in_road
                     and vehicle.position <= self._stop_position(vehicle) + 1e-8):
                 vehicle.token_stall_time = 0.0
                 continue
@@ -1577,7 +1702,7 @@ class LeVanLuongSimulator:
         requests = []
         for vehicle in self.vehicles:
             road, _ = self._road_state(vehicle)
-            base_movement_id = f"{vehicle.arm}_{vehicle.to_arm}"
+            base_movement_id = vehicle.conn_road
             if road == base_movement_id:
                 movement_id = self._lane_movement_id(vehicle, on_connector=True)
                 connector_s = max(0.0, vehicle.position - vehicle.approach_end)
@@ -1590,7 +1715,7 @@ class LeVanLuongSimulator:
                     accel=vehicle.accel, desired_speed=vehicle.desired,
                     speed0=max(0.0, vehicle.speed), entry_distance=0.0))
                 continue
-            if road != f"{vehicle.arm}_in":
+            if road != vehicle.in_road:
                 continue
             movement_id = self._lane_movement_id(vehicle)
             green = self._green_for(vehicle)
@@ -1764,7 +1889,49 @@ class LeVanLuongSimulator:
                     vehicle.junction_entry_token = True
         self._dest_groups = None
 
+    @cython.annotation_typing(True)
     def _move(self):
+        old_progress: cython.double
+        new_progress: cython.double
+        new_distance: cython.double
+        new_shift: cython.double
+        old_shift: cython.double
+        road_progress: cython.double
+        seam_progress: cython.double
+        remaining: cython.double
+        crossing_speed: cython.double
+        new_scale: cython.double
+        half_length: cython.double
+        lateral_gap: cython.double
+        separation: cython.double
+        needed: cython.double
+        closing: cython.double
+        other_shift: cython.double
+        ego_cur: cython.double
+        ego_next: cython.double
+        lo: cython.double
+        hi: cython.double
+        remaining_change: cython.double
+        vehicle: Vehicle
+        ahead: Vehicle
+        other: Vehicle
+        item: Vehicle
+        distance: cython.double
+        initial_speed: cython.double
+        scale: cython.double
+        unconstrained_distance: cython.double
+        to_boundary: cython.double
+        seam_gap: cython.double
+        entry_horizon: cython.double
+        predicted_speed: cython.double
+        future_time: cython.double
+        acceleration: cython.double
+        can_cross: cython.bint
+        is_in_road: cython.bint
+        route_invalid: cython.bint
+        committed: cython.bint
+        safe_committed: cython.bint
+
         if self.mode == "safe":
             self._update_body_sweep()
         starting_positions = {v.creation_id: v.position for v in self.vehicles}
@@ -1777,7 +1944,7 @@ class LeVanLuongSimulator:
         self._free_idm_cache = {}
         self._neighbor_road_state = {}
         ticks_to_green_end = None
-        startup_allowed = {}
+        tick_time = self.cycle * DT
         startup_gate_enabled = {}
         if self.mode == "safe":
             from_startup = self._startup_schedulers
@@ -1788,6 +1955,9 @@ class LeVanLuongSimulator:
                 )
                 startup_gate_enabled[arm] = green_for_arm
                 snapshot = []
+                scheduler = from_startup[arm]
+                if green_for_arm == scheduler.green:
+                    continue
                 if green_for_arm:
                     for item in self.vehicles:
                         if (item.arm == arm and item.road == f"{arm}_in" and
@@ -1803,8 +1973,7 @@ class LeVanLuongSimulator:
                                 committed=item.position > stop + 1e-8,
                                 occupied=item.occupied,
                             ))
-                startup_allowed[arm] = from_startup[arm].update(
-                    self.cycle * DT, green_for_arm, snapshot)
+                scheduler.update(tick_time, green_for_arm, snapshot)
         if self.phase in ("LVL", "HDT") and self._yellow <= 0.0:
             # Without a yellow interval vehicles are given perfect foresight of
             # the end of green (legacy behaviour). With a yellow they react
@@ -1831,13 +2000,13 @@ class LeVanLuongSimulator:
                                 (self.green_lvl, self.green_hdt, self.all_red),
                                 self.cycle)
                             break
-        # Vehicles grouped by destination arm for ``_destination_has_room``
-        # (list order kept). Membership of ``self.vehicles`` does not change
-        # until the end of this method.
-        dest_groups = {}
-        for item in self.vehicles:
-            dest_groups.setdefault(item.to_arm, []).append(item)
+        # Only a vehicle whose nose has crossed its exit seam can occupy
+        # downstream space. Add new arrivals as each vehicle finishes moving.
+        dest_groups = {arm: [] for arm in ARMS}
         if self.mode == "safe":
+            for item in self.vehicles:
+                if item.position - item.connector_end + item.length / 2 > 0.0:
+                    dest_groups[item.to_arm].append(item)
             if self._negotiation is not None:
                 self._dest_groups = dest_groups
                 self._negotiation.step(DT)
@@ -1847,7 +2016,7 @@ class LeVanLuongSimulator:
         for vehicle in self.vehicles:
             pending_entry = self.mode == "gama_2025_6_4" and not vehicle.gama_entered
             if pending_entry:
-                road, progress = f"{vehicle.arm}_in", 0.0
+                road, progress = vehicle.in_road, 0.0
             else:
                 road, progress = self._road_state(vehicle)
             self._neighbor_road_state[id(vehicle)] = (road, progress)
@@ -1859,17 +2028,26 @@ class LeVanLuongSimulator:
             if vehicle.lane > max_lane:
                 vehicle.lane = max_lane
             entry = (progress, vehicle.creation_id, vehicle)
-            for sub in self._footprint(vehicle):
-                bisect.insort(lane_maps[road][sub], entry)
+            footprint = self._footprint(vehicle)
+            lanes = lane_maps[road]
+            for sub in footprint:
+                lanes[sub].append(entry)
+            if self.mode == "safe":
+                index = self._road_index[road]
+                index.entries.append(entry)
+                index.counts[progress, vehicle.creation_id] = len(footprint)
+        # No queries occur during loading. Sort once before the first lookup;
+        # subsequent moves use the normal live insert/pop path.
+        for lanes in lane_maps.values():
+            for lane in lanes:
+                lane.sort()
+        for index in self._road_index.values():
+            index.entries.sort()
         survivors = []
         moved_ids = set()
-        # Same-approach candidates for the seam-following scan below, in
-        # ``self.vehicles`` order (the list itself is not changed until the
-        # tick ends, see ``self.vehicles = survivors``).
-        vehicles_by_arm = {}
-        for item in self.vehicles:
-            vehicles_by_arm.setdefault(item.arm, []).append(item)
-        for vehicle in self.vehicles:
+        seam_index = (_SeamFollowIndex(self.vehicles)
+                      if self.mode == "safe" and self.junction_model == "negotiation" else None)
+        for order, vehicle in enumerate(self.vehicles):
             moved_ids.add(id(vehicle))
             old_road, old_progress = self._neighbor_road_state[id(vehicle)]
             is_in_road = old_road.endswith("_in")
@@ -1912,7 +2090,7 @@ class LeVanLuongSimulator:
                     # snapshot yet; it arrives at speed and is not a member
                     # of the standing queue the gate releases.
                     vehicle.created_cycle < self.cycle and
-                    vehicle.creation_id not in startup_allowed.get(vehicle.arm, ())):
+                    (from_startup[vehicle.arm].release_time(vehicle.creation_id) or 0.0) > tick_time):
                 # Startup gating applies only to the onset queue recorded by
                 # the arm scheduler. Keep the vehicle at its existing position
                 # before integrating acceleration or distance.
@@ -1933,37 +2111,47 @@ class LeVanLuongSimulator:
             lane_decision = self._choose_lane(vehicle, lane_maps)
             move_lane = vehicle.lane
             reuse = self._neighbors_reuse
-            if reuse is not None and reuse[0] is vehicle and reuse[1] == vehicle.lane:
-                leader, gap, _, _ = reuse[2]
-            else:
-                leader, gap, _, _ = self._neighbors(vehicle, vehicle.lane, lane_maps)
+            body_shift = None
             if self.mode == "safe":
                 lane_centre = (vehicle.lane + (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
                 if abs(vehicle.current_lateral_shift - lane_centre) > 1e-6:
-                    # Same lateral predicate as _resolve_road_conflicts: the
-                    # body ahead of the vehicle's actual lateral position.
-                    body_leader, body_gap, _, _ = self._neighbors(
-                        vehicle, vehicle.lane, lane_maps,
-                        shift=vehicle.current_lateral_shift)
-                    leader, gap = body_leader, body_gap
+                    body_shift = vehicle.current_lateral_shift
+            if body_shift is not None:
+                # Between sublanes, the gap at the body's actual position governs.
+                leader, gap, _, _ = self._neighbors(
+                    vehicle, vehicle.lane, lane_maps, shift=body_shift)
+            elif reuse is not None and reuse[0] is vehicle and reuse[1] == vehicle.lane:
+                leader, gap, _, _ = reuse[2]
+            else:
+                leader, gap, _, _ = self._neighbors(vehicle, vehicle.lane, lane_maps)
             if safe_committed and not green and (leader is None or leader.road != old_road):
                 # A vehicle whose front crossed the stop line on green must
                 # clear the approach during all-red. Connector conflicts are
                 # handled separately; they must not trap it on the stop line.
                 leader, gap = None, math.inf
-            if (self.mode == "safe" and
-                    (is_in_road or old_road == vehicle.conn_road) and
-                    self.junction_model == "negotiation"):
+            seam_cell = None
+            if seam_index is not None and (is_in_road or old_road == vehicle.conn_road):
                 # Keep following a same-approach body across the stop-line
                 # seam, even when it takes another connector. Those paths
                 # share the first metres of the junction and only diverge
                 # after their bodies have cleared one another.
                 own_pose = None
-                for ahead in vehicles_by_arm[vehicle.arm]:
-                    if (ahead is vehicle or ahead.arm != vehicle.arm or
-                            ahead.position <= vehicle.position or
-                            ahead.position - vehicle.position > 40.0 or
-                            ahead.road not in (vehicle.in_road, ahead.conn_road)):
+                seam_cell = math.floor(vehicle.position / SEAM_FOLLOW_DISTANCE)
+                for candidate in seam_index.by_arm[vehicle.arm][seam_cell]:
+                    ahead = self.vehicles[candidate]
+                    if (ahead.position <= vehicle.position or
+                            ahead.position - vehicle.position > SEAM_FOLLOW_DISTANCE):
+                        continue
+                    seam_gap = (ahead.position - vehicle.position -
+                                (ahead.length + vehicle.length) / 2.0)
+                    if is_in_road and ahead.road == ahead.conn_road and ahead.wheelbase > 0.0:
+                        seam_gap -= ahead.body_sweep
+                    # A candidate can replace the leader only at a strictly smaller gap.
+                    # Test that distance before computing poses and divergence zones.
+                    if seam_gap >= gap and (
+                            ahead.conn_road == vehicle.conn_road or
+                            (vehicle.occupied == ahead.occupied == 1 and
+                             not vehicle.evading and not ahead.evading)):
                         continue
                     if ahead.road == old_road:
                         lateral = abs(ahead.current_lateral_shift -
@@ -2008,21 +2196,12 @@ class LeVanLuongSimulator:
                                    ahead.approach_end <= z.b_out
                                    for z in diverging):
                             continue
-                    seam_gap = (ahead.position - vehicle.position -
-                                (ahead.length + vehicle.length) / 2.0)
                     if ((ahead.wheelbase > 0.0 or vehicle.wheelbase > 0.0) and
                             ahead.position <= vehicle.position + vehicle.length / 2.0):
                         # Beside a long body, not behind it: the other
                         # centre is still alongside (see the seam targets in
                         # junction_negotiation).
                         continue
-                    if (is_in_road and ahead.road == ahead.conn_road and
-                            ahead.wheelbase > 0.0):
-                        # Past the seam jog the long body is turned against
-                        # the follower still on the approach: keep its
-                        # corner reach as extra distance (see
-                        # ``_resolve_seam_overlaps``).
-                        seam_gap -= ahead.body_sweep
                     if seam_gap < gap:
                         leader, gap = ahead, seam_gap
             vehicle.leading_distance = gap
@@ -2102,15 +2281,12 @@ class LeVanLuongSimulator:
             # The safety resolver is a final guard, not a way to brake by
             # moving a vehicle backwards. Preserve the required link clearance
             # during forward motion, including connector-to-exit approaches.
-            if (self.mode == "safe" and leader is not None and math.isfinite(gap) and
-                    (old_road.endswith(("_in", "_out")) or
-                     leader.road.endswith("_out"))):
-                clearance = max(1.0, vehicle.gap, leader.gap)
-                distance = min(distance, max(0.0, gap + self._leader_advance(
-                    leader, old_road, moved_ids) - clearance))
             if self.mode == "safe" and math.isfinite(gap):
-                distance = min(distance, max(0.0, gap + self._leader_advance(
-                    leader, old_road, moved_ids)))
+                room = gap + self._leader_advance(leader, old_road, moved_ids)
+                if leader is not None and (old_road.endswith(("_in", "_out")) or
+                                           leader.road.endswith("_out")):
+                    room -= max(1.0, vehicle.gap, leader.gap)
+                distance = min(distance, max(0.0, room))
             if junction_stop is not None:
                 # Hard guard: the front never passes the junction stop point.
                 junction_room = max(0.0, junction_stop - (vehicle.position + vehicle.length / 2.0)
@@ -2126,7 +2302,7 @@ class LeVanLuongSimulator:
                 vehicle.speed = 0.0
             boundary = (vehicle.approach_end if is_in_road else
                         vehicle.connector_end if old_road not in
-                        (f"{vehicle.to_arm}_out",) else vehicle.route_end)
+                        (vehicle.out_road,) else vehicle.route_end)
             to_boundary = boundary - vehicle.position
             can_cross = ((green or safe_committed or
                           (self.mode == "safe" and vehicle.junction_entry_token)) and
@@ -2180,9 +2356,9 @@ class LeVanLuongSimulator:
                             self.permitted_right_on_red_entries += 1
                         else:
                             self.entries_during_red += 1
-                    vehicle.road = f"{vehicle.arm}_{vehicle.to_arm}"
+                    vehicle.road = vehicle.conn_road
                 else:
-                    vehicle.road = f"{vehicle.to_arm}_out"
+                    vehicle.road = vehicle.out_road
                 next_road = vehicle.road
                 vehicle.lane = self._mapped_lane(vehicle, vehicle.lane, old_road, next_road)
                 if self.mode == "gama_2025_6_4":
@@ -2321,29 +2497,43 @@ class LeVanLuongSimulator:
                     vehicle.position = max(hold_from, stop_position)
                     vehicle.speed = 0.0
                 self._free_idm_cache.pop(id(vehicle), None)
-                old_entry = (old_progress, vehicle.creation_id, vehicle)
-                for sub in self._footprint(vehicle):
-                    entries = lane_maps[old_road][sub]
-                    index = bisect.bisect_left(entries, old_entry)
-                    if index < len(entries) and entries[index] == old_entry:
-                        entries.pop(index)
                 new_road, new_progress = self._road_state(vehicle)
                 vehicle.road = new_road
-                if new_road != old_road:
-                    max_lane = max(0, self.roads[new_road]["num_lanes"] - vehicle.occupied)
-                    if vehicle.lane > max_lane:
-                        vehicle.lane = max_lane
-                        new_shift = (vehicle.lane + (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
-                        vehicle.start_lateral_shift = vehicle.target_lateral_shift = new_shift
-                        vehicle.current_lateral_shift = new_shift
-                        vehicle.lane_change_progress = 1.0
-                        vehicle.lane_change_from = -1
                 self._neighbor_road_state[id(vehicle)] = (new_road, new_progress)
-                if new_road not in lane_maps:
-                    lane_maps[new_road] = self._new_road_lanes(new_road)
+                old_entry = (old_progress, vehicle.creation_id, vehicle)
                 new_entry = (new_progress, vehicle.creation_id, vehicle)
-                for sub in self._footprint(vehicle):
-                    bisect.insort(lane_maps[new_road][sub], new_entry)
+                if new_road == old_road and self.mode == "safe":
+                    # Lane changes have already updated the complete footprint.
+                    # Move the road index once for all occupied sublanes.
+                    self._road_index[old_road].move(
+                        lane_maps[old_road], self._footprint(vehicle), old_entry, new_entry)
+                else:
+                    for sub in self._footprint(vehicle):
+                        entries = lane_maps[old_road][sub]
+                        index = bisect.bisect_left(entries, old_entry)
+                        if index < len(entries) and entries[index] == old_entry:
+                            entries.pop(index)
+                    if new_road != old_road:
+                        max_lane = max(0, self.roads[new_road]["num_lanes"] - vehicle.occupied)
+                        if vehicle.lane > max_lane:
+                            vehicle.lane = max_lane
+                            new_shift = (vehicle.lane + (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
+                            vehicle.start_lateral_shift = vehicle.target_lateral_shift = new_shift
+                            vehicle.current_lateral_shift = new_shift
+                            vehicle.lane_change_progress = 1.0
+                            vehicle.lane_change_from = -1
+                    if new_road not in lane_maps:
+                        lane_maps[new_road] = self._new_road_lanes(new_road)
+                    for sub in self._footprint(vehicle):
+                        bisect.insort(lane_maps[new_road][sub], new_entry)
+            if seam_cell is not None:
+                seam_index.update(order, vehicle, seam_cell)
+            if self.mode == "safe":
+                half_length = vehicle.length / 2
+                if (vehicle.position - vehicle.connector_end + half_length > 0.0 and
+                        starting_positions[vehicle.creation_id] - vehicle.connector_end
+                        + half_length <= 0.0):
+                    dest_groups[vehicle.to_arm].append(vehicle)
             if vehicle.position >= vehicle.route_end - 0.01:
                 self.passed += 1
                 # Still in ``self.vehicles`` until the tick ends; the indexed
@@ -2366,7 +2556,7 @@ class LeVanLuongSimulator:
                     # frozen half-way at standstill straddles two corridors
                     # and deadlocks queues (13/11 liveness audit).
                     rate = max(0.25, min(1.0, vehicle.speed / min_lc_speed))
-                    if (new_road == f"{vehicle.arm}_in" and
+                    if (new_road == vehicle.in_road and
                             (vehicle.merge_wait > 0.0 or
                              vehicle.lane != self._route_target_lane(vehicle))):
                         # Mandatory corridor merges keep their full lateral rate.
@@ -2507,6 +2697,7 @@ class LeVanLuongSimulator:
             self._resolve_seam_overlaps(starting_positions, starting_speeds)
         self._commit_axles()
 
+    @cython.annotation_typing(True)
     def _resolve_connector_overlaps(self, starting_positions, starting_speeds):
         """Stop a following connector body before it enters an occupied footprint.
 
@@ -2515,6 +2706,7 @@ class LeVanLuongSimulator:
         This final geometry check only retreats within the distance travelled
         in the current tick and never rewinds to an earlier tick.
         """
+        vehicle: Vehicle
         groups = {}
         # The 8 m window below covers two passenger cars; longer bodies
         # overlap at larger centre distances.
@@ -2558,6 +2750,7 @@ class LeVanLuongSimulator:
                 placed.append((vehicle.position - vehicle.approach_end,
                                vehicle, make_polygons(vehicle)))
 
+    @cython.annotation_typing(True)
     def _resolve_seam_overlaps(self, starting_positions, starting_speeds):
         """Stop an approach body short of a body just past the stop line,
         when one of the two is a heavy vehicle.
@@ -2572,6 +2765,8 @@ class LeVanLuongSimulator:
         back beyond its start. Pairs of light vehicles keep the original
         behaviour.
         """
+        vehicle: Vehicle
+        other: Vehicle
         if not any(v.wheelbase > 0.0 for v in self.vehicles):
             return
         near_seam = {}
@@ -2617,6 +2812,7 @@ class LeVanLuongSimulator:
             vehicle.speed = max(0.0, min(vehicle.speed, 2.0 * (lo - start) / DT -
                                          starting_speeds.get(vehicle.creation_id, 0.0)))
 
+    @cython.annotation_typing(True)
     def _resolve_road_conflicts(self):
         """Keep vehicle bodies and their minimum clearance apart on road links.
 
@@ -2624,6 +2820,14 @@ class LeVanLuongSimulator:
         Progress is road-relative: vehicles entering the same exit from different
         arms have different cumulative route positions.
         """
+        progress: cython.double
+        allowed: cython.double
+        ahead_progress: cython.double
+        correction: cython.double
+        clearance: cython.double
+        slack: cython.double
+        vehicle: Vehicle
+        ahead: Vehicle
         by_road = {}
         # The 6 m window below is a car length plus its clearance.
         slack = self._length_slack()
@@ -2636,9 +2840,10 @@ class LeVanLuongSimulator:
             settled = []
             for progress, vehicle in entries:
                 allowed = progress
+                # Progress decreases through this road. Once a settled body is
+                # outside the forward window, it cannot constrain a later entry.
+                settled = [pair for pair in settled if pair[0] - progress <= 6.0 + slack]
                 for ahead_progress, ahead in reversed(settled):
-                    if ahead_progress - progress > 6.0 + slack:
-                        continue
                     # Physical body widths: this guard moves vehicles back,
                     # it must not act on the corner reach (``body_sweep``)
                     # that only keeps traffic clear of long bodies.
@@ -2665,7 +2870,7 @@ class LeVanLuongSimulator:
                     # lacks room. Keep the road state consistent with its
                     # position so the next step can wait for the exit to clear.
                     if road.endswith("_out") and allowed < 0.0:
-                        connector = f"{vehicle.arm}_{vehicle.to_arm}"
+                        connector = vehicle.conn_road
                         vehicle.lane = self._mapped_lane(
                             vehicle, vehicle.lane, road, connector)
                         shift = (vehicle.lane + (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
@@ -2686,7 +2891,29 @@ class LeVanLuongSimulator:
                 if vehicle.road == road:
                     settled.append((allowed, vehicle))
 
-    def _choose_lane(self, vehicle, lane_maps):
+    @cython.annotation_typing(True)
+    def _choose_lane(self, vehicle: Vehicle, lane_maps):
+        progress: cython.double
+        stop_gap: cython.double
+        old_gap: cython.double
+        front_gap: cython.double
+        back_gap: cython.double
+        old_acc: cython.double
+        gain: cython.double
+        best_gain: cython.double
+        min_gain: cython.double
+        target_acc: cython.double
+        follower_delta: cython.double
+        leader_speed: cython.double
+        urgency: cython.double
+        cand_shift: cython.double
+        lo_lat: cython.double
+        hi_lat: cython.double
+        long_sep: cython.double
+        closing: cython.double
+        jam: cython.double
+        lat_gap: cython.double
+        other: Vehicle
         if self.mode == "gama_2025_6_4":
             return self._choose_lane_gama(vehicle, lane_maps)
         road, progress = self._neighbor_road_state[id(vehicle)]
@@ -2754,8 +2981,9 @@ class LeVanLuongSimulator:
         best_lane, best_gain = vehicle.lane, 0.0
         best_leader, best_front_gap = old_leader, old_gap
         min_gain = 0.5 if mandatory else (1.5 if queue_filter else 0.8)
-        for lane in range(self.roads[road]["num_lanes"] - vehicle.occupied + 1):
-            if abs(lane - vehicle.lane) != 1:
+        last_lane = self.roads[road]["num_lanes"] - vehicle.occupied
+        for lane in (vehicle.lane - 1, vehicle.lane + 1):
+            if not 0 <= lane <= last_lane:
                 continue
             if road.endswith("_in"):
                 old_lane = vehicle.lane
@@ -2888,6 +3116,7 @@ class LeVanLuongSimulator:
             multiplier = LATERAL_DURATION_FACTOR[vehicle.kind]
             vehicle.lateral_duration = max(0.4, base_duration * multiplier)
         else:
+            self._neighbors_reuse = reuse
             vehicle.time_since_lane_change += DT
 
     def _gama_idm_params(self, vehicle):
@@ -2975,7 +3204,8 @@ class LeVanLuongSimulator:
         vehicle.leading_speed = new_leader.speed if new_leader else 0.0
         return result
 
-    def _road_state(self, vehicle):
+    @cython.annotation_typing(True)
+    def _road_state(self, vehicle: Vehicle):
         # Road names are precomputed per vehicle (``Vehicle.__post_init__``);
         # this is the hottest function of the simulator.
         road = vehicle.road
@@ -3002,7 +3232,30 @@ class LeVanLuongSimulator:
     def _overlap(a, a_lane, b):
         return a_lane < b.lane + b.occupied and b.lane < a_lane + a.occupied
 
-    def _neighbors(self, vehicle, lane, lane_maps, shift=None):
+    @cython.annotation_typing(True)
+    def _neighbors(self, vehicle: Vehicle, lane, lane_maps, shift=None):
+        front: cython.double
+        back: cython.double
+        front_distance: cython.double
+        back_distance: cython.double
+        distance: cython.double
+        other_position: cython.double
+        p_other: cython.double
+        other: Vehicle
+        gap: cython.double
+        reach: cython.double
+        pair_length: cython.double
+        reach_len: cython.double
+        position: cython.double
+        candidate_shift: cython.double
+        v_length: cython.double
+        v_sweep: cython.double
+        v_half: cython.double
+        k: cython.Py_ssize_t
+        start: cython.Py_ssize_t
+        index: cython.Py_ssize_t
+        ahead: cython.Py_ssize_t
+        behind: cython.Py_ssize_t
         road, position = self._neighbor_road_state[id(vehicle)]
         candidate_shift = ((lane + (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
                            if shift is None else shift)
@@ -3100,7 +3353,6 @@ class LeVanLuongSimulator:
                 # (same arithmetic, same order): they ran ~2,000 times a tick.
                 entries = road_index.entries
                 start = bisect.bisect_left(entries, (position - INDEX_MARGIN, -1))
-                road_state = self._road_state
                 v_half, v_sweep, v_length = vehicle.half_width, vehicle.body_sweep, vehicle.length
                 for k in range(start, len(entries)):
                     p_other, _, other = entries[k]
@@ -3108,7 +3360,7 @@ class LeVanLuongSimulator:
                         break
                     if other is vehicle:
                         continue
-                    other_road, other_position = road_state(other)
+                    other_road, other_position = _vehicle_road_state(other)
                     if other_road != road:
                         continue
                     reach = v_half + other.half_width + LATERAL_CLEARANCE
@@ -3135,7 +3387,7 @@ class LeVanLuongSimulator:
                         break
                     if other is vehicle:
                         continue
-                    other_road, other_position = road_state(other)
+                    other_road, other_position = _vehicle_road_state(other)
                     if other_road != road:
                         continue
                     reach = v_half + other.half_width + LATERAL_CLEARANCE
@@ -3166,10 +3418,10 @@ class LeVanLuongSimulator:
                 front_distance = front + (vehicle.length + leader.length) / 2
             if follower is not None:
                 back_distance = back + (vehicle.length + follower.length) / 2
-        if follower is None and road == f"{vehicle.arm}_{vehicle.to_arm}":
+        if follower is None and road == vehicle.conn_road:
             # On a connector, GAMA's follower search crosses its source node
             # and checks vehicles approaching on the incoming road.
-            source_road = f"{vehicle.arm}_in"
+            source_road = vehicle.in_road
             source = self.roads[source_road]
             for sublane in range(lane, lane + vehicle.occupied):
                 if sublane >= source["num_lanes"]:
@@ -3189,19 +3441,19 @@ class LeVanLuongSimulator:
                     back = distance - (vehicle.length + other.length) / 2
         if leader is None:
             next_road = None
-            if road == f"{vehicle.arm}_in":
+            if road == vehicle.in_road:
                 green = self._green_for(vehicle)
                 if green or (self.mode == "gama_2025_6_4" and not vehicle.gama_entered):
-                    next_road = f"{vehicle.arm}_{vehicle.to_arm}"
+                    next_road = vehicle.conn_road
                 else:
                     if self.mode == "gama_2025_6_4" and vehicle.gama_entered:
                         front = vehicle.approach_end - vehicle.position + vehicle.gap
                     elif self.mode == "safe":
                         front = self._stop_position(vehicle) - vehicle.position + vehicle.gap
-            elif road == f"{vehicle.arm}_{vehicle.to_arm}":
-                next_road = f"{vehicle.to_arm}_out"
+            elif road == vehicle.conn_road:
+                next_road = vehicle.out_road
             elif (self.mode == "gama_2025_6_4" and
-                  road == f"{vehicle.to_arm}_out"):
+                  road == vehicle.out_road):
                 # Tagged Utils.findLeader returns a virtual target-node leader
                 # when the vehicle has no next road (the final exit segment).
                 front = self.roads[road]["length"] - position + vehicle.gap
@@ -3231,7 +3483,15 @@ class LeVanLuongSimulator:
                         break
         return leader, front, follower, back
 
-    def _idm(self, vehicle, gap, leader_speed):
+    @cython.annotation_typing(True)
+    def _idm(self, vehicle: Vehicle, gap, leader_speed):
+        road_limit: cython.double
+        curve_cap: cython.double
+        limit: cython.double
+        stop_gap: cython.double
+        desired_gap: cython.double
+        interaction: cython.double
+        result: cython.double
         if self.mode == "gama_2025_6_4":
             road, _ = self._neighbor_road_state.get(id(vehicle), (vehicle.road, 0.0))
             if gap == math.inf:
@@ -3395,4 +3655,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if not __package__:
+        sys.path.insert(0, str(ROOT.parent))
+    from python_simulation.python_sim import main as run_cli
+    run_cli()
+elif __package__:
+    from ._native import load_if_built
+    load_if_built(__name__, __file__)

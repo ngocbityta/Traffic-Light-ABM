@@ -63,6 +63,10 @@ class SafeStartupScheduler:
         self._green_since = None
         self._release_at.clear()
 
+    @property
+    def green(self):
+        return self._green
+
     def update(
         self,
         now: float,
@@ -100,18 +104,18 @@ class SafeStartupScheduler:
             for queue in queues.values():
                 # Largest station is the first vehicle nearest the stop line.
                 queue.sort(key=lambda v: (-v.position, str(v.vehicle_id)))
-                scheduled: list[tuple[StartupVehicle, float, set[int]]] = []
+                lane_release: dict[int, float] = {}
                 for vehicle in queue:
                     reaction = self._reaction(vehicle.vehicle_id)
                     release = now + reaction
-                    footprint = set(range(int(vehicle.sublane),
-                                          int(vehicle.sublane) + vehicle.occupied))
-                    for predecessor, predecessor_release, other_footprint in scheduled:
-                        if footprint & other_footprint:
-                            release = max(release,
-                                          predecessor_release + self.discharge_headway)
+                    footprint = range(int(vehicle.sublane),
+                                      int(vehicle.sublane) + vehicle.occupied)
+                    for lane in footprint:
+                        if lane in lane_release:
+                            release = max(release, lane_release[lane] + self.discharge_headway)
                     self._release_at[vehicle.vehicle_id] = release
-                    scheduled.append((vehicle, release, footprint))
+                    for lane in footprint:
+                        lane_release[lane] = release
 
         return frozenset(
             v.vehicle_id

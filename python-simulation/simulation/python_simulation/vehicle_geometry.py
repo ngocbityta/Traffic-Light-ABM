@@ -70,6 +70,11 @@ class Road:
     @property
     def length(self): return self.cumulative[-1]
 
+    def __getstate__(self):
+        # Poses are derived from immutable geometry. Workers regenerate cache
+        # entries on demand after restoring an episode.
+        return {key: value for key, value in vars(self).items() if key != "_pose_cache"}
+
     def pose(self, progress: float, lateral_shift: float = 0.0) -> Pose:
         """Return lane-center pose. lateral_shift follows observer.html's SUBLANE_WIDTH convention."""
         # Pure function of (progress, shift); about half of the calls in a
@@ -85,7 +90,7 @@ class Road:
         cached = cache.get(key)
         if cached is not None:
             return cached
-        if len(cache) >= 50000:
+        if len(cache) >= 2048:
             cache.clear()
         result = cache[key] = self._pose(progress, lateral_shift)
         return result
@@ -140,7 +145,7 @@ class RouteGeometry:
         s=float(progress)
         if s < 0: i=0
         elif s >= self.length: i=len(self.roads)-1
-        else: i=next(j for j in range(len(self.roads)) if s < self.cumulative[j+1])
+        else: i=bisect_right(self.cumulative, s)-1
         road_id,road=self.roads[i]
         shift=(shifts.get(road_id,lateral_shift) if shifts is not None else lateral_shift)
         return road_id,road.pose(s-self.cumulative[i],shift)
@@ -219,3 +224,8 @@ def swept_overlap(road_a: Road, start_a: float, end_a: float, road_b: Road, star
         if polygons_overlap(footprint(pa,length=La+2*pad,width=Wa+2*pad),
                             footprint(pb,length=Lb+2*pad,width=Wb+2*pad),clearance): return True
     return False
+
+
+if __package__:
+    from ._native import load_if_built
+    load_if_built(__name__, __file__)
