@@ -39,6 +39,14 @@ from typing import Callable, Iterable
 
 import numpy as np
 
+try:
+    import cython
+except ImportError:
+    if __package__:
+        from ._native import cython
+    else:
+        from _native import cython
+
 TURN_RANK = {"through": 0, "right": 1, "left": 2}
 # movement id -> corridor (pure function of the string; read ~10^4 times a tick)
 _CORRIDORS: dict[str, str] = {}
@@ -363,6 +371,7 @@ class JunctionNegotiator:
         self.gap_events: list[tuple] = []
 
     # ------------------------------------------------------------ helpers
+    @cython.annotation_typing(True)
     def impatience(self, ag: Agent):
         p = self.p
         if ag.wait_time >= p.green_priority_after:
@@ -383,6 +392,7 @@ class JunctionNegotiator:
         return self.p.max_yield_moto if ag.motorbike else self.p.max_yield_car
 
     @staticmethod
+    @cython.annotation_typing(True)
     def is_minor(ag: Agent):
         # Permissive right turns must yield at their merge conflict just as
         # left turns yield to opposing traffic. Signal permission alone does
@@ -390,21 +400,25 @@ class JunctionNegotiator:
         return ag.arm_green and ag.turn in ("left", "right")
 
     @staticmethod
+    @cython.annotation_typing(True)
     def arrival(ag: Agent, z_in):
         return travel_time(z_in - ag.front, ag.speed, ag.accel, ag.desired)
 
     @staticmethod
+    @cython.annotation_typing(True)
     def leave(ag: Agent, z_out):
         # Conservative clearing time: half acceleration, plus body length.
         return travel_time(z_out - ag.back, ag.speed, 0.5 * ag.accel, ag.desired)
 
     @staticmethod
+    @cython.annotation_typing(True)
     def can_stop(ag: Agent, z_in, decel=None):
         decel = ag.max_decel if decel is None else decel
         room = z_in - ag.min_gap - ag.front
         return ag.speed * ag.speed / (2.0 * max(decel, 0.1)) <= max(0.0, room) + 0.05
 
     @staticmethod
+    @cython.annotation_typing(True)
     def laterally_apart(a: Agent, b: Agent, margin=0.15):
         """Bodies on the same connector (or about to be) that do not share a
         lateral band, now or while finishing a lateral move."""
@@ -413,6 +427,7 @@ class JunctionNegotiator:
         return max(a_lo - b_hi, b_lo - a_hi) >= a.half_width + b.half_width + margin
 
     @staticmethod
+    @cython.annotation_typing(True)
     def apart_in_plane(a: Agent, b: Agent, margin=0.15):
         """Sideways distance between the two centres, across the heading of
         the rear vehicle, exceeds both half widths.
@@ -435,18 +450,22 @@ class JunctionNegotiator:
         return True
 
     @staticmethod
+    @cython.annotation_typing(True)
     def clearing(ag: Agent):
         return ag.on_junction and not ag.arm_green
 
     @staticmethod
+    @cython.annotation_typing(True)
     def idle(ag: Agent):
         return ag.speed < 0.5 and (ag.stalled or ag.hold_time > 0.0)
 
     @staticmethod
+    @cython.annotation_typing(True)
     def in_zone(ag: Agent, z_in, z_out):
         return ag.front > z_in and ag.back < z_out
 
     # ------------------------------------------------------------ gap acceptance
+    @cython.annotation_typing(True)
     def total_gap(self, m: Agent, f: Agent, z: Zone):
         """Vu & Shimizu (2010) total gap = longitudinal gap - lateral gap (s).
 

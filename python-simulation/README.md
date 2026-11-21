@@ -34,7 +34,19 @@ train/venv/bin/python -m pip install "Cython==3.3.1" setuptools
 train/venv/bin/python python-simulation/scripts/build_native.py
 ```
 
-Đo riêng 1.000 tick với cấu hình mặc định, seed 1 và `cProfile`:
+Bản build mặc định không có hook profiling của Cython (nhanh hơn khoảng 9 %).
+Để `cProfile` thấy được các hàm đã biên dịch, build biến thể profiling và chạy
+với cùng biến môi trường:
+
+```bash
+LVL_NATIVE_PROFILE=1 python3 python-simulation/scripts/build_native.py
+```
+
+Hai biến thể nằm ở hai thư mục build khác nhau; khi chỉ có một biến thể, mô
+phỏng nạp biến thể đó.
+
+Đo riêng 1.000 tick với cấu hình mặc định, seed 1 và `cProfile`
+(cần `LVL_NATIVE_PROFILE=1` nếu đang dùng bản biên dịch):
 
 ```bash
 PYTHONPATH=python-simulation/simulation python3 -c 'import cProfile, pstats; from python_simulation.python_sim import LeVanLuongSimulator; sim = LeVanLuongSimulator(seed=1); p = cProfile.Profile(); p.runcall(sim.step, 1000); pstats.Stats(p).strip_dirs().sort_stats("cumtime").print_stats(10)'

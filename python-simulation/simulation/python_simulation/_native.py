@@ -15,12 +15,23 @@ CACHE = ROOT / "__pycache__" / "native"
 SUFFIX = sysconfig.get_config_var("EXT_SUFFIX")
 
 
-@lru_cache(maxsize=1)
-def build_path():
+def profile_requested():
+    """``LVL_NATIVE_PROFILE=1``: build/load the cProfile-visible extensions.
+    Cython's profiling hooks cost ~9 % per tick, so the default is without."""
+    return os.getenv("LVL_NATIVE_PROFILE") == "1"
+
+
+@lru_cache(maxsize=2)
+def build_path(profile=None):
+    if profile is None:
+        profile = profile_requested()
     digest = hashlib.sha256()
     for name in (*MODULES, "_native"):
         digest.update((ROOT / (name + ".py")).read_bytes())
-    digest.update((ROOT / "python_sim.pxd").read_bytes())
+    for header in ("python_sim.pxd", "junction_negotiation.pxd"):
+        digest.update((ROOT / header).read_bytes())
+    if profile:
+        digest.update(b"cython-profile")
     abi = sysconfig.get_config_var("SOABI") or sys.implementation.cache_tag
     return CACHE / f"{abi}-{platform.machine()}-{digest.hexdigest()[:24]}"
 
@@ -28,9 +39,13 @@ def build_path():
 def load_if_built(name, source):
     if not source.endswith(".py") or not CACHE.is_dir() or os.getenv("LVL_PURE_PYTHON") == "1":
         return
-    binary = build_path() / (name.rsplit(".", 1)[-1] + SUFFIX)
+    filename = name.rsplit(".", 1)[-1] + SUFFIX
+    binary = build_path() / filename
     if not binary.is_file():
-        return
+        # The other variant (with or without profiling hooks) of the same sources.
+        binary = build_path(not profile_requested()) / filename
+        if not binary.is_file():
+            return
     spec = importlib.util.spec_from_file_location(name, binary)
     module = importlib.util.module_from_spec(spec)
     original = sys.modules[name]

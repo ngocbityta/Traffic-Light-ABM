@@ -78,6 +78,36 @@ class SumMinTree:
                 node = left + 1
         return node - self.capacity
 
+    def find_many(self, masses):
+        """``[self.find(m) for m in masses]`` descending all paths at once
+        (same comparisons and subtractions, element by element)."""
+        mass = np.array(masses, dtype=np.float64)
+        node = np.ones(mass.shape, dtype=np.int64)
+        while node[0] < self.capacity:  # every leaf has the same depth
+            left = 2 * node
+            left_sum = self.sum[left]
+            go_left = mass < left_sum
+            mass = np.where(go_left, mass, mass - left_sum)
+            node = np.where(go_left, left, left + 1)
+        return node - self.capacity
+
+    def set_many(self, indices, priorities):
+        """Sequential ``set`` for every pair (a repeated index keeps its last
+        priority), then each touched ancestor recomputed once from its
+        children: the same sums and minima as one ``set`` after another."""
+        nodes = np.asarray(indices, dtype=np.int64) + self.capacity
+        values = np.asarray(priorities, dtype=np.float64)
+        self.sum[nodes] = values      # numpy fancy assignment: last write wins
+        self.minimum[nodes] = values
+        nodes = np.unique(nodes // 2)
+        while nodes.size and nodes[0] >= 1:
+            left = 2 * nodes
+            self.sum[nodes] = self.sum[left] + self.sum[left + 1]
+            self.minimum[nodes] = np.minimum(self.minimum[left], self.minimum[left + 1])
+            if nodes[0] == 1:
+                break
+            nodes = np.unique(nodes // 2)
+
 
 class PrioritizedReplay:
     def __init__(self, capacity, alpha=.5, seed=None):
@@ -119,8 +149,10 @@ class PrioritizedReplay:
         if self.size < batch_size or total <= 0 or not 0 <= beta <= 1:
             raise ValueError("Invalid Rainbow replay sample")
         segment = total / batch_size
-        indices = np.asarray([self.tree.find((i + self.rng.random()) * segment)
-                              for i in range(batch_size)], dtype=np.int64)
+        # One draw per segment, in segment order: the same stream as calling
+        # ``rng.random()`` batch_size times.
+        draws = self.rng.random(batch_size)
+        indices = self.tree.find_many((np.arange(batch_size) + draws) * segment)
         probabilities = self.tree.sum[self.tree.capacity + indices] / total
         minimum = self.tree.minimum[1] / total
         weights = (self.size * probabilities) ** (-beta)
@@ -134,12 +166,14 @@ class PrioritizedReplay:
                 self.discounts[indices], self.next_masks[indices])
 
     def update_priorities(self, indices, losses):
-        for index, loss in zip(indices, losses):
-            priority = float(abs(loss)) + 1e-6
-            if not math.isfinite(priority):
-                raise ValueError("Non-finite Rainbow replay priority")
-            self.max_priority = max(self.max_priority, priority)
-            self.tree.set(int(index), priority ** self.alpha)
+        priorities = np.abs(np.asarray(losses, dtype=np.float64)) + 1e-6
+        if not np.isfinite(priorities).all():
+            raise ValueError("Non-finite Rainbow replay priority")
+        self.max_priority = max(self.max_priority, float(priorities.max()))
+        # Python's float power (libm), as before: numpy's vectorised power
+        # can differ in the last bit.
+        alpha = self.alpha
+        self.tree.set_many(indices, [p ** alpha for p in priorities.tolist()])
 
     def __len__(self):
         return self.size

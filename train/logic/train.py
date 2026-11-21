@@ -17,6 +17,8 @@ import multiprocessing
 import os
 import platform
 import pickle
+import queue
+import random
 import threading
 import time
 from collections import deque
@@ -78,6 +80,13 @@ def parse_args(argv=None):
                         "sync = the previous lock-step rounds (reproducible order)")
     p.add_argument("--replay-ratio", type=float, default=1.0,
                    help="Gradient updates per stored transition (1.0 = previous behaviour)")
+    p.add_argument("--learner", choices=("thread", "inline"), default="thread",
+                   help="async Python workers: 'thread' learns in a background thread so "
+                        "finished workers get their next rollout at once; 'inline' learns "
+                        "in the dispatch loop before resubmitting (previous behaviour)")
+    p.add_argument("--max-learner-lag", type=int, default=None,
+                   help="Rollouts that may wait for the learner thread before new rollouts "
+                        "are held back (keeps the replay ratio; default: number of workers)")
     p.add_argument("--learner-threads", type=int, default=None,
                    help="torch threads of the learner (default: free cores beside the workers)")
     p.add_argument("--rollout-decisions", type=int, default=16,
@@ -152,6 +161,7 @@ def parse_args(argv=None):
             args.buffer_size < args.batch_size or args.warmup < 0 or
             not (args.replay_ratio > 0) or
             (args.learner_threads is not None and args.learner_threads < 1) or
+            (args.max_learner_lag is not None and args.max_learner_lag < 1) or
             min(args.r1_ref, args.r2_ref, args.b_ref) <= 0 or
             min(args.r2_lambda, args.r3_beta, args.pressure_lambda) < 0):
         p.error("Horizon must exceed 100 cycles; total-steps and validate-every must be positive")
@@ -194,7 +204,7 @@ def parse_args(argv=None):
 
 def training_config(args):
     fields = ("algorithm", "scenario", "backend", "python_sim_mode", "episode_horizon", "max_train_seconds", "validate_every", "checkpoint_every",
-              "workers", "rollout_decisions", "rollout_mode", "replay_ratio", "gama_heap_mb", "fast_simulation", "device", "seed_base",
+              "workers", "rollout_decisions", "rollout_mode", "replay_ratio", "learner", "max_learner_lag", "gama_heap_mb", "fast_simulation", "device", "seed_base",
               "validation_seed_base", "lr", "gamma",
               "reward_mode", "r1_ref", "r2_ref", "b_ref", "r2_lambda", "r3_beta",
               "pressure_lambda", "demand_mode", "max_delay_sq", "buffer_size", "warmup", "batch_size",
@@ -230,13 +240,41 @@ def training_config(args):
                   # simulator as its collision and junction logic evolves.
                   "python-simulation/simulation/python_simulation/junction_conflicts.py",
                   "python-simulation/simulation/python_simulation/junction_negotiation.py",
+                  "python-simulation/simulation/python_simulation/junction_negotiation.pxd",
                   "python-simulation/simulation/python_simulation/sim_config.py",
                   "python-simulation/simulation/python_simulation/safe_collision_guard.py")
-    # gama-simulation/ was removed on 2026-11-16; hash only files present.
+    if args.backend == "python":
+        # GAMA models do not run with the Python backend. A copy of the code
+        # taken to another machine (e.g. Colab) without them must still
+        # resume the same checkpoint.
+        files = tuple(name for name in files if not name.endswith(".gaml"))
+    missing = [name for name in files if not (REPO_DIR / name).exists()]
+    if args.backend == "python" and missing:
+        raise FileNotFoundError("Source files needed by training are missing: " + ", ".join(missing))
+    # GAMA backend: gama-simulation/ was removed on 2026-11-16; hash the files present.
     config["code_sha256"] = {name: hashlib.sha256(
         (REPO_DIR / name).read_bytes()).hexdigest() for name in files
         if (REPO_DIR / name).exists()}
     return config
+
+
+# Settings that change where and how fast training runs, not what is learned:
+# a run may be resumed with other values (e.g. started on a laptop, continued
+# on a Colab GPU with more workers).
+RESUMABLE_CHANGES = ("workers", "device", "max_train_seconds", "learner", "max_learner_lag",
+                     "rollout_mode", "validate_every", "checkpoint_every", "gama_heap_mb")
+
+
+def check_resume_config(saved, current):
+    """Raise unless ``saved`` and ``current`` differ only in RESUMABLE_CHANGES;
+    return the keys that differ."""
+    changed = sorted(key for key in set(saved) | set(current)
+                     if saved.get(key) != current.get(key))
+    blocked = [key for key in changed if key not in RESUMABLE_CHANGES]
+    if blocked:
+        raise ValueError("Resume requires identical training settings and source code "
+                         f"(changed: {', '.join(blocked)})")
+    return changed
 
 
 def actor_seed(episode_seed, learner_decisions, worker=0):
@@ -359,6 +397,114 @@ async def collect_rollout(env, actor, args, seed, decision_limit, force_warmup,
 
 
 _PYTHON_PROCESS_ENV = None
+_PROCESS_ACTOR = None
+
+
+def weights_payload(agent, seed):
+    """What a worker needs to act like ``make_actor``: the online network's
+    weights on the CPU and the actor seed. A pickled actor was 4.4 MB (two
+    networks, Adam state, replay) and took ~20-30 ms to build per rollout."""
+    state = {name: tensor.detach().to("cpu", copy=True)
+             for name, tensor in agent.online_net.state_dict().items()}
+    return ("weights", pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL), int(seed))
+
+
+def load_actor_payload(payload, args):
+    """A pickled actor, or ``("weights", state, seed)`` loaded into an actor
+    kept by this process (built once like ``make_actor``)."""
+    global _PROCESS_ACTOR
+    if not (isinstance(payload, tuple) and payload and payload[0] == "weights"):
+        return pickle.loads(payload)
+    _, state, seed = payload
+    if _PROCESS_ACTOR is None:
+        _PROCESS_ACTOR = RainbowAgent(
+            lr=args.lr, gamma=args.gamma, buffer_size=1, warmup=1, batch_size=1,
+            tau=args.tau, eps_start=args.eps_start, eps_decay_steps=args.eps_decay_steps,
+            eps_min=args.eps_min, seed=seed, reward_mode=args.reward_mode,
+            device=torch.device("cpu"), **spatial_kwargs(args))
+    actor = _PROCESS_ACTOR
+    actor.online_net.load_state_dict(pickle.loads(state))
+    # As a freshly built actor: action draws and NoisyNet noise from ``seed``.
+    actor.rng = random.Random(seed)
+    torch.manual_seed(seed)
+    return actor
+
+
+class LearnerThread(threading.Thread):
+    """Stores finished rollouts in the replay and runs the gradient updates
+    beside the rollout dispatcher.
+
+    Each rollout is learned exactly as the dispatch loop did it (store, the
+    replay-ratio updates per stored transition, flush the n-step tail), in
+    arrival order. ``lock`` is held for a whole rollout, so outside it the
+    agent never has a half-flushed n-step tail. After each rollout the online
+    weights are published for the next rollouts.
+    """
+
+    def __init__(self, agent, args):
+        super().__init__(name="learner", daemon=True)
+        self.agent, self.args = agent, args
+        self.lock = threading.RLock()
+        self.items = queue.Queue()
+        self.pending = 0            # rollouts queued or being learned
+        self.changed = threading.Condition()
+        self.error = None
+        self.busy_seconds = 0.0
+        self.weights = None
+        self.publish()
+
+    def publish(self):
+        if self.args.algorithm == "rainbow":
+            self.weights = weights_payload(self.agent, 0)[1]
+
+    def submit(self, transitions):
+        with self.changed:
+            self.pending += 1
+        self.items.put(transitions)
+
+    def stop(self):
+        self.items.put(None)
+
+    def run(self):
+        agent, args = self.agent, self.args
+        while True:
+            transitions = self.items.get()
+            if transitions is None:
+                return
+            started = time.monotonic()
+            try:
+                with self.lock:
+                    for observation, action, reward, next_observation, seconds, mask, terminal in transitions:
+                        emitted = agent.store(observation, action, reward, next_observation,
+                                              terminal, seconds=seconds, next_mask=mask)
+                        learn_emitted(agent, args, emitted)
+                    if args.algorithm == "rainbow":
+                        learn_emitted(agent, args, agent.finish_episode())
+                    self.publish()
+            except BaseException as error:  # surfaced by the dispatcher
+                self.error = error
+            finally:
+                self.busy_seconds += time.monotonic() - started
+                with self.changed:
+                    self.pending -= 1
+                    self.changed.notify_all()
+            if self.error is not None:
+                return
+
+    def check(self):
+        if self.error is not None:
+            raise RuntimeError("Learner thread failed") from self.error
+
+    async def wait_below(self, limit):
+        """Wait (without blocking the event loop) until fewer than ``limit``
+        rollouts wait for the learner; ``limit=1`` drains it."""
+        waited = time.monotonic()
+        while True:
+            self.check()
+            with self.changed:
+                if self.pending < limit:
+                    return time.monotonic() - waited
+            await asyncio.sleep(0.002)
 
 
 def collect_python_rollout_process(actor_payload, args, seed, decision_limit,
@@ -382,7 +528,7 @@ def collect_python_rollout_process(actor_payload, args, seed, decision_limit,
         if sim_payload is None:
             raise RuntimeError("Missing Python simulation state for a resumed rollout")
         _PYTHON_PROCESS_ENV.sim = pickle.loads(sim_payload)
-    actor = pickle.loads(actor_payload)
+    actor = load_actor_payload(actor_payload, args)
     result = asyncio.run(collect_rollout(
         _PYTHON_PROCESS_ENV, actor, args, seed, decision_limit, force_warmup,
         parameters=parameters, deadline=deadline, initial_state=initial_state))
@@ -434,9 +580,11 @@ async def amain(args):
     config_path = os.path.join(outdir, "training_config.json")
     if args.resume_dir and os.path.exists(config_path):
         with open(config_path) as stream:
-            if json.load(stream) != config:
-                raise ValueError("Resume requires identical training settings and source code")
-    else:
+            changed = check_resume_config(json.load(stream), config)
+        if changed:
+            print("[Train] Resuming with changed run settings: " + ", ".join(
+                f"{key}" for key in changed))
+    if not (args.resume_dir and os.path.exists(config_path)) or changed:
         with open(config_path, "w") as stream:
             json.dump(config, stream, indent=2, sort_keys=True)
             stream.write("\n")
@@ -648,8 +796,7 @@ async def amain(args):
         if args.resume_dir:
             snapshot = torch.load(os.path.join(outdir, "training_state.pt"),
                                   map_location=agent.device, weights_only=False)
-            if snapshot["config"] != config:
-                raise ValueError("Resume requires identical training settings and source code")
+            check_resume_config(snapshot["config"], config)
             agent.restore_training(snapshot["agent"])
             ep = snapshot["episode"]
             next_seed = snapshot["next_seed"]
@@ -661,10 +808,17 @@ async def amain(args):
                 tmp = best_path.with_suffix(".pt.tmp")
                 tmp.write_bytes(snapshot["best_before_validation"])
                 os.replace(tmp, best_path)
-            if process_executors:
-                worker_states = snapshot["worker_states"]
-                worker_seeds = snapshot["worker_seeds"]
-                worker_sim_payloads = snapshot["worker_sim_payloads"]
+            if process_executors and "worker_states" in snapshot:
+                # Another worker count: unfinished episodes beyond it are
+                # dropped (their transitions are already in the replay),
+                # extra workers start new episodes.
+                count = args.workers
+                worker_states = (list(snapshot["worker_states"]) + [None] * count)[:count]
+                worker_seeds = (list(snapshot["worker_seeds"]) + [None] * count)[:count]
+                worker_sim_payloads = (list(snapshot["worker_sim_payloads"]) + [None] * count)[:count]
+                dropped = sum(state is not None for state in snapshot["worker_states"][count:])
+                if dropped:
+                    print(f"[Train] {dropped} unfinished episode(s) of removed workers dropped")
             for worker, normalizer in zip(envs, snapshot["normalizers"]):
                 worker._worst_delay_sq = normalizer
             with open(log_path, newline="") as f:
@@ -734,6 +888,9 @@ async def amain(args):
         # Resumed workers rebuild their simulation from the checkpoint once.
         payload_pending = [worker_states[i] is not None for i in range(args.workers)]
 
+        learner = None  # LearnerThread of the async Python path
+        learner_stats = {}
+
         async def validate_and_checkpoint(completed_episode, finished):
             """Validation and checkpoint cadence of one learned rollout."""
             await collect_validation()
@@ -741,12 +898,27 @@ async def amain(args):
             if (not time_budget_reached() and
                     ((completed_episode and
                       episodes_done % args.validate_every == 0) or finished)):
-                marker = await validate_policy(episodes_done)
+                if learner is None:
+                    marker = await validate_policy(episodes_done)
+                else:
+                    with learner.lock:  # a consistent copy of the weights
+                        marker = await validate_policy(episodes_done)
             if (completed_episode and episodes_done % args.checkpoint_every == 0
                     and not time_budget_reached() and not finished):
+                await save_checkpoint()
+            return marker
+
+        async def save_checkpoint():
+            """Checkpoint after every handed-over rollout has been learned, so
+            the replay matches the worker states saved beside it."""
+            if learner is None:
                 agent.save(os.path.join(outdir, "checkpoint.pt"))
                 save_training_snapshot()
-            return marker
+                return
+            await learner.wait_below(1)
+            with learner.lock:
+                agent.save(os.path.join(outdir, "checkpoint.pt"))
+                save_training_snapshot()
 
         async def run_async_rollouts():
             """Each worker process gets its next rollout as soon as its last
@@ -757,10 +929,26 @@ async def amain(args):
             order of replay insertions is not reproducible run to run
             (``--rollout-mode sync`` keeps the lock-step order).
             """
-            nonlocal ep, episodes_done, next_seed
+            nonlocal ep, episodes_done, next_seed, learner
             loop = asyncio.get_running_loop()
             inflight = {}
             reserved = [0]  # decisions promised to rollouts in flight
+            if args.learner == "thread":
+                learner = LearnerThread(agent, args)
+                learner.start()
+            max_lag = args.max_learner_lag or args.workers
+            held_back = [0.0]  # seconds new rollouts waited for the learner
+
+            def actor_payload(i):
+                seed = actor_seed(worker_seeds[i], agent.decisions, i)
+                if learner is not None and args.algorithm == "rainbow":
+                    return ("weights", learner.weights, seed)
+                if learner is not None:
+                    with learner.lock:
+                        actor = make_actor(agent_class, agent, args, seed)
+                else:
+                    actor = make_actor(agent_class, agent, args, seed)
+                return pickle.dumps(actor, protocol=pickle.HIGHEST_PROTOCOL)
 
             def submit(i):
                 nonlocal next_seed
@@ -779,13 +967,11 @@ async def amain(args):
                     worker_seeds[i] = next_seed
                     next_seed += 1
                     parameters = episode_parameters(worker_seeds[i])
-                actor = make_actor(agent_class, agent, args,
-                                   actor_seed(worker_seeds[i], agent.decisions, i))
                 payload = worker_sim_payloads[i] if payload_pending[i] else None
                 payload_pending[i] = False
                 future = loop.run_in_executor(
                     process_executors[i], collect_python_rollout_process,
-                    pickle.dumps(actor, protocol=pickle.HIGHEST_PROTOCOL),
+                    actor_payload(i),
                     args, worker_seeds[i], quota,
                     args.algorithm != "qlearning" and len(agent.buffer) < args.warmup,
                     parameters, deadline, worker_states[i], payload)
@@ -807,12 +993,16 @@ async def amain(args):
                             continue
                         ep += 1
                         seed = item["seed"]
-                        for observation, action, reward, next_observation, seconds, mask, terminal in item["transitions"]:
-                            emitted = agent.store(observation, action, reward, next_observation, terminal,
-                                                  seconds=seconds, next_mask=mask)
-                            learn_emitted(agent, args, emitted)
-                        if args.algorithm == "rainbow":
-                            learn_emitted(agent, args, agent.finish_episode())
+                        if learner is not None:
+                            learner.check()
+                            learner.submit(item["transitions"])
+                        else:
+                            for observation, action, reward, next_observation, seconds, mask, terminal in item["transitions"]:
+                                emitted = agent.store(observation, action, reward, next_observation, terminal,
+                                                      seconds=seconds, next_mask=mask)
+                                learn_emitted(agent, args, emitted)
+                            if args.algorithm == "rainbow":
+                                learn_emitted(agent, args, agent.finish_episode())
                         for _ in range(item["decisions"]):
                             agent.decay_epsilon()
                         state = item["state"]
@@ -843,14 +1033,30 @@ async def amain(args):
                               f"queue={state['current_queue_length']:2d} | "
                               f"{item['wall']:5.1f}s{marker}", flush=True)
                         if not finished:
+                            if learner is not None:
+                                # Keep the replay ratio: hold new work back
+                                # while the learner is ``max_lag`` rollouts behind.
+                                held_back[0] += await learner.wait_below(max_lag)
                             submit(i)
+                if learner is not None:
+                    await learner.wait_below(1)
             except BaseException:
                 for future in inflight:
                     future.cancel()
                 raise
+            finally:
+                if learner is not None:
+                    learner.stop()
+                    learner.join(timeout=600)
+                    learner_stats.update(
+                        learner="thread", learner_busy_seconds=round(learner.busy_seconds, 2),
+                        rollouts_held_back_seconds=round(held_back[0], 2), max_learner_lag=max_lag)
+                    learner.check()
+                    learner = None
 
         if process_executors and args.rollout_mode == "async":
             await run_async_rollouts()
+            learner_stats["rollout_phase_seconds"] = round(time.monotonic() - train_started, 2)
             await collect_validation(wait=True)
             # All in-flight results are now reflected in one resumable checkpoint.
             agent.save(os.path.join(outdir, "checkpoint.pt"))
@@ -1066,6 +1272,14 @@ async def amain(args):
                    "train_wall_seconds": round(train_elapsed, 2),
                    "aggregate_simulated_seconds": round(simulated_seconds, 2),
                    "decisions_per_second": round(agent.decisions / train_elapsed, 5),
+                   # Rollout phase only: without the final wait for queued
+                   # validations and the last checkpoint.
+                   "rollout_phase_seconds": learner_stats.get("rollout_phase_seconds"),
+                   "decisions_per_second_rollout_phase": (
+                       round(agent.decisions / learner_stats["rollout_phase_seconds"], 5)
+                       if learner_stats.get("rollout_phase_seconds") else None),
+                   **{key: value for key, value in learner_stats.items()
+                      if key != "rollout_phase_seconds"},
                    "simulated_seconds_per_wall_second": round(simulated_seconds / train_elapsed, 5),
                    "training_config": config,
                    "source_sha256": config["code_sha256"],

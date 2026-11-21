@@ -1,4 +1,6 @@
-"""Build the optional, cProfile-visible simulator extensions for this Python."""
+"""Build the optional native simulator extensions for this Python.
+
+Set LVL_NATIVE_PROFILE=1 to build the cProfile-visible variant (about 9 % slower)."""
 import os
 from pathlib import Path
 import platform
@@ -6,7 +8,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "simulation"))
-from python_simulation._native import CACHE, MODULES, ROOT, SUFFIX, build_path
+from python_simulation._native import CACHE, MODULES, ROOT, SUFFIX, build_path, profile_requested
 
 
 def main():
@@ -31,7 +33,7 @@ def main():
         extensions = [Extension("python_simulation." + name, [str(ROOT / (name + ".py"))],
                                 extra_compile_args=flags) for name in MODULES]
         extensions = cythonize(extensions, build_dir=str(stage / "cython"), compiler_directives={
-            "language_level": 3, "profile": True, "annotation_typing": False, "infer_types": False,
+            "language_level": 3, "profile": profile_requested(), "annotation_typing": False, "infer_types": False,
             "nonecheck": True,
         })
         setup(name="lvl-native", packages=[], ext_modules=extensions, script_args=[
