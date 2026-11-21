@@ -75,13 +75,45 @@ def read_demand(path, roads=None):
     return rows
 
 
+BASE_FLOW = 2400.0          # vehicles/h per approach at 100 % demand
+BUSY_AXIS = ("NW", "SE")    # Hoang Dao Thuy: the busier axis when unbalanced
+
+
+def axis_flows(scale=1.0, imbalance=0.0, base_flow=BASE_FLOW, busy_axis=BUSY_AXIS):
+    """Flow (vehicles/h) of every arm for a demand level.
+
+    ``scale`` multiplies the mean flow of the four arms (1.0 = ``base_flow``);
+    each arm of ``busy_axis`` carries ``1 + imbalance`` times the flow of each
+    arm of the other axis, the mean staying ``scale * base_flow``.
+    """
+    if not (math.isfinite(scale) and math.isfinite(imbalance) and scale >= 0 and imbalance >= 0):
+        raise ValueError("Invalid demand level")
+    mean = base_flow * scale
+    quiet = 2.0 * mean / (2.0 + imbalance)
+    busy = quiet * (1.0 + imbalance)
+    return {arm: (busy if arm in busy_axis else quiet) for arm in ARMS}
+
+
+def sample_demand_level(seed, scale_min=1.0, scale_max=1.0, imbalance_max=0.0):
+    """``(scale, imbalance)`` of one episode, uniform in the given ranges and
+    fixed by the episode seed (its own stream: the arrivals keep ``seed``)."""
+    if not (0 <= scale_min <= scale_max and imbalance_max >= 0):
+        raise ValueError("Invalid demand level ranges")
+    rng = random.Random(f"demand-level:{int(seed)}")
+    scale = scale_min + (scale_max - scale_min) * rng.random()
+    imbalance = imbalance_max * rng.random()
+    return scale, imbalance
+
+
 def generate_demand(path, seed, horizon, flow_per_approach=2400.0,
                     motorbike_ratio=0.85, p_left=0.2, p_right=0.2,
-                    heavy_ratio=DEFAULT_HEAVY_RATIO):
+                    heavy_ratio=DEFAULT_HEAVY_RATIO, flow_by_arm=None):
     """CSV rows: cycle, arm, vehicle type, speed in km/h, turn, initial lane.
 
     Vehicle type: 0 motorbike, 1 car, 2 heavy vehicle (truck or bus). Pass
     ``heavy_ratio=0`` for the two-type demand the GAMA model replays.
+    ``flow_by_arm`` ({arm: vehicles/h}) replaces ``flow_per_approach`` arm by
+    arm (see ``axis_flows``); the random stream is the same either way.
     """
     params = (flow_per_approach, motorbike_ratio, p_left, p_right, heavy_ratio)
     if (isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 0 or
@@ -90,15 +122,19 @@ def generate_demand(path, seed, horizon, flow_per_approach=2400.0,
             not 0 <= heavy_ratio <= 1 or motorbike_ratio + heavy_ratio > 1 + 1e-12 or
             p_left < 0 or p_right < 0 or p_left + p_right > 1):
         raise ValueError("Invalid demand parameters")
+    if flow_by_arm is not None and (set(flow_by_arm) != set(ARMS) or any(
+            not math.isfinite(flow_by_arm[arm]) or flow_by_arm[arm] < 0 for arm in ARMS)):
+        raise ValueError("flow_by_arm needs a finite, non-negative flow for every arm")
     roads = road_lengths()
     rng = random.Random(seed)
     rows = []
-    probability = flow_per_approach / 3600.0 * DT
-    if not 0 <= probability <= 1:
+    flows = [flow_per_approach if flow_by_arm is None else flow_by_arm[arm] for arm in ARMS]
+    probabilities = [flow / 3600.0 * DT for flow in flows]
+    if not all(0 <= probability <= 1 for probability in probabilities):
         raise ValueError("Arrival probability must be between zero and one")
     for cycle in range(1, horizon + 1):
         for origin, arm in enumerate(ARMS):
-            if rng.random() >= probability:
+            if rng.random() >= probabilities[origin]:
                 continue
             draw = rng.random()
             turn = 0 if draw < p_left else 1 if draw < p_left + p_right else 2

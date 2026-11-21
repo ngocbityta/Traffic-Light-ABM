@@ -827,8 +827,11 @@ class LeVanLuongSimulator:
             # Is ``other`` in the way of this vehicle's next sublane step?
             step = 1 if self._route_target_lane(vehicle) > vehicle.lane else -1
             target = (vehicle.lane + step + (vehicle.occupied - 1) / 2.0) * SUBLANE_WIDTH
+            # Same widths as the lane-change sweep check (``_change_lane``):
+            # a long body's corner reach blocks the merge there, so it must
+            # count here too, or neither vehicle is ever let go first.
             if abs(target - other.current_lateral_shift) >= (
-                    vehicle.half_width + other.half_width + LATERAL_CLEARANCE):
+                    self._half_width(vehicle) + self._half_width(other) + LATERAL_CLEARANCE):
                 continue
             ahead = other.position + (other.length + vehicle.length) / 2 + max(
                 vehicle.gap, other.gap) + 1.0

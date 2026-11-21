@@ -31,13 +31,14 @@ from .three_dqn_agent import ThreeDQNAgent, FlatDQNAgent
 from .rainbow_agent import RainbowAgent
 from .hybrid_agent import SpatialHybridAgent
 from .tabular_agent import TabularQAgent
-from .gama_env import GamaTrafficEnv, featurize
+from .gama_env import GamaTrafficEnv, QUEUE_FEATURE_SCALES, featurize
 from .python_env import PythonTrafficEnv
 from .lvl_env import LVLGamaEnv, LVLPythonEnv
 from .server_manager import GamaServerManager
 from .evaluate import evaluate_episode
 from .demand import generate_demand, demand_parameters
-from python_simulation.demand import generate_demand as generate_lvl_demand
+from python_simulation.demand import (axis_flows, generate_demand as generate_lvl_demand,
+                                      sample_demand_level)
 from python_simulation.demand import demand_parameters as lvl_demand_parameters
 from python_simulation.sim_config import load_sim_config
 
@@ -101,7 +102,24 @@ def parse_args(argv=None):
     p.add_argument("--seed-base", type=int, default=1000,
                    help="Seed GAMA cua episode e = seed_base + e")
     p.add_argument("--validation-seed-base", type=int, default=10_000_000,
-                   help="Reserved held-out seed range; validation uses base+1 and base+2")
+                   help="Reserved held-out seed range; validation uses base+1, base+2, ...")
+    # Demand level (lvl scenario). Each training episode draws its own level
+    # from its seed and keeps it for the whole episode: the mean flow of the
+    # four arms is scale * 2400 veh/h and every arm of the Hoang Dao Thuy
+    # axis (NW-SE) carries 1 + imbalance times the flow of a Le Van Luong arm.
+    p.add_argument("--demand-scale-min", type=float, default=1.0,
+                   help="Lowest demand level of a training episode (1.0 = 2400 veh/h per arm)")
+    p.add_argument("--demand-scale-max", type=float, default=1.0,
+                   help="Highest demand level of a training episode")
+    p.add_argument("--axis-imbalance-max", type=float, default=0.0,
+                   help="Largest extra share of the NW-SE axis per arm (0.2 = 20 %% busier)")
+    p.add_argument("--queue-feature-scale", choices=QUEUE_FEATURE_SCALES, default="linear",
+                   help="Queue counts in the observation: linear (/100, /50, clipped) or "
+                        "log (log1p(n)/log1p(1000); does not saturate at heavy demand)")
+    p.add_argument("--validation-levels", default=None,
+                   help="Held-out levels 'scale:imbalance,...', one seed each "
+                        "(default: two seeds at 1:0; when the training level is random, the "
+                        "lowest, middle and highest scale at half the largest imbalance)")
     # DQN hyperparameters
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--gamma", type=float, default=None)
@@ -186,10 +204,34 @@ def parse_args(argv=None):
         p.error("Parallel reference reward requires a fixed positive --max-delay-sq shared by all workers")
     if args.resume_dir and args.output_dir and Path(args.resume_dir).resolve() != Path(args.output_dir).resolve():
         p.error("--output-dir must equal --resume-dir when resuming")
+    levels = (args.demand_scale_min, args.demand_scale_max, args.axis_imbalance_max)
+    if not all(math.isfinite(x) for x in levels) or not (
+            0 < args.demand_scale_min <= args.demand_scale_max and args.axis_imbalance_max >= 0):
+        p.error("Demand levels need 0 < --demand-scale-min <= --demand-scale-max "
+                "and --axis-imbalance-max >= 0")
+    random_level = levels != (1.0, 1.0, 0.0)
+    if args.validation_levels is None:
+        low, high = args.demand_scale_min, args.demand_scale_max
+        half = args.axis_imbalance_max / 2
+        args.validation_levels = (
+            f"{low!r}:{half!r},{(low + high) / 2!r}:{half!r},{high!r}:{half!r}"
+            if random_level else "1:0,1:0")
+    try:
+        args.validation_levels = tuple(
+            (float(scale), float(imbalance)) for scale, imbalance in
+            (item.split(":") for item in args.validation_levels.split(",")))
+    except ValueError:
+        p.error("--validation-levels must look like 0.5:0.1,1:0.1,1.5:0.1")
+    if not args.validation_levels or not all(
+            math.isfinite(a) and math.isfinite(b) and a > 0 and b >= 0
+            for a, b in args.validation_levels):
+        p.error("--validation-levels needs positive scales and non-negative imbalances")
+    if (random_level or set(args.validation_levels) != {(1.0, 0.0)}) and args.scenario != "lvl":
+        p.error("Demand levels exist only for --scenario lvl")
     possible_episodes = min(args.total_steps, args.episodes) if args.episodes else args.total_steps
     training_end = args.seed_base + possible_episodes
     if any(args.seed_base < args.validation_seed_base + offset <= training_end
-           for offset in (1, 2)):
+           for offset in range(1, len(args.validation_levels) + 1)):
         p.error("Validation seeds overlap the possible training seed range")
     if args.gamma is None:
         args.gamma = .97 if args.reward_mode in ("queue_time", "total_wait", "r1", "r2", "r3", "r4") else .99
@@ -207,9 +249,13 @@ def training_config(args):
               "workers", "rollout_decisions", "rollout_mode", "replay_ratio", "learner", "max_learner_lag", "gama_heap_mb", "fast_simulation", "device", "seed_base",
               "validation_seed_base", "lr", "gamma",
               "reward_mode", "r1_ref", "r2_ref", "b_ref", "r2_lambda", "r3_beta",
-              "pressure_lambda", "demand_mode", "max_delay_sq", "buffer_size", "warmup", "batch_size",
+              "pressure_lambda", "demand_mode", "demand_scale_min", "demand_scale_max",
+              "axis_imbalance_max", "validation_levels", "queue_feature_scale", "max_delay_sq", "buffer_size", "warmup", "batch_size",
               "tau", "eps_start", "eps_decay_steps", "eps_min", "model_path")
     config = {name: getattr(args, name) for name in fields}
+    # JSON has no tuples: keep the in-memory config equal to the saved one,
+    # or a resume from training_config.json sees a changed setting.
+    config["validation_levels"] = [list(level) for level in args.validation_levels]
     config["simulation_config"] = args.simulation_config
     if args.algorithm == "rainbow":
         config.update({name: getattr(args, name) for name in
@@ -323,8 +369,13 @@ def _make_actor(agent_class, learner, args, seed):
 
 
 def reward_settings(args):
-    return dict(r1_ref=args.r1_ref, r2_ref=args.r2_ref, b_ref=args.b_ref,
-                r2_lambda=args.r2_lambda, r3_beta=args.r3_beta)
+    # Saved in every checkpoint and handed back to the environment by
+    # evaluate.py, so the observation scale travels with the weights.
+    settings = dict(r1_ref=args.r1_ref, r2_ref=args.r2_ref, b_ref=args.b_ref,
+                    r2_lambda=args.r2_lambda, r3_beta=args.r3_beta)
+    if args.queue_feature_scale != "linear":
+        settings["queue_feature_scale"] = args.queue_feature_scale
+    return settings
 
 
 def spatial_kwargs(args):
@@ -378,13 +429,13 @@ async def collect_rollout(env, actor, args, seed, decision_limit, force_warmup,
     decisions = 0
     while (state["cycle"] < args.episode_horizon and decisions < decision_limit and
            (deadline is None or time.monotonic() < deadline)):
-        observation = featurize(state)
+        observation = featurize(state, getattr(env, "queue_feature_scale", "linear"))
         action = actor.act(observation, action_mask=state["action_mask"],
                            force_random=force_warmup)
         next_state, reward, _, info = await env.step(
             action, horizon=args.episode_horizon, current_state=state)
         if info["bootstrap_valid"]:
-            transitions.append((observation, action, reward, featurize(next_state),
+            transitions.append((observation, action, reward, featurize(next_state, getattr(env, "queue_feature_scale", "linear")),
                                 info["elapsed_seconds"], next_state["action_mask"].copy(),
                                 not info["bootstrap_valid"]))
         actor.decay_epsilon()
@@ -595,18 +646,33 @@ async def amain(args):
         with open(demand_manifest_path) as stream:
             demand_manifest = json.load(stream)
 
-    def record_demand(seed, path, digest):
+    def record_demand(seed, path, digest, level=None):
         # Demand generation currently happens in the learner process before
         # worker submission. Keep the read/modify/replace atomic if callers
         # later move this helper onto worker threads.
         with demand_manifest_lock:
             demand_manifest[str(seed)] = {"path": os.path.relpath(path, outdir),
                                           "sha256": digest}
+            if level is not None:
+                scale, imbalance, flows = level
+                demand_manifest[str(seed)].update(
+                    scale=round(scale, 6), axis_imbalance=round(imbalance, 6),
+                    flow_veh_h={arm: round(flow, 3) for arm, flow in flows.items()})
             temporary = demand_manifest_path + ".tmp"
             with open(temporary, "w") as stream:
                 json.dump(demand_manifest, stream, indent=2, sort_keys=True)
                 stream.write("\n")
             os.replace(temporary, demand_manifest_path)
+
+    validation_levels = {args.validation_seed_base + 1 + i: level
+                         for i, level in enumerate(args.validation_levels)}
+
+    def demand_level(seed):
+        """(scale, imbalance) of an episode: fixed for held-out seeds, else drawn from the seed."""
+        if seed in validation_levels:
+            return validation_levels[seed]
+        return sample_demand_level(seed, args.demand_scale_min, args.demand_scale_max,
+                                   args.axis_imbalance_max)
 
     def episode_parameters(seed):
         if args.demand_mode == "model":
@@ -616,9 +682,11 @@ async def amain(args):
             # The GAMA model has no heavy vehicles: its demand stays two-type.
             heavy_ratio = (args.simulation_config["heavy_ratio"]
                            if args.backend == "python" else 0.0)
+            scale, imbalance = demand_level(seed)
+            flows = axis_flows(scale, imbalance)
             digest = generate_lvl_demand(path, seed, args.episode_horizon,
-                                         heavy_ratio=heavy_ratio)
-            record_demand(seed, path, digest)
+                                         heavy_ratio=heavy_ratio, flow_by_arm=flows)
+            record_demand(seed, path, digest, (scale, imbalance, flows))
             return lvl_demand_parameters(path)
         digest = generate_demand(path, seed, args.episode_horizon)
         record_demand(seed, path, digest)
@@ -665,7 +733,7 @@ async def amain(args):
             await env.setup()
             envs.append(env)
         env = envs[0]
-        validation_seeds = (args.validation_seed_base + 1, args.validation_seed_base + 2)
+        validation_seeds = tuple(sorted(validation_levels))
         validation_dt = getattr(env, "step_seconds", .2 if args.scenario == "lvl" else .1)
         validation_parameters = {}
         validation_env_bytes = None
@@ -717,7 +785,13 @@ async def amain(args):
         def record_validation(episode, step, scores, weights=None):
             """Log one finished validation and keep the best policy; returns a marker."""
             nonlocal best_validation_queue
-            score = sum(scores) / len(scores)
+            if len(set(args.validation_levels)) > 1:
+                # Levels differ in size: a geometric mean weighs the same
+                # relative gain at every level equally, instead of letting
+                # the heaviest level decide which policy is best.
+                score = math.exp(sum(math.log(max(x, 1e-12)) for x in scores) / len(scores))
+            else:
+                score = sum(scores) / len(scores)
             marker = ""
             if score < best_validation_queue:
                 best_validation_queue = score
@@ -1188,7 +1262,7 @@ async def amain(args):
             decisions = 0
             done = False
             while not done and agent.decisions < args.total_steps:
-                state_vec = featurize(state)
+                state_vec = featurize(state, getattr(env, "queue_feature_scale", "linear"))
                 # The paper fills N_min with uniformly random legal transitions
                 # before starting gradient updates, independently of epsilon.
                 action = agent.act(state_vec, action_mask=state["action_mask"],
@@ -1197,7 +1271,7 @@ async def amain(args):
                 next_state, reward, _, info = await env.step(
                     action, horizon=args.episode_horizon, current_state=state)
                 if info["bootstrap_valid"]:
-                    emitted = agent.store(state_vec, action, reward, featurize(next_state),
+                    emitted = agent.store(state_vec, action, reward, featurize(next_state, getattr(env, "queue_feature_scale", "linear")),
                                           not info["bootstrap_valid"],
                                           seconds=info["elapsed_seconds"],
                                           next_mask=next_state["action_mask"])
@@ -1290,8 +1364,8 @@ async def amain(args):
                        [min(int(row["seed"]) for row in completed_rows),
                         max(int(row["seed"]) for row in completed_rows)]
                        if completed_rows else []),
-                   "validation_seeds": [args.validation_seed_base + 1,
-                                        args.validation_seed_base + 2],
+                   "validation_seeds": list(validation_seeds),
+                   "validation_levels": [list(level) for level in args.validation_levels],
                    "time_metric_semantics": (
                        "LVL average_waiting_time is cumulative queue-time integral / created; "
                        "average_travel_time is cumulative system-time integral / passed; "

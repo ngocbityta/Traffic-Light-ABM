@@ -14,4 +14,11 @@ DRIVE_SUBDIR="Traffic-Light-ABM/runs"
 TRAIN_ARGS=(--scenario lvl --backend python --algorithm rainbow --reward-mode r1
             --rollout-mode async --learner thread --rollout-decisions 16
             --episode-horizon 8000 --total-steps "$TOTAL_STEPS" --warmup 2000
-            --validate-every 250)
+            --validate-every 250
+            # Demand: each episode draws 50-130 % of 2400 veh/h per arm and a
+            # 0-20 % heavier Hoang Dao Thuy axis (NW-SE), fixed for the episode.
+            --demand-scale-min 0.5 --demand-scale-max 1.3 --axis-imbalance-max 0.2
+            # Heavy levels reach returns near -7000: widen C51, same 40-unit atoms.
+            --c51-v-min -8000 --c51-atoms 201
+            # Queue counts reach ~300 per axis at 1.3x (linear clips at 100): log scale.
+            --queue-feature-scale log)

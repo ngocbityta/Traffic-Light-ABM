@@ -38,7 +38,7 @@ from .python_env import PythonTrafficEnv
 from .lvl_env import LVLGamaEnv, LVLPythonEnv
 from .server_manager import GamaServerManager
 from .demand import generate_demand, demand_parameters
-from python_simulation.demand import generate_demand as generate_lvl_demand
+from python_simulation.demand import axis_flows, generate_demand as generate_lvl_demand
 from python_simulation.sim_config import load_sim_config
 from python_simulation.demand import demand_parameters as lvl_demand_parameters
 
@@ -86,7 +86,7 @@ async def evaluate_episode(env, agent, seed, horizon, writer, episode,
         if state["dqn_waiting_action"]:
             if pending is not None:
                 reward += env.transition_reward(pending, state)
-            action = agent.act(featurize(state), greedy=True, action_mask=state["action_mask"])
+            action = agent.act(featurize(state, getattr(env, "queue_feature_scale", "linear")), greedy=True, action_mask=state["action_mask"])
             pending = state
             await env.set_action(action)
             await env.step_cycles(1)
@@ -122,6 +122,10 @@ def parse_args():
     p.add_argument("--seed-base", type=int, default=20_000_000,
                    help="Seed danh gia (khac voi seed train de tranh overfit)")
     p.add_argument("--demand-mode", choices=("paired", "model"), default="paired")
+    p.add_argument("--demand-scale", type=float, default=1.0,
+                   help="lvl: mean flow per arm = scale * 2400 veh/h (same for every episode)")
+    p.add_argument("--axis-imbalance", type=float, default=0.0,
+                   help="lvl: each NW-SE arm carries 1 + this times a SW-NE arm's flow")
     p.add_argument("--port", type=int, default=6868)
     p.add_argument("--backend", choices=("gama", "python"), default="python",
                    help="Simulation engine for the selected scenario")
@@ -139,6 +143,11 @@ def parse_args():
         p.error("Python backend requires paired CSV demand; GAMA's live RNG is different")
     if args.scenario == "lvl" and args.demand_mode != "paired":
         p.error("Le Van Luong evaluation requires paired demand")
+    if not (math.isfinite(args.demand_scale) and math.isfinite(args.axis_imbalance) and
+            args.demand_scale > 0 and args.axis_imbalance >= 0):
+        p.error("--demand-scale must be > 0 and --axis-imbalance >= 0")
+    if (args.demand_scale, args.axis_imbalance) != (1.0, 0.0) and args.scenario != "lvl":
+        p.error("--demand-scale/--axis-imbalance exist only for --scenario lvl")
     return args
 
 
@@ -242,7 +251,9 @@ async def amain(args):
                         # the GAMA model has no heavy vehicles.
                         generate_lvl_demand(demand_path, seed, args.episode_horizon,
                                             heavy_ratio=(env.sim_config["heavy_ratio"]
-                                                         if args.backend == "python" else 0.0))
+                                                         if args.backend == "python" else 0.0),
+                                            flow_by_arm=axis_flows(args.demand_scale,
+                                                                   args.axis_imbalance))
                         parameters = lvl_demand_parameters(demand_path)
                     else:
                         generate_demand(demand_path, seed, args.episode_horizon)

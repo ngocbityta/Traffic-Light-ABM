@@ -24,6 +24,7 @@ Protocol chi tiet xem header cua train/benchmarks/gama/models/intersection-dqn-p
 
 import asyncio
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -107,7 +108,7 @@ class GamaTrafficEnv:
                  reward_mode="reference", max_delay_sq=None,
                  state_mode="dtse", r1_ref=50.0, r2_ref=50.0, b_ref=50.0,
                  r2_lambda=1.0, r3_beta=1.0, reset_mode="reload",
-                 fast_training=False):
+                 fast_training=False, queue_feature_scale="linear"):
         if reward_scope not in ("all", "near"):
             raise ValueError(f"Unknown reward scope: {reward_scope}")
         if reward_mode not in ("reference", "queue_time", "total_wait", "r1", "r2", "r3", "r4"):
@@ -116,6 +117,8 @@ class GamaTrafficEnv:
             raise ValueError(f"Unknown state mode: {state_mode}")
         if reset_mode not in ("reload", "fresh"):
             raise ValueError(f"Unknown reset mode: {reset_mode}")
+        if queue_feature_scale not in QUEUE_FEATURE_SCALES:
+            raise ValueError(f"Unknown queue feature scale: {queue_feature_scale}")
         if (state_mode == "spatial") != (reward_mode in ("r1", "r2", "r3", "r4")):
             raise ValueError("Spatial state requires R1-R4; DTSE requires a legacy reward")
         if (not all(np.isfinite(x) for x in (r1_ref, r2_ref, b_ref, r2_lambda, r3_beta)) or
@@ -133,6 +136,8 @@ class GamaTrafficEnv:
         self.state_mode = state_mode
         self.reset_mode = reset_mode
         self.fast_training = bool(fast_training)
+        # How the queue counts enter the observation (see ``featurize``).
+        self.queue_feature_scale = queue_feature_scale
         self.r1_ref = float(r1_ref)
         self.r2_ref = float(r2_ref)
         self.b_ref = float(b_ref)
@@ -491,9 +496,14 @@ class GamaTrafficEnv:
 # Featurization: state dict -> DTSE tensor (occupancy, speed, signal).
 # ---------------------------------------------------------------------------
 STATE_DIM = (3, 8, 20)
+# "linear": counts / 100 (queues) and / 50 (pressure), clipped at 1; both
+# saturate at 1.3-1.5x demand. "log": log1p(count) / log1p(1000), which still
+# separates 10, 100 and 1000 vehicles.
+QUEUE_FEATURE_SCALES = ("linear", "log")
+_LOG_COUNT = math.log1p(1000.0)
 
 
-def featurize(state):
+def featurize(state, queue_feature_scale="linear"):
     if "spatial" in state:
         phase = state["global_phase"] // 2
         aux = np.zeros(17, dtype=np.float32)
@@ -501,10 +511,16 @@ def featurize(state):
             aux[phase] = 1.0
         step_sec = state.get("step_seconds", 0.1)
         aux[4] = min(1.0, (state["green_cycles"] * step_sec) / 60.0)
-        aux[5:9] = np.clip([state["queue_ns"], state["queue_ew"],
-                            state["approach_ns"], state["approach_ew"]], 0, 100) / 100.0
+        counts = [state["queue_ns"], state["queue_ew"],
+                  state["approach_ns"], state["approach_ew"]]
         pressure = np.asarray(state["pressure"], dtype=np.float32)
-        aux[9:13] = np.clip(pressure / 50.0, -1.0, 1.0)
+        if queue_feature_scale == "log":
+            aux[5:9] = np.minimum(np.log1p(np.maximum(counts, 0.0)) / _LOG_COUNT, 1.0)
+            aux[9:13] = np.clip(np.sign(pressure) * np.log1p(np.abs(pressure)) / _LOG_COUNT,
+                                -1.0, 1.0)
+        else:
+            aux[5:9] = np.clip(counts, 0, 100) / 100.0
+            aux[9:13] = np.clip(pressure / 50.0, -1.0, 1.0)
         aux[13:17] = state["action_mask"].astype(np.float32)
         return {"grid": np.asarray(state["spatial"], dtype=np.float32), "aux": aux,
                 "pressure": pressure}
