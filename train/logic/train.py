@@ -19,6 +19,7 @@ import platform
 import pickle
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -390,22 +391,34 @@ def collect_python_rollout_process(actor_payload, args, seed, decision_limit,
                                                protocol=pickle.HIGHEST_PROTOCOL))
     return result
 
-def evaluate_rainbow_worker(env, actor_bytes, seed, horizon, parameters, threads):
-    # Each validation seed owns its environment and evaluates the same frozen
-    # policy. The executor still owns its separate training environment.
-    previous = torch.get_num_threads()
-    try:
-        torch.set_num_threads(threads)
-        actor = pickle.loads(actor_bytes)
-        state, _, _, _ = asyncio.run(evaluate_episode(
-            env, actor, seed, horizon, None, 0, collect_samples=False, parameters=parameters))
-        wait = (env.reward_cost_from_state(state) if env.reward_mode in ("r1", "r2", "r3", "r4")
-                else state["queue_time_integral"])
-        if env.reward_mode == "total_wait":
-            wait += state["external_wait_integral"]
-        return wait / (horizon * env.step_seconds)
-    finally:
-        torch.set_num_threads(previous)
+def validation_score(env, state, horizon, default_dt):
+    """Mean queue/cost per simulated second of one finished validation episode."""
+    wait = (env.reward_cost_from_state(state) if env.reward_mode in ("r1", "r2", "r3", "r4")
+            else state["queue_time_integral"])
+    if env.reward_mode == "total_wait":
+        wait += state["external_wait_integral"]
+    return wait / (horizon * getattr(env, "step_seconds", default_dt))
+
+
+_VALIDATION_PROCESS_ENV = None
+
+
+def validate_seed_process(env_bytes, actor_bytes, seed, horizon, parameters, default_dt):
+    """Score one frozen policy on one held-out seed in a dedicated validation process.
+
+    The process owns its own simulation environment, so validation shares
+    nothing with the learner or with the rollout workers.
+    """
+    global _VALIDATION_PROCESS_ENV
+    if _VALIDATION_PROCESS_ENV is None:
+        # One small observation per decision: extra torch threads only oversubscribe the CPU.
+        torch.set_num_threads(1)
+        _VALIDATION_PROCESS_ENV = pickle.loads(env_bytes)
+    env = _VALIDATION_PROCESS_ENV
+    actor = pickle.loads(actor_bytes)
+    state, _, _, _ = asyncio.run(evaluate_episode(
+        env, actor, seed, horizon, None, 0, collect_samples=False, parameters=parameters))
+    return validation_score(env, state, horizon, default_dt)
 
 
 async def amain(args):
@@ -467,6 +480,7 @@ async def amain(args):
     managers = []
     envs = []
     process_executors = []
+    validation_executors = []
     try:
         if args.backend == "python" and args.workers > 1:
             # "spawn": forking a process that already holds torch threads
@@ -503,6 +517,20 @@ async def amain(args):
             await env.setup()
             envs.append(env)
         env = envs[0]
+        validation_seeds = (args.validation_seed_base + 1, args.validation_seed_base + 2)
+        validation_dt = getattr(env, "step_seconds", .2 if args.scenario == "lvl" else .1)
+        validation_parameters = {}
+        validation_env_bytes = None
+        if args.backend == "python":
+            # Validation runs on its own two processes (one per held-out seed),
+            # so neither the learner nor the rollout workers ever wait for it.
+            # Held-out seeds are fixed: their demand is generated once, here.
+            validation_parameters = {seed: episode_parameters(seed)
+                                     for seed in validation_seeds}
+            validation_env_bytes = pickle.dumps(env, protocol=pickle.HIGHEST_PROTOCOL)
+            spawn = multiprocessing.get_context("spawn")
+            validation_executors = [concurrent.futures.ProcessPoolExecutor(
+                max_workers=1, mp_context=spawn) for _ in validation_seeds]
         agent_class = {"qlearning": TabularQAgent, "dqn": FlatDQNAgent,
                        "3dqn": ThreeDQNAgent, "rainbow": RainbowAgent,
                        "hybrid": SpatialHybridAgent}[args.algorithm]
@@ -535,8 +563,88 @@ async def amain(args):
         worker_states = [None] * args.workers
         worker_seeds = [None] * args.workers
         worker_sim_payloads = [None] * args.workers
-        pending_validation = None
-        validation_future = None
+        validation_queue = deque()  # frozen-policy jobs in submission order
+        validation_log_path = os.path.join(outdir, "validation_log.csv")
+
+        def record_validation(episode, step, scores, weights=None):
+            """Log one finished validation and keep the best policy; returns a marker."""
+            nonlocal best_validation_queue
+            score = sum(scores) / len(scores)
+            marker = ""
+            if score < best_validation_queue:
+                best_validation_queue = score
+                path = Path(outdir, "best_weights.pt")
+                if weights is None:
+                    agent.save(str(path))
+                else:
+                    # The policy that was scored, not the learner's current weights.
+                    tmp = path.with_suffix(".pt.tmp")
+                    tmp.write_bytes(weights)
+                    os.replace(tmp, path)
+                marker = "  <- best validation queue"
+            with open(validation_log_path, "a", newline="") as f:
+                csv.writer(f).writerow([episode, step, *scores, score])
+            if weights is not None:
+                print(f"[Validation] episode {episode} | step {step} | "
+                      f"score {score:.4f}{marker}", flush=True)
+            return marker
+
+        def submit_validation(job):
+            loop = asyncio.get_running_loop()
+            job["futures"] = [
+                loop.run_in_executor(validation_executors[i], validate_seed_process,
+                                     validation_env_bytes, job["actor"], seed,
+                                     args.episode_horizon, validation_parameters[seed],
+                                     validation_dt)
+                for i, seed in enumerate(validation_seeds)]
+            validation_queue.append(job)
+
+        async def collect_validation(wait=False):
+            """Record finished validations in order; block only when ``wait``."""
+            while validation_queue:
+                job = validation_queue[0]
+                if not all(future.done() for future in job["futures"]):
+                    if not wait:
+                        return
+                    await asyncio.wait(job["futures"])
+                scores = [future.result() for future in job["futures"]]
+                validation_queue.popleft()
+                record_validation(job["episode"], job["step"], scores, job["weights"])
+
+        async def validate_policy(episode, reset_worker0=False):
+            """Score the current policy on the held-out seeds.
+
+            Python backend: freeze it and hand it to the validation processes
+            without waiting. GAMA backend (no spare simulation process): run it
+            here and return the best-so-far marker.
+            """
+            if validation_executors:
+                weights = io.BytesIO()
+                agent.save(weights)
+                actor = make_actor(agent_class, agent, args, args.validation_seed_base)
+                submit_validation(dict(
+                    episode=episode, step=agent.decisions, weights=weights.getvalue(),
+                    actor=pickle.dumps(actor, protocol=pickle.HIGHEST_PROTOCOL)))
+                return ""
+            # Validation must not change the training reward normalizer.
+            normalizer = env._worst_delay_sq
+            scores = []
+            try:
+                for validation_seed in validation_seeds:
+                    last, _, _, _ = await evaluate_episode(
+                        env, agent, validation_seed, args.episode_horizon,
+                        DiscardSamples(), 0, collect_samples=False,
+                        parameters=episode_parameters(validation_seed))
+                    scores.append(validation_score(env, last, args.episode_horizon,
+                                                   validation_dt))
+            finally:
+                env._worst_delay_sq = normalizer
+                if reset_worker0:
+                    # Validation ran on worker 0's environment.
+                    worker_states[0] = None
+                    worker_seeds[0] = None
+            return record_validation(episode, agent.decisions, scores)
+
         if args.resume_dir:
             snapshot = torch.load(os.path.join(outdir, "training_state.pt"),
                                   map_location=agent.device, weights_only=False)
@@ -546,8 +654,8 @@ async def amain(args):
             ep = snapshot["episode"]
             next_seed = snapshot["next_seed"]
             best_validation_queue = snapshot["best_validation_queue"]
-            pending_validation = snapshot.get("pending_validation")
-            if pending_validation is not None and "best_before_validation" in snapshot:
+            pending_validations = snapshot.get("pending_validations", [])
+            if pending_validations and "best_before_validation" in snapshot:
                 # A validation newer than this checkpoint may have replaced the file.
                 best_path = Path(outdir, "best_weights.pt")
                 tmp = best_path.with_suffix(".pt.tmp")
@@ -570,6 +678,20 @@ async def amain(args):
                 episodes_done = (sum(row[-1] == "1" for row in old_rows[1:ep + 1])
                                  if args.workers > 1 else ep)
             print(f"[Train] Resumed episode {ep}, decision {agent.decisions}")
+            if pending_validations:
+                # A checkpoint can be written while frozen policies are being
+                # scored. Drop newer scores, then replay those validations.
+                if os.path.exists(validation_log_path):
+                    first_pending = min(job["step"] for job in pending_validations)
+                    with open(validation_log_path, newline="") as f:
+                        previous = [row for row in csv.reader(f)
+                                    if int(row[1]) < first_pending]
+                    tmp = validation_log_path + ".tmp"
+                    with open(tmp, "w", newline="") as f:
+                        csv.writer(f).writerows(previous)
+                    os.replace(tmp, validation_log_path)
+                for job in pending_validations:
+                    submit_validation(dict(job))
         else:
             if os.path.exists(log_path):
                 raise FileExistsError("Training output already exists; use --resume-dir")
@@ -583,8 +705,10 @@ async def amain(args):
                         "best_validation_queue": best_validation_queue,
                         "normalizers": [worker._worst_delay_sq for worker in envs],
                         "agent": agent.training_state()}
-            if pending_validation is not None:
-                snapshot["pending_validation"] = pending_validation
+            if validation_queue:
+                snapshot["pending_validations"] = [
+                    {key: value for key, value in job.items() if key != "futures"}
+                    for job in validation_queue]
                 if math.isfinite(best_validation_queue):
                     snapshot["best_before_validation"] = Path(outdir, "best_weights.pt").read_bytes()
             if process_executors:
@@ -610,78 +734,14 @@ async def amain(args):
         # Resumed workers rebuild their simulation from the checkpoint once.
         payload_pending = [worker_states[i] is not None for i in range(args.workers)]
 
-        def start_validation(job):
-            loop = asyncio.get_running_loop()
-            return asyncio.gather(*[
-                loop.run_in_executor(process_executors[i], evaluate_rainbow_worker, env,
-                                     job["actor"], seed, args.episode_horizon,
-                                     episode_parameters(seed), learner_threads)
-                for i, seed in enumerate((args.validation_seed_base + 1,
-                                          args.validation_seed_base + 2))
-            ])
-
-        async def finish_validation():
-            nonlocal best_validation_queue, pending_validation, validation_future
-            if validation_future is None:
-                return
-            scores = await validation_future
-            score = sum(scores) / len(scores)
-            episode, step = pending_validation["episode"], pending_validation["step"]
-            if score < best_validation_queue:
-                best_validation_queue = score
-                path = Path(outdir, "best_weights.pt")
-                tmp = path.with_suffix(".pt.tmp")
-                tmp.write_bytes(pending_validation["weights"])
-                os.replace(tmp, path)
-            with open(os.path.join(outdir, "validation_log.csv"), "a", newline="") as f:
-                csv.writer(f).writerow([episode, step, *scores, score])
-            print(f"[Validation] episode {episode} | step {step} | score {score:.4f}", flush=True)
-            pending_validation = validation_future = None
-
         async def validate_and_checkpoint(completed_episode, finished):
             """Validation and checkpoint cadence of one learned rollout."""
-            nonlocal best_validation_queue, pending_validation, validation_future
-            if validation_future is not None and validation_future.done():
-                await finish_validation()
+            await collect_validation()
             marker = ""
             if (not time_budget_reached() and
                     ((completed_episode and
                       episodes_done % args.validate_every == 0) or finished)):
-                if args.algorithm == "rainbow" and agent.device.type == "cpu":
-                    await finish_validation()
-                    weights = io.BytesIO()
-                    agent.save(weights)
-                    actor = make_actor(agent_class, agent, args, args.validation_seed_base)
-                    pending_validation = dict(episode=episodes_done, step=agent.decisions,
-                                              actor=pickle.dumps(actor, protocol=pickle.HIGHEST_PROTOCOL),
-                                              weights=weights.getvalue())
-                    validation_future = start_validation(pending_validation)
-                else:
-                    normalizer = env._worst_delay_sq
-                    scores = []
-                    try:
-                        for validation_seed in (args.validation_seed_base + 1,
-                                                args.validation_seed_base + 2):
-                            last, _, _, _ = await evaluate_episode(
-                                env, agent, validation_seed, args.episode_horizon,
-                                DiscardSamples(), 0, collect_samples=False,
-                                parameters=episode_parameters(validation_seed))
-                            wait = (env.reward_cost_from_state(last)
-                                    if args.reward_mode in ("r1", "r2", "r3", "r4")
-                                    else last["queue_time_integral"])
-                            if args.reward_mode == "total_wait":
-                                wait += last["external_wait_integral"]
-                            dt = getattr(env, "step_seconds", .2 if args.scenario == "lvl" else .1)
-                            scores.append(wait / (args.episode_horizon * dt))
-                    finally:
-                        env._worst_delay_sq = normalizer
-                    score = sum(scores) / len(scores)
-                    with open(os.path.join(outdir, "validation_log.csv"), "a", newline="") as f:
-                        csv.writer(f).writerow([episodes_done, agent.decisions, *scores, score])
-                    if score < best_validation_queue:
-                        best_validation_queue = score
-                        agent.save(os.path.join(outdir, "best_weights.pt"))
-                        marker = "  <- best validation queue"
+                marker = await validate_policy(episodes_done)
             if (completed_episode and episodes_done % args.checkpoint_every == 0
                     and not time_budget_reached() and not finished):
                 agent.save(os.path.join(outdir, "checkpoint.pt"))
@@ -790,21 +850,8 @@ async def amain(args):
                 raise
 
         if process_executors and args.rollout_mode == "async":
-            if pending_validation is not None:
-                # A checkpoint can be written while the frozen policy is being
-                # evaluated. Discard newer scores when replaying that validation.
-                path = Path(outdir, "validation_log.csv")
-                if path.exists():
-                    with path.open(newline="") as f:
-                        previous = [row for row in csv.reader(f)
-                                    if int(row[1]) < pending_validation["step"]]
-                    tmp = path.with_suffix(".csv.tmp")
-                    with tmp.open("w", newline="") as f:
-                        csv.writer(f).writerows(previous)
-                    os.replace(tmp, path)
-                validation_future = start_validation(pending_validation)
             await run_async_rollouts()
-            await finish_validation()
+            await collect_validation(wait=True)
             # All in-flight results are now reflected in one resumable checkpoint.
             agent.save(os.path.join(outdir, "checkpoint.pt"))
             save_training_snapshot()
@@ -900,39 +947,13 @@ async def amain(args):
                            item["simulated_cycles"], int(completed_episode)]
                     with open(log_path, "a", newline="") as f:
                         csv.writer(f).writerow(row)
+                    await collect_validation()
                     marker = ""
                     if (not time_budget_reached() and
                             ((completed_episode and
                               episodes_done % args.validate_every == 0) or finished)):
-                        normalizer = env._worst_delay_sq
-                        scores = []
-                        try:
-                            for validation_seed in (args.validation_seed_base + 1,
-                                                    args.validation_seed_base + 2):
-                                last, _, _, _ = await evaluate_episode(
-                                    env, agent, validation_seed, args.episode_horizon,
-                                    DiscardSamples(), 0, collect_samples=False,
-                                    parameters=episode_parameters(validation_seed))
-                                wait = (env.reward_cost_from_state(last)
-                                        if args.reward_mode in ("r1", "r2", "r3", "r4")
-                                        else last["queue_time_integral"])
-                                if args.reward_mode == "total_wait":
-                                    wait += last["external_wait_integral"]
-                                dt = getattr(env, "step_seconds", .2 if args.scenario == "lvl" else .1)
-                                scores.append(wait / (args.episode_horizon * dt))
-                        finally:
-                            env._worst_delay_sq = normalizer
-                            if not process_executors:
-                                # Validation ran on worker 0's environment.
-                                worker_states[0] = None
-                                worker_seeds[0] = None
-                        score = sum(scores) / len(scores)
-                        with open(os.path.join(outdir, "validation_log.csv"), "a", newline="") as f:
-                            csv.writer(f).writerow([episodes_done, agent.decisions, *scores, score])
-                        if score < best_validation_queue:
-                            best_validation_queue = score
-                            agent.save(os.path.join(outdir, "best_weights.pt"))
-                            marker = "  <- best validation queue"
+                        marker = await validate_policy(
+                            episodes_done, reset_worker0=not process_executors)
                     if (time_budget_reached() or finished or
                             (completed_episode and
                              episodes_done % args.checkpoint_every == 0)):
@@ -999,36 +1020,12 @@ async def amain(args):
             with open(log_path, "a", newline="") as f:
                 csv.writer(f).writerow(row)
 
+            await collect_validation()
             marker = ""
             if (not time_budget_reached() and
                     (ep % args.validate_every == 0 or agent.decisions >= args.total_steps or
                      ep == args.episodes)):
-                # Validation must not change the training reward normalizer.
-                normalizer = env._worst_delay_sq
-                scores = []
-                try:
-                    for validation_seed in (args.validation_seed_base + 1,
-                                            args.validation_seed_base + 2):
-                        last, _, _, _ = await evaluate_episode(env, agent, validation_seed,
-                            args.episode_horizon, DiscardSamples(), 0,
-                            collect_samples=False,
-                            parameters=episode_parameters(validation_seed))
-                        wait = (env.reward_cost_from_state(last)
-                                if args.reward_mode in ("r1", "r2", "r3", "r4")
-                                else last["queue_time_integral"])
-                        if args.reward_mode == "total_wait":
-                            wait += last["external_wait_integral"]
-                        dt = getattr(env, "step_seconds", .2 if args.scenario == "lvl" else .1)
-                        scores.append(wait / (args.episode_horizon * dt))
-                finally:
-                    env._worst_delay_sq = normalizer
-                score = sum(scores) / len(scores)
-                with open(os.path.join(outdir, "validation_log.csv"), "a", newline="") as f:
-                    csv.writer(f).writerow([ep, agent.decisions, *scores, score])
-                if score < best_validation_queue:
-                    best_validation_queue = score
-                    agent.save(os.path.join(outdir, "best_weights.pt"))
-                    marker = "  <- best validation queue"
+                marker = await validate_policy(ep)
             if (time_budget_reached() or ep % args.checkpoint_every == 0 or
                     agent.decisions >= args.total_steps or ep == args.episodes):
                 agent.save(os.path.join(outdir, "checkpoint.pt"))
@@ -1043,6 +1040,10 @@ async def amain(args):
                   f"queue={state['current_queue_length']:2d} | {wall:5.1f}s{marker}")
 
             episodes_done = ep
+        if validation_queue:
+            # The loops above never waited for validation; collect what is still running.
+            await collect_validation(wait=True)
+            save_training_snapshot()
         # 4. Luu weights cuoi cung
         final_path = os.path.join(outdir, "dqn_weights.pt")
         agent.save(final_path)
@@ -1095,7 +1096,7 @@ async def amain(args):
         print(f"[Train] Log huan luyen    : {log_path}")
         print(f"[Train] Train wall time    : {train_elapsed:.1f}s")
     finally:
-        for executor in process_executors:
+        for executor in process_executors + validation_executors:
             executor.shutdown(wait=True, cancel_futures=True)
         if args.start_server and not args.keep_server:
             # These workspaces and JVMs belong only to this training run.
