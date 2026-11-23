@@ -30,6 +30,7 @@ import torch
 from .three_dqn_agent import ThreeDQNAgent, FlatDQNAgent
 from .rainbow_agent import RainbowAgent
 from .hybrid_agent import SpatialHybridAgent
+from .xla_support import resolve_device
 from .tabular_agent import TabularQAgent
 from .gama_env import GamaTrafficEnv, QUEUE_FEATURE_SCALES, featurize
 from .python_env import PythonTrafficEnv
@@ -157,8 +158,13 @@ def parse_args(argv=None):
     p.add_argument("--target-update", type=int, default=2000)
     p.add_argument("--model-path", type=str, default=None,
                    help="Optional .gaml path override for the selected scenario")
-    p.add_argument("--device", choices=("cpu", "mps", "cuda"), default=None,
-                   help="Device for PyTorch learner (default: cpu on Mac, cuda if available)")
+    p.add_argument("--device", choices=("cpu", "mps", "cuda", "xla"), default=None,
+                   help="Device for PyTorch learner (default: cpu on Mac, cuda if available; "
+                        "xla = TPU through torch_xla, learner only, workers stay on CPU)")
+    p.add_argument("--allow-code-change", action="store_true",
+                   help="Resume although the hashed source files differ from the checkpoint's "
+                        "(only for deliberate code updates such as adding a device; training "
+                        "settings must still match). Later checkpoints store the new hashes.")
     args = p.parse_args(argv)
     if args.sim_config and (args.backend != "python" or args.scenario != "lvl"):
         p.error("--sim-config requires --backend python --scenario lvl")
@@ -311,12 +317,14 @@ RESUMABLE_CHANGES = ("workers", "device", "max_train_seconds", "learner", "max_l
                      "rollout_mode", "validate_every", "checkpoint_every", "gama_heap_mb")
 
 
-def check_resume_config(saved, current):
-    """Raise unless ``saved`` and ``current`` differ only in RESUMABLE_CHANGES;
-    return the keys that differ."""
+def check_resume_config(saved, current, allow_code_change=False):
+    """Raise unless ``saved`` and ``current`` differ only in RESUMABLE_CHANGES
+    (and, with ``allow_code_change``, in the source hashes); return the keys
+    that differ."""
     changed = sorted(key for key in set(saved) | set(current)
                      if saved.get(key) != current.get(key))
-    blocked = [key for key in changed if key not in RESUMABLE_CHANGES]
+    allowed = RESUMABLE_CHANGES + (("code_sha256",) if allow_code_change else ())
+    blocked = [key for key in changed if key not in allowed]
     if blocked:
         raise ValueError("Resume requires identical training settings and source code "
                          f"(changed: {', '.join(blocked)})")
@@ -631,7 +639,7 @@ async def amain(args):
     config_path = os.path.join(outdir, "training_config.json")
     if args.resume_dir and os.path.exists(config_path):
         with open(config_path) as stream:
-            changed = check_resume_config(json.load(stream), config)
+            changed = check_resume_config(json.load(stream), config, args.allow_code_change)
         if changed:
             print("[Train] Resuming with changed run settings: " + ", ".join(
                 f"{key}" for key in changed))
@@ -752,7 +760,7 @@ async def amain(args):
                        "hybrid": SpatialHybridAgent}[args.algorithm]
         agent_kwargs = spatial_kwargs(args)
         if args.algorithm != "qlearning" and args.device is not None:
-            agent_kwargs["device"] = torch.device(args.device)
+            agent_kwargs["device"] = resolve_device(args.device)
         agent = agent_class(
             lr=args.lr, gamma=args.gamma, buffer_size=args.buffer_size,
             warmup=args.warmup, batch_size=args.batch_size, tau=args.tau,
@@ -869,8 +877,8 @@ async def amain(args):
 
         if args.resume_dir:
             snapshot = torch.load(os.path.join(outdir, "training_state.pt"),
-                                  map_location=agent.device, weights_only=False)
-            check_resume_config(snapshot["config"], config)
+                                  map_location="cpu", weights_only=False)
+            check_resume_config(snapshot["config"], config, args.allow_code_change)
             agent.restore_training(snapshot["agent"])
             ep = snapshot["episode"]
             next_seed = snapshot["next_seed"]

@@ -15,8 +15,10 @@ from torch import nn
 
 try:
     from .three_dqn_agent import valid_mask
+    from .xla_support import sync as sync_device, to_cpu
 except ImportError:  # train.py also runs as a standalone script
     from .three_dqn_agent import valid_mask
+    from .xla_support import sync as sync_device, to_cpu
 
 
 ARCHITECTURE = "gama-rainbow-spatial-4x6x20x16-v4"
@@ -415,7 +417,8 @@ class RainbowAgent:
             lower = b.floor().long().clamp(0, self.atoms - 1)
             upper = b.ceil().long().clamp(0, self.atoms - 1)
             low_weight = upper.float() - b
-            low_weight[lower == upper] = 1.0
+            # where() instead of a boolean-mask assignment: static shapes for XLA
+            low_weight = torch.where(lower == upper, torch.ones_like(low_weight), low_weight)
             projection = torch.zeros_like(target_probs)
             projection.scatter_add_(1, lower, target_probs * low_weight)
             projection.scatter_add_(1, upper, target_probs * (b - lower.float()))
@@ -425,6 +428,7 @@ class RainbowAgent:
         loss.backward()
         nn.utils.clip_grad_norm_(self.online_net.parameters(), 10.0)
         self.optimizer.step()
+        sync_device(device)  # XLA: run the lazy graph; no-op elsewhere
         self.buffer.update_priorities(indices, losses.detach().cpu().numpy())
         self.update_count += 1
         if self.update_count % self.target_update == 0:
@@ -440,15 +444,15 @@ class RainbowAgent:
     def save(self, path):
         torch.save({"architecture": ARCHITECTURE, "reward_mode": self.reward_mode,
                     "reward_settings": self.reward_settings,
-                    "online_net": self.online_net.state_dict(),
-                    "target_net": self.target_net.state_dict(),
+                    "online_net": to_cpu(self.online_net.state_dict()),
+                    "target_net": to_cpu(self.target_net.state_dict()),
                     "decisions": self.decisions, "update_count": self.update_count,
                     "gamma": self.gamma, "n_step": self.n_step,
                     "atoms": self.atoms, "v_min": self.v_min, "v_max": self.v_max,
                     "r1_ref": self.r1_ref}, path)
 
     def load(self, path):
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
         if ckpt.get("architecture") not in (ARCHITECTURE, LEGACY_ARCHITECTURE,
                                              PREVIOUS_ARCHITECTURE):
             raise ValueError("Rainbow checkpoint architecture mismatch")
@@ -477,9 +481,9 @@ class RainbowAgent:
             device_rng = [state.cpu() for state in torch.cuda.get_rng_state_all()]
         return {"architecture": ARCHITECTURE,
                 "reward_mode": self.reward_mode, "reward_settings": self.reward_settings,
-                "policy": {"online": self.online_net.state_dict(),
-                           "target": self.target_net.state_dict()},
-                "optimizer": self.optimizer.state_dict(),
+                "policy": {"online": to_cpu(self.online_net.state_dict()),
+                           "target": to_cpu(self.target_net.state_dict())},
+                "optimizer": to_cpu(self.optimizer.state_dict()),
                 "decisions": self.decisions, "update_count": self.update_count,
                 "losses": list(self.last_losses), "action_rng": self.rng.getstate(),
                 "torch_rng": torch.get_rng_state(), "device_rng": device_rng,

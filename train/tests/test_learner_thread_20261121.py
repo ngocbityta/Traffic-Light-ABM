@@ -145,6 +145,30 @@ class ResumeAcrossMachinesTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             check_resume_config(saved, dict(saved, code_sha256={"a": "2"}))
 
+    def test_allow_code_change_only_unblocks_source_hashes(self):
+        from train.logic.train import check_resume_config
+        saved = {"workers": 6, "device": None, "lr": 1e-4, "code_sha256": {"a": "1"}}
+        newer = dict(saved, device="xla", code_sha256={"a": "2"})
+        self.assertEqual(check_resume_config(saved, newer, allow_code_change=True),
+                         ["code_sha256", "device"])
+        with self.assertRaises(ValueError):
+            check_resume_config(saved, dict(newer, lr=3e-4), allow_code_change=True)
+
+
+class XlaSupportTests(unittest.TestCase):
+    def test_to_cpu_copies_nested_tensors_and_keeps_other_values(self):
+        import torch
+        from train.logic.xla_support import is_xla, resolve_device, sync, to_cpu
+        source = {"state": {0: {"step": torch.tensor(3.0), "avg": torch.ones(2)}},
+                  "param_groups": [{"lr": 1e-4, "params": [0]}]}
+        copy = to_cpu(source)
+        self.assertEqual(copy["param_groups"], source["param_groups"])
+        self.assertIsNot(copy["state"][0]["avg"], source["state"][0]["avg"])
+        self.assertTrue(torch.equal(copy["state"][0]["avg"], source["state"][0]["avg"]))
+        self.assertFalse(is_xla("cpu"))
+        self.assertEqual(resolve_device("cpu").type, "cpu")
+        sync(torch.device("cpu"))  # no-op, must not import torch_xla
+
 
 if __name__ == "__main__":
     unittest.main()

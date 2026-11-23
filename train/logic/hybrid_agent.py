@@ -11,9 +11,11 @@ from torch import nn
 try:
     from .rainbow_agent import AUX_SIZE, N_ACTIONS, PrioritizedReplay
     from .three_dqn_agent import valid_mask
+    from .xla_support import sync as sync_device, to_cpu
 except ImportError:  # standalone train.py
     from .rainbow_agent import AUX_SIZE, N_ACTIONS, PrioritizedReplay
     from .three_dqn_agent import valid_mask
+    from .xla_support import sync as sync_device, to_cpu
 
 
 ARCHITECTURE = "gama-spatial-3dqn-maxpressure-4x6x20x16-v2"
@@ -220,6 +222,7 @@ class SpatialHybridAgent:
             for target_param, online_param in zip(self.target_net.parameters(),
                                                   self.online_net.parameters()):
                 target_param.lerp_(online_param, self.tau)
+        sync_device(device)  # XLA: run the lazy graph; no-op elsewhere
         self.update_count += 1
         value = float(loss.item())
         self.last_losses.append(value)
@@ -233,14 +236,14 @@ class SpatialHybridAgent:
         torch.save({"architecture": ARCHITECTURE, "reward_mode": self.reward_mode,
                     "reward_settings": self.reward_settings,
                     "pressure_lambda": self.pressure_lambda,
-                    "online_net": self.online_net.state_dict(),
-                    "target_net": self.target_net.state_dict(),
+                    "online_net": to_cpu(self.online_net.state_dict()),
+                    "target_net": to_cpu(self.target_net.state_dict()),
                     "gamma": self.gamma, "eps": self.eps,
                     "q_spread": self.q_spread, "pressure_spread": self.pressure_spread,
                     "decisions": self.decisions, "update_count": self.update_count}, path)
 
     def load(self, path):
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
         if ckpt.get("architecture") != ARCHITECTURE:
             raise ValueError("Spatial hybrid checkpoint architecture mismatch")
         self.online_net.load_state_dict(ckpt["online_net"])
@@ -258,9 +261,9 @@ class SpatialHybridAgent:
 
     def training_state(self):
         return {"architecture": ARCHITECTURE,
-                "policy": {"online": self.online_net.state_dict(),
-                           "target": self.target_net.state_dict()},
-                "optimizer": self.optimizer.state_dict(),
+                "policy": {"online": to_cpu(self.online_net.state_dict()),
+                           "target": to_cpu(self.target_net.state_dict())},
+                "optimizer": to_cpu(self.optimizer.state_dict()),
                 "eps": self.eps, "decisions": self.decisions,
                 "update_count": self.update_count,
                 "q_spread": self.q_spread, "pressure_spread": self.pressure_spread,
