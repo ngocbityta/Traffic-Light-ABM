@@ -67,3 +67,6 @@ validation/__pycache__/
 
 # Local Colab CLI checkout
 /google-colab-cli/
+docs/
+vast_session1/
+kaggle_session1/
