@@ -28,6 +28,12 @@ N_ACTIONS = 4
 
 
 def pack_observation(observation):
+    encoded, aux = encode_observation(observation)
+    return zlib.compress(encoded.tobytes(), 1), aux
+
+
+def encode_observation(observation):
+    """Validated uint8 grid code and float16 aux: what ``pack_observation`` compresses."""
     grid = np.asarray(observation["grid"], dtype=np.float32)
     aux = np.asarray(observation["aux"], dtype=np.float32)
     if grid.shape != GRID_SHAPE or aux.shape != (AUX_SIZE,):
@@ -40,16 +46,23 @@ def pack_observation(observation):
         raise ValueError("Rainbow state channels are outside their normalized ranges")
     encoded = np.rint(np.clip(grid, 0, 1) * 255).astype(np.uint8)
     encoded[:, 4] = np.rint(np.clip(grid[:, 4], -1, 1) * 127).astype(np.int8).view(np.uint8)
-    blob = zlib.compress(encoded.tobytes(), 1)
-    return blob, aux.astype(np.float16)
+    return encoded, aux.astype(np.float16)
+
+
+def decode_grids(raw):
+    """Float grids from a uint8 code batch shaped (n, *GRID_SHAPE)."""
+    grids = raw.astype(np.float32) / 255.0
+    grids[:, :, 4] = raw[:, :, 4].view(np.int8).astype(np.float32) / 127.0
+    return grids
+
+
+def blob_code(blob):
+    return np.frombuffer(zlib.decompress(blob), dtype=np.uint8).reshape(GRID_SHAPE)
 
 
 def unpack_observations(blobs, aux):
-    raw = np.stack([np.frombuffer(zlib.decompress(blob), dtype=np.uint8).reshape(GRID_SHAPE)
-                    for blob in blobs])
-    grids = raw.astype(np.float32) / 255.0
-    grids[:, :, 4] = raw[:, :, 4].view(np.int8).astype(np.float32) / 127.0
-    return grids, np.asarray(aux, dtype=np.float32)
+    raw = np.stack([blob_code(blob) for blob in blobs])
+    return decode_grids(raw), np.asarray(aux, dtype=np.float32)
 
 
 class SumMinTree:
@@ -128,13 +141,30 @@ class PrioritizedReplay:
         self.next_masks = np.zeros((self.capacity, N_ACTIONS), dtype=np.bool_)
         self.max_priority = 1.0
         self.pos = self.size = 0
+        self.state_codes = self.next_state_codes = None  # set by use_raw_observations()
+
+    def use_raw_observations(self):
+        """Keep grid codes as uint8 arrays instead of zlib blobs (~1.5 GB at 100k).
+
+        Sampling then skips decompression; the decoded values, the sampling
+        stream and the snapshot format (zlib blobs) are unchanged."""
+        if self.size:
+            raise ValueError("Switch the replay storage before storing transitions")
+        shape = (self.capacity,) + GRID_SHAPE
+        self.state_codes = np.zeros(shape, dtype=np.uint8)
+        self.next_state_codes = np.zeros(shape, dtype=np.uint8)
+        self.states = self.next_states = None
 
     def push(self, state, action, reward, next_state, done, discount, next_mask):
         if action not in range(N_ACTIONS) or not np.isfinite(reward) or not 0 <= discount <= 1:
             raise ValueError("Invalid Rainbow transition")
         p = self.pos
-        self.states[p], self.aux[p] = pack_observation(state)
-        self.next_states[p], self.next_aux[p] = pack_observation(next_state)
+        if self.state_codes is not None:
+            self.state_codes[p], self.aux[p] = encode_observation(state)
+            self.next_state_codes[p], self.next_aux[p] = encode_observation(next_state)
+        else:
+            self.states[p], self.aux[p] = pack_observation(state)
+            self.next_states[p], self.next_aux[p] = pack_observation(next_state)
         self.actions[p] = action
         self.rewards[p] = reward
         self.dones[p] = done
@@ -157,9 +187,15 @@ class PrioritizedReplay:
         minimum = self.tree.minimum[1] / total
         weights = (self.size * probabilities) ** (-beta)
         weights /= (self.size * minimum) ** (-beta)
-        states, aux = unpack_observations([self.states[i] for i in indices], self.aux[indices])
-        next_states, next_aux = unpack_observations(
-            [self.next_states[i] for i in indices], self.next_aux[indices])
+        if self.state_codes is not None:
+            states = decode_grids(self.state_codes[indices])
+            next_states = decode_grids(self.next_state_codes[indices])
+            aux = np.asarray(self.aux[indices], dtype=np.float32)
+            next_aux = np.asarray(self.next_aux[indices], dtype=np.float32)
+        else:
+            states, aux = unpack_observations([self.states[i] for i in indices], self.aux[indices])
+            next_states, next_aux = unpack_observations(
+                [self.next_states[i] for i in indices], self.next_aux[indices])
         return (indices, weights.astype(np.float32), states, aux,
                 self.actions[indices].astype(np.int64), self.rewards[indices],
                 next_states, next_aux, self.dones[indices].astype(np.float32),
@@ -178,11 +214,20 @@ class PrioritizedReplay:
     def __len__(self):
         return self.size
 
+    def _blobs(self, codes, n):
+        # Same bytes as pack_observation() wrote: zlib level 1 of the uint8 code.
+        return [zlib.compress(codes[i].tobytes(), 1) for i in range(n)]
+
     def snapshot(self):
         n = self.size
+        if self.state_codes is not None:
+            states = self._blobs(self.state_codes, n)
+            next_states = self._blobs(self.next_state_codes, n)
+        else:
+            states, next_states = self.states[:n], self.next_states[:n]
         return {"capacity": self.capacity, "size": n, "pos": self.pos,
                 "max_priority": self.max_priority, "rng": self.rng.bit_generator.state,
-                "states": self.states[:n], "next_states": self.next_states[:n],
+                "states": states, "next_states": next_states,
                 "tree_sum": self.tree.sum.copy(), "tree_min": self.tree.minimum.copy(),
                 **{name: getattr(self, name)[:n].copy() for name in
                    ("aux", "next_aux", "actions", "rewards", "discounts", "dones", "next_masks")}}
@@ -193,8 +238,13 @@ class PrioritizedReplay:
         self.size, self.pos = state["size"], state["pos"]
         self.max_priority = state["max_priority"]
         self.rng.bit_generator.state = state["rng"]
-        self.states[:self.size] = state["states"]
-        self.next_states[:self.size] = state["next_states"]
+        if self.state_codes is not None:
+            for i in range(self.size):
+                self.state_codes[i] = blob_code(state["states"][i])
+                self.next_state_codes[i] = blob_code(state["next_states"][i])
+        else:
+            self.states[:self.size] = state["states"]
+            self.next_states[:self.size] = state["next_states"]
         self.tree.sum[:] = state["tree_sum"]
         self.tree.minimum[:] = state["tree_min"]
         for name in ("aux", "next_aux", "actions", "rewards", "discounts", "dones", "next_masks"):
@@ -317,6 +367,33 @@ class RainbowAgent:
         self.decisions = self.update_count = 0
         self.eps = 0.0  # NoisyNet replaces epsilon exploration after replay warm-up.
         self.last_losses = deque(maxlen=100)
+        # Fast learner (enable_fast_learner): same update rule, fewer kernel launches.
+        self.fast = self.use_graph = False
+        self._graph = None
+        self._graph_warmup = 0
+
+    GRAPH_WARMUP = 3  # eager updates on a side stream before capturing the graph
+
+    def enable_fast_learner(self):
+        """Faster learner with the same algorithm: uint8 replay (bit-identical
+        samples), one online forward over [s; s2] (same noise, no BatchNorm),
+        and on CUDA the whole gradient step replayed as one CUDA graph. The
+        noise is still drawn eagerly before each update, in the same order."""
+        self.buffer.use_raw_observations()
+        self.fast = True
+        self.use_graph = self.device.type == "cuda"
+        self._rows = torch.arange(self.batch_size, device=self.device)
+        if self.use_graph:
+            self._make_optimizer_capturable()
+
+    def _make_optimizer_capturable(self):
+        for group in self.optimizer.param_groups:
+            group["capturable"] = True
+        for state in self.optimizer.state.values():
+            if "step" in state:
+                state["step"] = state["step"].to(self.device, torch.float32)
+        self._graph = None  # optimizer tensors may have been replaced: capture again
+        self._graph_warmup = 0
 
     def act(self, state, greedy=False, action_mask=None, force_random=False):
         mask = valid_mask(action_mask)
@@ -383,6 +460,8 @@ class RainbowAgent:
         return len(self.buffer) >= max(self.warmup, self.batch_size)
 
     def update(self):
+        if self.fast:
+            return self._update_fast()
         beta = min(1.0, self.per_beta_start +
                    (1.0 - self.per_beta_start) * self.update_count / self.per_beta_steps)
         (indices, weights, states, aux, actions, rewards, next_states,
@@ -433,6 +512,98 @@ class RainbowAgent:
         self.last_losses.append(value)
         return value
 
+    # Fast learner ---------------------------------------------------------
+    # Same sample -> loss -> priority order, same beta schedule, same noise
+    # stream (online then target reset_noise, drawn eagerly before the step).
+
+    BATCH_FIELDS = ("states", "aux", "next_states", "next_aux", "actions", "rewards",
+                    "dones", "discounts", "masks", "weights")
+
+    def _train_step(self, s, a, s2, a2, actions, rewards, dones, discounts, masks, weights):
+        """One gradient step on device tensors; returns (losses, loss) on device.
+        Free of host syncs so it can be captured in a CUDA graph."""
+        n = self.batch_size
+        rows = self._rows
+        out = self.online_net(torch.cat((s, s2)), torch.cat((a, a2)))
+        logits = out[:n][rows, actions]
+        with torch.no_grad():
+            online_probs = out[n:].detach().softmax(dim=-1)
+            q_next = (online_probs * self.support).sum(dim=-1).masked_fill(~masks, -torch.inf)
+            best = q_next.argmax(dim=1)
+            self.target_net.train()
+            target_probs = self.target_net(s2, a2).softmax(dim=-1)[rows, best]
+            self.target_net.eval()
+            tz = (rewards[:, None] + (1 - dones[:, None]) *
+                  discounts[:, None] * self.support[None]).clamp(self.v_min, self.v_max)
+            b = (tz - self.v_min) / self.delta_z
+            lower = b.floor().long().clamp(0, self.atoms - 1)
+            upper = b.ceil().long().clamp(0, self.atoms - 1)
+            low_weight = torch.where(lower == upper, torch.ones_like(b), upper.float() - b)
+            projection = torch.zeros_like(target_probs)
+            projection.scatter_add_(1, lower, target_probs * low_weight)
+            projection.scatter_add_(1, upper, target_probs * (b - lower.float()))
+        losses = -(projection * logits.log_softmax(dim=-1)).sum(dim=-1)
+        loss = (losses * weights).mean()
+        self.optimizer.zero_grad(set_to_none=False)
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.online_net.parameters(), 10.0)
+        self.optimizer.step()
+        return losses.detach(), loss.detach()
+
+    def _update_fast(self):
+        beta = min(1.0, self.per_beta_start +
+                   (1.0 - self.per_beta_start) * self.update_count / self.per_beta_steps)
+        (indices, weights, states, aux, actions, rewards, next_states,
+         next_aux, dones, discounts, masks) = self.buffer.sample(self.batch_size, beta)
+        batch = dict(states=states, aux=aux, next_states=next_states, next_aux=next_aux,
+                     actions=actions, rewards=rewards, dones=dones, discounts=discounts,
+                     masks=masks, weights=weights)
+        self.online_net.reset_noise()
+        self.target_net.reset_noise()
+        if self.use_graph:
+            losses, loss = self._graph_step(batch)
+        else:
+            tensors = [torch.as_tensor(batch[name], device=self.device) for name in self.BATCH_FIELDS]
+            losses, loss = self._train_step(*tensors)
+        self.buffer.update_priorities(indices, losses.cpu().numpy())
+        self.update_count += 1
+        if self.update_count % self.target_update == 0:
+            self.target_net.load_state_dict(self.online_net.state_dict())
+        value = float(loss.item())
+        self.last_losses.append(value)
+        return value
+
+    def _graph_step(self, batch):
+        if self._graph is None:
+            if self._graph_warmup == 0:
+                # Static input buffers: pinned host staging + device copies.
+                self._host = {k: torch.empty(v.shape, dtype=torch.as_tensor(v).dtype).pin_memory()
+                              for k, v in batch.items()}
+                self._static = {k: torch.empty_like(t, device=self.device) for k, t in self._host.items()}
+                self._side = torch.cuda.Stream(device=self.device)
+            self._load_batch(batch)
+            if self._graph_warmup < self.GRAPH_WARMUP:
+                # Real updates, run eagerly on a side stream as CUDA graphs require.
+                self._side.wait_stream(torch.cuda.current_stream(self.device))
+                with torch.cuda.stream(self._side):
+                    result = self._train_step(*(self._static[k] for k in self.BATCH_FIELDS))
+                torch.cuda.current_stream(self.device).wait_stream(self._side)
+                self._graph_warmup += 1
+                return result
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self._graph_out = self._train_step(*(self._static[k] for k in self.BATCH_FIELDS))
+            self._graph = graph
+        else:
+            self._load_batch(batch)
+        self._graph.replay()  # capture records only: the first replay runs this update
+        return self._graph_out
+
+    def _load_batch(self, batch):
+        for name, values in batch.items():
+            self._host[name].numpy()[...] = values
+            self._static[name].copy_(self._host[name], non_blocking=True)
+
     @property
     def avg_loss(self):
         return float(np.mean(self.last_losses)) if self.last_losses else 0.0
@@ -479,11 +650,23 @@ class RainbowAgent:
                 "reward_mode": self.reward_mode, "reward_settings": self.reward_settings,
                 "policy": {"online": self.online_net.state_dict(),
                            "target": self.target_net.state_dict()},
-                "optimizer": self.optimizer.state_dict(),
+                "optimizer": self._portable_optimizer_state(),
                 "decisions": self.decisions, "update_count": self.update_count,
                 "losses": list(self.last_losses), "action_rng": self.rng.getstate(),
                 "torch_rng": torch.get_rng_state(), "device_rng": device_rng,
                 "replay": self.buffer.snapshot()}
+
+    def _portable_optimizer_state(self):
+        """Adam state as the eager learner saves it (capturable off, CPU steps),
+        so checkpoints from either learner resume in either one."""
+        saved = self.optimizer.state_dict()
+        if not self.use_graph:
+            return saved
+        for group in saved["param_groups"]:
+            group["capturable"] = False
+        saved["state"] = {key: {**value, "step": value["step"].cpu()} if "step" in value else value
+                          for key, value in saved["state"].items()}
+        return saved
 
     def restore_training(self, state):
         if state["architecture"] != ARCHITECTURE:
@@ -491,6 +674,8 @@ class RainbowAgent:
         self.online_net.load_state_dict(state["policy"]["online"])
         self.target_net.load_state_dict(state["policy"]["target"])
         self.optimizer.load_state_dict(state["optimizer"])
+        if self.use_graph:
+            self._make_optimizer_capturable()
         self.decisions, self.update_count = state["decisions"], state["update_count"]
         self.last_losses.clear()
         self.last_losses.extend(state["losses"])

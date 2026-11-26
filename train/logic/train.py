@@ -159,7 +159,16 @@ def parse_args(argv=None):
                    help="Optional .gaml path override for the selected scenario")
     p.add_argument("--device", choices=("cpu", "mps", "cuda"), default=None,
                    help="Device for PyTorch learner (default: cpu on Mac, cuda if available)")
+    p.add_argument("--allow-code-change", action="store_true",
+                   help="Resume although the hashed source files differ from the checkpoint's "
+                        "(only for deliberate code updates such as a faster learner; training "
+                        "settings must still match). Later checkpoints store the new hashes.")
+    p.add_argument("--fast-learner", action="store_true",
+                   help="Rainbow only: same update rule with uint8 replay, one online forward "
+                        "over [s; s2] and, on CUDA, the gradient step as one CUDA graph")
     args = p.parse_args(argv)
+    if args.fast_learner and args.algorithm != "rainbow":
+        p.error("--fast-learner is only implemented for --algorithm rainbow")
     if args.sim_config and (args.backend != "python" or args.scenario != "lvl"):
         p.error("--sim-config requires --backend python --scenario lvl")
     args.simulation_config = load_sim_config(args.sim_config)
@@ -311,12 +320,58 @@ RESUMABLE_CHANGES = ("workers", "device", "max_train_seconds", "learner", "max_l
                      "rollout_mode", "validate_every", "checkpoint_every", "gama_heap_mb")
 
 
-def check_resume_config(saved, current):
-    """Raise unless ``saved`` and ``current`` differ only in RESUMABLE_CHANGES;
-    return the keys that differ."""
+class DemandManifest:
+    """seed -> demand file record, written to ``demand_manifest.json`` on ``flush``.
+
+    ``record`` only updates memory. Rewriting the whole indented JSON for every
+    episode took the learner process's GIL for O(entries) time (over 100 ms at
+    15k episodes) and slowed training down as the run grew, so the file is
+    written at checkpoints and at the end instead: it always matches the last
+    checkpoint, which is what a resume restarts from.
+    """
+
+    def __init__(self, path, entries=None):
+        self.path = path
+        self.entries = dict(entries or {})
+        self.lock = threading.Lock()
+        self.dirty = False
+
+    @classmethod
+    def load(cls, path):
+        with open(path) as stream:
+            return cls(path, json.load(stream))
+
+    def record(self, seed, path, digest, outdir, level=None):
+        entry = {"path": os.path.relpath(path, outdir), "sha256": digest}
+        if level is not None:
+            scale, imbalance, flows = level
+            entry.update(scale=round(scale, 6), axis_imbalance=round(imbalance, 6),
+                         flow_veh_h={arm: round(flow, 3) for arm, flow in flows.items()})
+        with self.lock:
+            self.entries[str(seed)] = entry
+            self.dirty = True
+
+    def flush(self):
+        with self.lock:
+            if not self.dirty:
+                return False
+            temporary = self.path + ".tmp"
+            with open(temporary, "w") as stream:
+                json.dump(self.entries, stream, indent=2, sort_keys=True)
+                stream.write("\n")
+            os.replace(temporary, self.path)
+            self.dirty = False
+            return True
+
+
+def check_resume_config(saved, current, allow_code_change=False):
+    """Raise unless ``saved`` and ``current`` differ only in RESUMABLE_CHANGES
+    (and, with ``allow_code_change``, in the source hashes); return the keys
+    that differ."""
     changed = sorted(key for key in set(saved) | set(current)
                      if saved.get(key) != current.get(key))
-    blocked = [key for key in changed if key not in RESUMABLE_CHANGES]
+    allowed = RESUMABLE_CHANGES + (("code_sha256",) if allow_code_change else ())
+    blocked = [key for key in changed if key not in allowed]
     if blocked:
         raise ValueError("Resume requires identical training settings and source code "
                          f"(changed: {', '.join(blocked)})")
@@ -631,7 +686,7 @@ async def amain(args):
     config_path = os.path.join(outdir, "training_config.json")
     if args.resume_dir and os.path.exists(config_path):
         with open(config_path) as stream:
-            changed = check_resume_config(json.load(stream), config)
+            changed = check_resume_config(json.load(stream), config, args.allow_code_change)
         if changed:
             print("[Train] Resuming with changed run settings: " + ", ".join(
                 f"{key}" for key in changed))
@@ -640,29 +695,15 @@ async def amain(args):
             json.dump(config, stream, indent=2, sort_keys=True)
             stream.write("\n")
     demand_manifest_path = os.path.join(outdir, "demand_manifest.json")
-    demand_manifest = {}
-    demand_manifest_lock = threading.Lock()
     if args.resume_dir and os.path.exists(demand_manifest_path):
-        with open(demand_manifest_path) as stream:
-            demand_manifest = json.load(stream)
+        manifest = DemandManifest.load(demand_manifest_path)
+    else:
+        manifest = DemandManifest(demand_manifest_path)
+    demand_manifest = manifest.entries  # the same dict, for the training summary
 
     def record_demand(seed, path, digest, level=None):
-        # Demand generation currently happens in the learner process before
-        # worker submission. Keep the read/modify/replace atomic if callers
-        # later move this helper onto worker threads.
-        with demand_manifest_lock:
-            demand_manifest[str(seed)] = {"path": os.path.relpath(path, outdir),
-                                          "sha256": digest}
-            if level is not None:
-                scale, imbalance, flows = level
-                demand_manifest[str(seed)].update(
-                    scale=round(scale, 6), axis_imbalance=round(imbalance, 6),
-                    flow_veh_h={arm: round(flow, 3) for arm, flow in flows.items()})
-            temporary = demand_manifest_path + ".tmp"
-            with open(temporary, "w") as stream:
-                json.dump(demand_manifest, stream, indent=2, sort_keys=True)
-                stream.write("\n")
-            os.replace(temporary, demand_manifest_path)
+        # Memory only: the file is written by manifest.flush() at checkpoints.
+        manifest.record(seed, path, digest, outdir, level)
 
     validation_levels = {args.validation_seed_base + 1 + i: level
                          for i, level in enumerate(args.validation_levels)}
@@ -759,6 +800,9 @@ async def amain(args):
             eps_start=args.eps_start, eps_decay_steps=args.eps_decay_steps,
             eps_min=args.eps_min, seed=args.seed_base, reward_mode=args.reward_mode,
             **agent_kwargs)
+        if args.fast_learner:
+            agent.enable_fast_learner()
+            print(f"[Train] fast learner on (CUDA graph: {'yes' if agent.use_graph else 'no'})")
         state_label = "4x6x20x16 + 17 aux" if args.algorithm in ("rainbow", "hybrid") else "3x8x20"
         print(f"[Train] {args.algorithm} | Scenario: {args.scenario} | Device: {agent.device} | State: {state_label} | Actions: {'2 legal phases' if args.scenario == 'lvl' else '4 phases'}")
 
@@ -870,7 +914,7 @@ async def amain(args):
         if args.resume_dir:
             snapshot = torch.load(os.path.join(outdir, "training_state.pt"),
                                   map_location=agent.device, weights_only=False)
-            check_resume_config(snapshot["config"], config)
+            check_resume_config(snapshot["config"], config, args.allow_code_change)
             agent.restore_training(snapshot["agent"])
             ep = snapshot["episode"]
             next_seed = snapshot["next_seed"]
@@ -927,6 +971,7 @@ async def amain(args):
                 csv.writer(f).writerow(header)
 
         def save_training_snapshot():
+            manifest.flush()  # the demand files this checkpoint has generated
             snapshot = {"config": config, "episode": ep,
                         "episodes_done": episodes_done,
                         "next_seed": next_seed,
@@ -1324,6 +1369,7 @@ async def amain(args):
             # The loops above never waited for validation; collect what is still running.
             await collect_validation(wait=True)
             save_training_snapshot()
+        manifest.flush()
         # 4. Luu weights cuoi cung
         final_path = os.path.join(outdir, "dqn_weights.pt")
         agent.save(final_path)
