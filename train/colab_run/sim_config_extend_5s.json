@@ -1,0 +1,19 @@
+{
+  "junction_model": "negotiation",
+  "yellow": 4.0,
+  "all_red": 0.0,
+  "min_green": 15.0,
+  "jam_timeout": 120.0,
+  "curve_lat_accel": 3.0,
+  "curve_decel": 2.0,
+  "max_decel": 7.5,
+  "heavy_ratio": 0.03,
+  "vehicle_params": {},
+  "startup_params": {},
+  "signal_control": "extend",
+  "max_green": 75.0,
+  "ext_step": 5.0,
+  "countdown_lock": 8.0,
+  "decision_lead": 1.0,
+  "observation_zone": 50.0
+}

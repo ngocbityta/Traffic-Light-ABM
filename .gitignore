@@ -67,3 +67,46 @@ validation/__pycache__/
 
 # Local Colab CLI checkout
 /google-colab-cli/
+
+# Model weights, checkpoints, and archives
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+*.weights
+*.h5
+*.pkl
+*.tar
+*.tar.gz
+*.tgz
+*.tar.zst
+*.zst
+*.tar.bz2
+*.tar.xz
+*.zip
+*.7z
+checkpoints/
+weights/
+saved_models/
+
+# Python/Cython build, notebooks, IDE, and temp/backup files
+build/
+dist/
+*.egg-info/
+*.c
+*.o
+*.dylib
+*.dll
+.ipynb_checkpoints/
+.mypy_cache/
+.ruff_cache/
+.fuse_hidden*
+*.tmp
+*.part
+*.copying
+.tmp_claude/
+.tmp*/
+.backup_*/
+.vscode/
+.idea/

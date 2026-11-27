@@ -26,6 +26,8 @@ class TrainingReadinessRegressions(unittest.TestCase):
 
     def test_shared_default_and_calibrated_parameters(self):
         defaults = load_sim_config()
+        self.assertEqual(defaults["all_red"], 0.0)
+        self.assertEqual(LeVanLuongSimulator(flow_per_approach=0).all_red, defaults["all_red"])
         self.assertEqual(defaults["junction_model"], "negotiation")
         sim = LeVanLuongSimulator(flow_per_approach=0, **defaults)
         self.assertEqual(sim.junction_model, "negotiation")

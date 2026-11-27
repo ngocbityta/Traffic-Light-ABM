@@ -25,30 +25,46 @@ PREVIOUS_ARCHITECTURE = "gama-rainbow-spatial-4x6x20x16-v3"
 GRID_SHAPE = (4, 6, 20, 16)
 AUX_SIZE = 17
 N_ACTIONS = 4
+# State v5 (27/11/2026): 50 m camera grid, 7 channels all in [0, 1], and the
+# 30 auxiliary features of train/logic/lvl_env.py (observation_v5).
+ARCHITECTURE_V5 = "gama-rainbow-v5-4x7x10x12-aux30"
+GRID_SHAPE_V5 = (4, 7, 10, 12)
+AUX_SIZE_V5 = 30
+STATE_SHAPES = {"v4": (GRID_SHAPE, AUX_SIZE), "v5": (GRID_SHAPE_V5, AUX_SIZE_V5)}
 
 
-def pack_observation(observation):
+def pack_observation(observation, grid_shape=GRID_SHAPE, aux_size=None):
     grid = np.asarray(observation["grid"], dtype=np.float32)
     aux = np.asarray(observation["aux"], dtype=np.float32)
-    if grid.shape != GRID_SHAPE or aux.shape != (AUX_SIZE,):
-        raise ValueError(f"Rainbow state must be grid {GRID_SHAPE} and aux {AUX_SIZE}")
+    grid_shape = tuple(grid_shape)
+    if aux_size is None:
+        aux_size = AUX_SIZE if grid_shape == GRID_SHAPE else AUX_SIZE_V5
+    if grid.shape != grid_shape or aux.shape != (aux_size,):
+        raise ValueError(f"Rainbow state must be grid {grid_shape} and aux {aux_size}")
     if not np.isfinite(grid).all() or not np.isfinite(aux).all():
         raise ValueError("Rainbow state contains non-finite values")
-    if (grid[:, :4].min() < -1e-5 or grid[:, :4].max() > 1.00001 or
-            grid[:, 5].min() < -1e-5 or grid[:, 5].max() > 1.00001 or
-            grid[:, 4].min() < -1.00001 or grid[:, 4].max() > 1.00001):
-        raise ValueError("Rainbow state channels are outside their normalized ranges")
-    encoded = np.rint(np.clip(grid, 0, 1) * 255).astype(np.uint8)
-    encoded[:, 4] = np.rint(np.clip(grid[:, 4], -1, 1) * 127).astype(np.int8).view(np.uint8)
+    if grid_shape == GRID_SHAPE:
+        if (grid[:, :4].min() < -1e-5 or grid[:, :4].max() > 1.00001 or
+                grid[:, 5].min() < -1e-5 or grid[:, 5].max() > 1.00001 or
+                grid[:, 4].min() < -1.00001 or grid[:, 4].max() > 1.00001):
+            raise ValueError("Rainbow state channels are outside their normalized ranges")
+        encoded = np.rint(np.clip(grid, 0, 1) * 255).astype(np.uint8)
+        encoded[:, 4] = np.rint(np.clip(grid[:, 4], -1, 1) * 127).astype(np.int8).view(np.uint8)
+    else:
+        if grid.min() < -1e-5 or grid.max() > 1.00001 or aux.min() < -1e-5 or aux.max() > 1.00001:
+            raise ValueError("Rainbow v5 state is outside [0, 1]")
+        encoded = np.rint(np.clip(grid, 0, 1) * 255).astype(np.uint8)
     blob = zlib.compress(encoded.tobytes(), 1)
     return blob, aux.astype(np.float16)
 
 
-def unpack_observations(blobs, aux):
-    raw = np.stack([np.frombuffer(zlib.decompress(blob), dtype=np.uint8).reshape(GRID_SHAPE)
+def unpack_observations(blobs, aux, grid_shape=GRID_SHAPE):
+    grid_shape = tuple(grid_shape)
+    raw = np.stack([np.frombuffer(zlib.decompress(blob), dtype=np.uint8).reshape(grid_shape)
                     for blob in blobs])
     grids = raw.astype(np.float32) / 255.0
-    grids[:, :, 4] = raw[:, :, 4].view(np.int8).astype(np.float32) / 127.0
+    if grid_shape == GRID_SHAPE:
+        grids[:, :, 4] = raw[:, :, 4].view(np.int8).astype(np.float32) / 127.0
     return grids, np.asarray(aux, dtype=np.float32)
 
 
@@ -110,17 +126,19 @@ class SumMinTree:
 
 
 class PrioritizedReplay:
-    def __init__(self, capacity, alpha=.5, seed=None):
+    def __init__(self, capacity, alpha=.5, seed=None, aux_size=AUX_SIZE, grid_shape=GRID_SHAPE):
         if capacity < 1 or not 0 <= alpha <= 1:
             raise ValueError("Invalid prioritized replay capacity or alpha")
+        self.grid_shape = tuple(grid_shape)
+        self.aux_size = int(aux_size)
         self.capacity = int(capacity)
         self.alpha = float(alpha)
         self.rng = np.random.default_rng(seed)
         self.tree = SumMinTree(self.capacity)
         self.states = [None] * self.capacity
         self.next_states = [None] * self.capacity
-        self.aux = np.zeros((self.capacity, AUX_SIZE), dtype=np.float16)
-        self.next_aux = np.zeros((self.capacity, AUX_SIZE), dtype=np.float16)
+        self.aux = np.zeros((self.capacity, self.aux_size), dtype=np.float16)
+        self.next_aux = np.zeros((self.capacity, self.aux_size), dtype=np.float16)
         self.actions = np.zeros(self.capacity, dtype=np.uint8)
         self.rewards = np.zeros(self.capacity, dtype=np.float32)
         self.discounts = np.zeros(self.capacity, dtype=np.float32)
@@ -133,8 +151,12 @@ class PrioritizedReplay:
         if action not in range(N_ACTIONS) or not np.isfinite(reward) or not 0 <= discount <= 1:
             raise ValueError("Invalid Rainbow transition")
         p = self.pos
-        self.states[p], self.aux[p] = pack_observation(state)
-        self.next_states[p], self.next_aux[p] = pack_observation(next_state)
+        # A 13-feature legacy agent stores the 17 features it is given minus
+        # the four pressure values, as act() does.
+        state, next_state = self._fit(state), self._fit(next_state)
+        self.states[p], self.aux[p] = pack_observation(state, self.grid_shape, self.aux_size)
+        self.next_states[p], self.next_aux[p] = pack_observation(
+            next_state, self.grid_shape, self.aux_size)
         self.actions[p] = action
         self.rewards[p] = reward
         self.dones[p] = done
@@ -143,6 +165,12 @@ class PrioritizedReplay:
         self.tree.set(p, self.max_priority ** self.alpha)
         self.pos = (p + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
+
+    def _fit(self, observation):
+        aux = np.asarray(observation["aux"])
+        if self.aux_size == 13 and aux.shape == (AUX_SIZE,):
+            return {**observation, "aux": np.concatenate((aux[:9], aux[13:17]))}
+        return observation
 
     def sample(self, batch_size, beta):
         total = self.tree.sum[1]
@@ -157,9 +185,10 @@ class PrioritizedReplay:
         minimum = self.tree.minimum[1] / total
         weights = (self.size * probabilities) ** (-beta)
         weights /= (self.size * minimum) ** (-beta)
-        states, aux = unpack_observations([self.states[i] for i in indices], self.aux[indices])
+        states, aux = unpack_observations([self.states[i] for i in indices], self.aux[indices],
+                                          self.grid_shape)
         next_states, next_aux = unpack_observations(
-            [self.next_states[i] for i in indices], self.next_aux[indices])
+            [self.next_states[i] for i in indices], self.next_aux[indices], self.grid_shape)
         return (indices, weights.astype(np.float32), states, aux,
                 self.actions[indices].astype(np.int64), self.rewards[indices],
                 next_states, next_aux, self.dones[indices].astype(np.float32),
@@ -238,13 +267,24 @@ class NoisyLinear(nn.Module):
 
 
 class RainbowNetwork(nn.Module):
-    def __init__(self, atoms=51, aux_size=AUX_SIZE):
+    def __init__(self, atoms=51, aux_size=AUX_SIZE, grid_shape=GRID_SHAPE):
         super().__init__()
         self.atoms = atoms
-        self.arm_encoder = nn.Sequential(
-            nn.Conv2d(6, 32, 3, stride=2), nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2), nn.ReLU(), nn.Flatten(),
-            nn.Linear(64 * 4 * 3, 128), nn.ReLU())
+        self.grid_shape = tuple(grid_shape)
+        channels, rows, cols = self.grid_shape[1:]
+        if self.grid_shape == GRID_SHAPE:
+            self.arm_encoder = nn.Sequential(
+                nn.Conv2d(6, 32, 3, stride=2), nn.ReLU(),
+                nn.Conv2d(32, 64, 3, stride=2), nn.ReLU(), nn.Flatten(),
+                nn.Linear(64 * 4 * 3, 128), nn.ReLU())
+        else:
+            # 10 x 12 cells: a stride-1 layer first keeps the 5 m resolution.
+            r1, c1 = rows - 2, cols - 2
+            r2, c2 = (r1 - 3) // 2 + 1, (c1 - 3) // 2 + 1
+            self.arm_encoder = nn.Sequential(
+                nn.Conv2d(channels, 32, 3, stride=1), nn.ReLU(),
+                nn.Conv2d(32, 64, 3, stride=2), nn.ReLU(), nn.Flatten(),
+                nn.Linear(64 * r2 * c2, 128), nn.ReLU())
         self.shared = nn.Sequential(nn.Linear(4 * 128 + aux_size, 256), nn.ReLU())
         self.value_hidden = NoisyLinear(256, 128)
         self.value_out = NoisyLinear(128, atoms)
@@ -257,7 +297,7 @@ class RainbowNetwork(nn.Module):
 
     def forward(self, grid, aux):
         batch = grid.shape[0]
-        arms = self.arm_encoder(grid.reshape(batch * 4, 6, 20, 16)).reshape(batch, 4 * 128)
+        arms = self.arm_encoder(grid.reshape(batch * 4, *self.grid_shape[1:])).reshape(batch, 4 * 128)
         shared = self.shared(torch.cat((arms, aux), dim=1))
         value = self.value_out(torch.relu(self.value_hidden(shared))).reshape(batch, 1, self.atoms)
         advantage = self.adv_out(torch.relu(self.adv_hidden(shared))).reshape(batch, N_ACTIONS, self.atoms)
@@ -270,7 +310,7 @@ class RainbowAgent:
                  eps_decay_steps=2_000_000, seed=None, device=None, reward_mode="r1",
                  n_step=3, per_alpha=.5, per_beta_start=.4, per_beta_steps=1_000_000,
                  atoms=51, v_min=-2000.0, v_max=0.0, target_update=2000,
-                 r1_ref=50.0, reward_settings=None, aux_size=AUX_SIZE):
+                 r1_ref=50.0, reward_settings=None, aux_size=None, state_version=None):
         if reward_mode not in ("r1", "r2", "r3", "r4"):
             raise ValueError("Spatial Rainbow requires R1-R4")
         if (not all(math.isfinite(x) for x in (gamma, lr, v_min, v_max, r1_ref)) or
@@ -292,9 +332,25 @@ class RainbowAgent:
         self.gamma = float(gamma)
         self.reward_mode = reward_mode
         self.reward_settings = dict(reward_settings or {"r1_ref": r1_ref})
-        self.architecture = ARCHITECTURE
-        if aux_size not in (13, AUX_SIZE):
-            raise ValueError("Unsupported Rainbow auxiliary state size")
+        # The state version travels in reward_settings (like the queue
+        # scale), so actors, validation and evaluate.py rebuild the same net.
+        if state_version is None:
+            state_version = self.reward_settings.get("state_version", "v4")
+        if state_version not in STATE_SHAPES:
+            raise ValueError(f"Unknown Rainbow state version: {state_version}")
+        self.state_version = state_version
+        self.grid_shape, default_aux = STATE_SHAPES[state_version]
+        if aux_size is None:
+            aux_size = default_aux
+        if state_version == "v5":
+            if aux_size != AUX_SIZE_V5:
+                raise ValueError("Rainbow v5 uses 30 auxiliary features")
+            self.reward_settings["state_version"] = "v5"
+            self.architecture = ARCHITECTURE_V5
+        else:
+            if aux_size not in (13, AUX_SIZE):
+                raise ValueError("Unsupported Rainbow auxiliary state size")
+            self.architecture = ARCHITECTURE
         self.aux_size = aux_size
         self.n_step = int(n_step)
         self.batch_size = int(batch_size)
@@ -307,12 +363,12 @@ class RainbowAgent:
         self.r1_ref = float(r1_ref)
         self.support = torch.linspace(v_min, v_max, atoms, device=self.device)
         self.delta_z = (v_max - v_min) / (atoms - 1)
-        self.online_net = RainbowNetwork(atoms, aux_size).to(self.device)
-        self.target_net = RainbowNetwork(atoms, aux_size).to(self.device)
+        self.online_net = RainbowNetwork(atoms, aux_size, self.grid_shape).to(self.device)
+        self.target_net = RainbowNetwork(atoms, aux_size, self.grid_shape).to(self.device)
         self.target_net.load_state_dict(self.online_net.state_dict())
         self.target_net.eval()
         self.optimizer = torch.optim.Adam(self.online_net.parameters(), lr=lr)
-        self.buffer = PrioritizedReplay(buffer_size, per_alpha, seed)
+        self.buffer = PrioritizedReplay(buffer_size, per_alpha, seed, aux_size, self.grid_shape)
         self.pending = deque()
         self.decisions = self.update_count = 0
         self.eps = 0.0  # NoisyNet replaces epsilon exploration after replay warm-up.
@@ -438,7 +494,8 @@ class RainbowAgent:
         return float(np.mean(self.last_losses)) if self.last_losses else 0.0
 
     def save(self, path):
-        torch.save({"architecture": ARCHITECTURE, "reward_mode": self.reward_mode,
+        torch.save({"architecture": self.architecture, "reward_mode": self.reward_mode,
+                    "state_version": self.state_version,
                     "reward_settings": self.reward_settings,
                     "online_net": self.online_net.state_dict(),
                     "target_net": self.target_net.state_dict(),
@@ -449,12 +506,18 @@ class RainbowAgent:
 
     def load(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        if ckpt.get("architecture") not in (ARCHITECTURE, LEGACY_ARCHITECTURE,
-                                             PREVIOUS_ARCHITECTURE):
+        architecture = ckpt.get("architecture")
+        if architecture == ARCHITECTURE_V5:
+            if self.state_version != "v5":
+                raise ValueError("Rainbow v5 checkpoint needs state_version='v5'")
+        elif architecture in (ARCHITECTURE, LEGACY_ARCHITECTURE, PREVIOUS_ARCHITECTURE):
+            if self.state_version != "v4":
+                raise ValueError("Rainbow v4 checkpoint loaded into a v5 agent")
+            expected_aux = AUX_SIZE if architecture == ARCHITECTURE else 13
+            if self.aux_size != expected_aux:
+                raise ValueError("Rainbow checkpoint auxiliary state size mismatch")
+        else:
             raise ValueError("Rainbow checkpoint architecture mismatch")
-        expected_aux = AUX_SIZE if ckpt["architecture"] == ARCHITECTURE else 13
-        if self.aux_size != expected_aux:
-            raise ValueError("Rainbow checkpoint auxiliary state size mismatch")
         if (ckpt["atoms"], ckpt["v_min"], ckpt["v_max"]) != (self.atoms, self.v_min, self.v_max):
             raise ValueError("Rainbow C51 support mismatch")
         self.online_net.load_state_dict(ckpt["online_net"])
@@ -475,7 +538,7 @@ class RainbowAgent:
             device_rng = torch.mps.get_rng_state().cpu()
         elif self.device.type == "cuda":
             device_rng = [state.cpu() for state in torch.cuda.get_rng_state_all()]
-        return {"architecture": ARCHITECTURE,
+        return {"architecture": self.architecture,
                 "reward_mode": self.reward_mode, "reward_settings": self.reward_settings,
                 "policy": {"online": self.online_net.state_dict(),
                            "target": self.target_net.state_dict()},
@@ -486,7 +549,7 @@ class RainbowAgent:
                 "replay": self.buffer.snapshot()}
 
     def restore_training(self, state):
-        if state["architecture"] != ARCHITECTURE:
+        if state["architecture"] != self.architecture:
             raise ValueError("Rainbow training checkpoint architecture mismatch")
         self.online_net.load_state_dict(state["policy"]["online"])
         self.target_net.load_state_dict(state["policy"]["target"])

@@ -108,7 +108,7 @@ class GamaTrafficEnv:
                  reward_mode="reference", max_delay_sq=None,
                  state_mode="dtse", r1_ref=50.0, r2_ref=50.0, b_ref=50.0,
                  r2_lambda=1.0, r3_beta=1.0, reset_mode="reload",
-                 fast_training=False, queue_feature_scale="linear"):
+                 fast_training=False, queue_feature_scale="linear", state_version="v4"):
         if reward_scope not in ("all", "near"):
             raise ValueError(f"Unknown reward scope: {reward_scope}")
         if reward_mode not in ("reference", "queue_time", "total_wait", "r1", "r2", "r3", "r4"):
@@ -119,6 +119,10 @@ class GamaTrafficEnv:
             raise ValueError(f"Unknown reset mode: {reset_mode}")
         if queue_feature_scale not in QUEUE_FEATURE_SCALES:
             raise ValueError(f"Unknown queue feature scale: {queue_feature_scale}")
+        if state_version not in ("v4", "v5"):
+            raise ValueError(f"Unknown state version: {state_version}")
+        if state_version == "v5" and state_mode != "spatial":
+            raise ValueError("State v5 is a spatial (Rainbow) state")
         if (state_mode == "spatial") != (reward_mode in ("r1", "r2", "r3", "r4")):
             raise ValueError("Spatial state requires R1-R4; DTSE requires a legacy reward")
         if (not all(np.isfinite(x) for x in (r1_ref, r2_ref, b_ref, r2_lambda, r3_beta)) or
@@ -138,6 +142,8 @@ class GamaTrafficEnv:
         self.fast_training = bool(fast_training)
         # How the queue counts enter the observation (see ``featurize``).
         self.queue_feature_scale = queue_feature_scale
+        # "v5": 50 m camera grid 4x7x10x12 + aux[30] (lvl_env.observation_v5).
+        self.state_version = state_version
         self.r1_ref = float(r1_ref)
         self.r2_ref = float(r2_ref)
         self.b_ref = float(b_ref)
@@ -504,6 +510,10 @@ _LOG_COUNT = math.log1p(1000.0)
 
 
 def featurize(state, queue_feature_scale="linear"):
+    if "aux_v5" in state:
+        return {"grid": np.asarray(state["spatial"], dtype=np.float32),
+                "aux": np.asarray(state["aux_v5"], dtype=np.float32),
+                "pressure": np.asarray(state["pressure"], dtype=np.float32)}
     if "spatial" in state:
         phase = state["global_phase"] // 2
         aux = np.zeros(17, dtype=np.float32)

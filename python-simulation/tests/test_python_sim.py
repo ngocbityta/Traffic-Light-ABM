@@ -26,14 +26,14 @@ class LeVanLuongTests(unittest.TestCase):
         self.assertEqual(len(roads), 20)
         self.assertEqual({roads[f"{arm}_in"]["kind"] for arm in ("NE", "SE", "SW", "NW")},
                          {"approach"})
-        # Legacy fixed plan without a yellow interval.
+        # Fixed plan without yellow under default all_red=0.0 (50 s LVL, 40 s HDT).
         sim = LeVanLuongSimulator(flow_per_approach=0, yellow=0.0)
+        self.assertEqual(sim.all_red, 0.0)
         self.assertEqual(sim.phase, "LVL")
         self.assertEqual(sim.step(250)["phase"], "LVL")
-        self.assertEqual(sim.step(1)["phase"], "none")
-        self.assertEqual(sim.step(15)["phase"], "HDT")
-        self.assertEqual(sim.step(200)["phase"], "none")
-        self.assertEqual(sim.step(15)["phase"], "LVL")
+        self.assertEqual(sim.step(1)["phase"], "HDT")
+        self.assertEqual(sim.step(199)["phase"], "HDT")
+        self.assertEqual(sim.step(1)["phase"], "LVL")
         self.assertEqual(sim.created, 0)
         self.assertEqual(sim.queue_time_integral, 0)
 
@@ -380,20 +380,24 @@ class LeVanLuongTests(unittest.TestCase):
                         vehicle.approach_end + 1e-8)
 
     def test_vehicle_committed_on_green_clears_approach_during_all_red(self):
-        sim = LeVanLuongSimulator(flow_per_approach=0, train_mode=True)
-        sim._create_vehicle("NW", "through", True, 5, 40)
-        vehicle = sim.vehicles[0]
-        vehicle.position = sim._stop_position(vehicle) + 0.5
-        vehicle.speed = 0.0
-        sim.phase = "none"
+        """Committed approach vehicle clears both yellow (all_red=0) and all-red."""
+        for yellow_phase in ("NW", None):
+            with self.subTest(yellow_phase=yellow_phase):
+                sim = LeVanLuongSimulator(flow_per_approach=0, train_mode=True)
+                sim._create_vehicle("NW", "through", True, 5, 40)
+                vehicle = sim.vehicles[0]
+                vehicle.position = sim._stop_position(vehicle) + 0.5
+                vehicle.speed = 0.0
+                sim.phase = "none"
+                sim.yellow_phase = yellow_phase
 
-        sim.step(10)
+                sim.step(10)
 
-        self.assertNotEqual(vehicle.road, "NW_in")
-        self.assertGreaterEqual(vehicle.position, vehicle.approach_end)
+                self.assertNotEqual(vehicle.road, "NW_in")
+                self.assertGreaterEqual(vehicle.position, vehicle.approach_end)
 
     def test_training_clock_and_mobil_cooldown(self):
-        # Legacy transition (all-red only); the yellow variant is tested below.
+        # Transition without yellow under default all_red=0.0 (direct switch).
         sim = LeVanLuongSimulator(flow_per_approach=0, train_mode=True, yellow=0.0)
         sim._create_vehicle("NE", "through", False, 10, 40)
         sim.step(19)
@@ -406,17 +410,14 @@ class LeVanLuongTests(unittest.TestCase):
         self.assertTrue(sim.dqn_waiting_action)
         self.assertEqual(sim.cycle, 50)
         sim.set_action(2)
-        sim.step(9)
-        self.assertEqual(sim.phase, "none")
-        sim.step(1)
-        self.assertEqual(sim.phase, "none")
         sim.step(1)
         self.assertEqual(sim.phase, "HDT")
-        sim.step(39)
+        self.assertFalse(sim.dqn_waiting_action)
+        sim.step(49)
         self.assertTrue(sim.dqn_waiting_action)
         self.assertEqual(sim.cycle, 100)
 
-    def test_training_switch_shows_yellow_then_all_red(self):
+    def test_training_switch_shows_yellow_then_next_green(self):
         sim = LeVanLuongSimulator(flow_per_approach=0, train_mode=True, yellow=3.0)
         sim.step(50)
         self.assertTrue(sim.dqn_waiting_action)
@@ -426,21 +427,21 @@ class LeVanLuongTests(unittest.TestCase):
         sim.step(14)
         self.assertEqual((sim.phase, sim.yellow_phase), ("none", "LVL"))
         sim.step(1)
-        self.assertEqual((sim.phase, sim.yellow_phase), ("none", None))
-        sim.step(14)
-        self.assertEqual(sim.phase, "HDT")
+        self.assertEqual((sim.phase, sim.yellow_phase), ("HDT", None))
 
     def test_fixed_plan_yellow_is_carved_from_green(self):
         sim = LeVanLuongSimulator(flow_per_approach=0, yellow=3.0)
-        # LVL green 50 s = 47 s green + 3 s yellow; onsets are unchanged.
-        self.assertEqual(sim._signal(1 + int(46.8 / DT)), ("LVL", None))
-        self.assertEqual(sim._signal(1 + int(47.2 / DT)), ("none", "LVL"))
-        self.assertEqual(sim._signal(1 + int(50.4 / DT)), ("none", None))
-        self.assertEqual(sim._signal(1 + int(53.2 / DT)), ("HDT", None))
-        self.assertEqual(sim._signal(1 + int(90.2 / DT)), ("none", "HDT"))
+        # LVL 50 s = 47 s green + 3 s yellow, then HDT 40 s = 37 s green + 3 s yellow (all_red=0).
+        self.assertEqual(sim._signal(1 + int(round(46.8 / DT))), ("LVL", None))
+        self.assertEqual(sim._signal(1 + int(round(47.2 / DT))), ("none", "LVL"))
+        self.assertEqual(sim._signal(1 + int(round(50.2 / DT))), ("HDT", None))
+        self.assertEqual(sim._signal(1 + int(round(86.8 / DT))), ("HDT", None))
+        self.assertEqual(sim._signal(1 + int(round(87.2 / DT))), ("none", "HDT"))
+        self.assertEqual(sim._signal(1 + int(round(90.2 / DT))), ("LVL", None))
         legacy = LeVanLuongSimulator(flow_per_approach=0, yellow=0.0)
         for cycle in range(1, 481):
             self.assertIsNone(legacy._signal(cycle)[1])
+            self.assertIn(legacy._signal(cycle)[0], ("LVL", "HDT"))
 
     def test_stop_or_go_logit_matches_paper_coefficients(self):
         sim = LeVanLuongSimulator(flow_per_approach=0)
@@ -455,25 +456,26 @@ class LeVanLuongTests(unittest.TestCase):
         moto.position = moto.approach_end - moto.length / 2 - 140.0
         self.assertLess(sim.stop_or_go_probability(moto), 0.01)
 
-    def test_go_decision_persists_into_all_red_and_lapses_at_next_green(self):
+    def test_go_decision_persists_through_yellow_and_lapses_at_next_green(self):
         sim = LeVanLuongSimulator(flow_per_approach=0, yellow=3.0)
         sim._create_vehicle("NE", "through", False, 4, 40)
         vehicle = sim.vehicles[-1]
-        sim.cycle = 1 + int(47.2 / DT)
+        sim.cycle = 1 + int(round(47.2 / DT))
         sim.phase, sim.yellow_phase = sim._signal()
         sim._yellow_epoch += 1
         sim._update_last_yellow()
         vehicle.position = sim._stop_position(vehicle) - 5.0
         vehicle.speed = 9.0  # 81/(2*5) > STOP_GO_MAX_DECEL: cannot stop
         self.assertTrue(sim._green_for(vehicle))
-        sim.cycle = 1 + int(51.0 / DT)
+        sim.cycle = 1 + int(round(49.8 / DT))
         sim.phase, sim.yellow_phase = sim._signal()
         sim._update_last_yellow()
-        self.assertEqual((sim.phase, sim.yellow_phase), ("none", None))
+        self.assertEqual((sim.phase, sim.yellow_phase), ("none", "LVL"))
         self.assertTrue(sim._green_for(vehicle))
-        sim.cycle = 1 + int(54.0 / DT)
+        sim.cycle = 1 + int(round(50.2 / DT))
         sim.phase, sim.yellow_phase = sim._signal()
         sim._update_last_yellow()
+        self.assertEqual((sim.phase, sim.yellow_phase), ("HDT", None))
         self.assertFalse(sim._green_for(vehicle))
 
     def test_mobil_resolves_spawn_overlap_before_cooldown(self):

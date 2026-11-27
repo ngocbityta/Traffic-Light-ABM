@@ -106,7 +106,7 @@ canvas:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
  <canvas id="overlay" aria-hidden="true"></canvas>
  <div class="signal-hud" role="status" aria-live="polite" aria-label="Trạng thái đèn giao thông">
   <div class="signal-head" aria-hidden="true"><i id="lampRed" class="lamp red"></i><i id="lampYellow" class="lamp yellow"></i><i id="lampGreen" class="lamp green"></i></div>
-  <div class="signal-copy"><strong id="signalHudPhase">Đang tải đèn</strong><span id="signalHudDirection">—</span></div>
+  <div class="signal-copy"><strong id="signalHudPhase">Đang tải đèn</strong><span id="signalHudDirection">—</span><span id="signalHudController" style="display:block;font-size:11px;opacity:.8"></span></div>
   <strong id="signalHudTimer" class="signal-count">—</strong>
  </div>
  <div class="legend-hud" aria-hidden="true">
@@ -1277,6 +1277,10 @@ canvas:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
   lastTickTime = now;
 
   const mode=data.mode||state.mode||el('mode').value;
+  {const ctl=data.controller??state.controller,flow=data.flow_per_approach??state.flow_per_approach;
+   const dec=data.agent_decisions??state.agent_decisions,act=data.agent_last_action??state.agent_last_action;
+   setTxt('signalHudController',[ctl,flow!=null?`${Math.round(flow)} xe/h mỗi nhánh`:null,
+    dec!=null?`${dec} quyết định${act!=null?` · gần nhất: ${act===0?'LVL':'HDT'}`:''}`:null].filter(Boolean).join(' · '));}
   el('mode').value=mode==='train'?'train':'fixed';
   waitingAction=mode==='train'&&Boolean(data.dqn_waiting_action??state.dqn_waiting_action);
 

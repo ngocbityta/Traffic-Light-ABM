@@ -31,9 +31,7 @@ STATE_EXPR = ('"" + cycle + "|" + phase + "|" + dqn_waiting_action + "|" + '
               'green_ticks')
 MASK = np.asarray([True, False, True, False])
 # A phase must have shown green this long before the policy may leave it
-# (10 s = 50 cycles of 0.2 s). Switching costs 4 s yellow + 2 s all-red, so
-# with a decision every 10 s an unconstrained agent could leave each phase
-# only 4 s of green, which no real controller does and no junction survives.
+# (10 s = 50 cycles of 0.2 s). The minimum applies to actual green time.
 MIN_GREEN_CYCLES = 50
 
 
@@ -45,6 +43,139 @@ def action_mask(phase, green_cycles, min_green_cycles=MIN_GREEN_CYCLES):
     may_switch = green_cycles is None or int(green_cycles) >= int(min_green_cycles)
     return np.asarray([phase == "LVL" or may_switch, False,
                        phase == "HDT" or may_switch, False])
+
+
+# ---------------------------------------------------------------------------
+# State v5 (27/11/2026): what a camera covering 50 m before each stop line
+# sees, plus the signal controller's own clock. Built only by the Python
+# backend (``state_version="v5"``); the simulator keeps the zone counters
+# (``observation_zone=50``).
+#
+# grid[arm, k, row, col]: arms in ARMS order (NE, SE, SW, NW), row j covers
+# [5j, 5j + 5) m before the stop line (reference point of the vehicle),
+# col = sublane 0..11 counted from the kerb. Channels:
+#   0 any vehicle, 1 motorbike, 2 car, 3 heavy vehicle, 4 stopped vehicle
+#   (< 1 km/h), 5 highest speed in the cell / 15 m/s, 6 sublane exists.
+# aux (30):
+#   0      axis with green (LVL 0, HDT 1)
+#   1      green shown so far / max_green
+#   2      last green of the waiting axis / max_green
+#   3      room left to extend: (max_green - planned green) / (max_green - min_green)
+#   4-7    stopped vehicles in the zone, log1p(n) / log1p(200)
+#   8-11   moving vehicles that reach the line within 5 s, log1p(n) / log1p(100)
+#   12-15  occupied share of the 40-50 m band (queue reaching the edge of view)
+#   16-19  arrivals into the zone, EWMA over 60 s, veh/s / 1.5
+#   20-23  longest stopped time of a vehicle in the zone / 120 s
+#   24-27  vehicles on the first 30 m of each exit road, log1p(n) / log1p(100)
+#   28-29  stop-line crossings since the last decision, LVL / HDT, veh/s / 3
+# Every value is clipped to [0, 1].
+# ---------------------------------------------------------------------------
+V5_GRID_SHAPE = (4, 7, 10, 12)
+V5_AUX_SIZE = 30
+V5_ZONE = 50.0
+V5_CELL = 5.0
+V5_EFFECTIVE_SECONDS = 5.0
+V5_SPEED_REF = 15.0
+V5_ARRIVAL_TAU = 60.0
+V5_EXIT_ZONE = 30.0
+STATE_VERSIONS = ("v4", "v5")
+_LOG200 = float(np.log1p(200.0))
+_LOG100 = float(np.log1p(100.0))
+_KIND_CHANNEL = {"motorbike": 1, "car": 2, "heavy": 3}
+
+
+class ZoneTracker:
+    """Rates between two decision snapshots of the simulator's zone counters."""
+
+    def __init__(self):
+        self.cycle = None
+        self.arrivals = None
+        self.crossings = None
+        self.arrival_rate = np.zeros(4, dtype=np.float64)
+        self.discharge = np.zeros(2, dtype=np.float64)
+
+    def update(self, sim):
+        arrivals = np.asarray([sim.zone_arrivals[arm] for arm in ARMS], dtype=np.float64)
+        crossings = np.asarray([sim.stopline_crossings[arm] for arm in ARMS], dtype=np.float64)
+        if self.cycle is not None and sim.cycle > self.cycle:
+            dt = (sim.cycle - self.cycle) * DT
+            alpha = 1.0 - float(np.exp(-dt / V5_ARRIVAL_TAU))
+            self.arrival_rate += alpha * ((arrivals - self.arrivals) / dt - self.arrival_rate)
+            crossed = (crossings - self.crossings) / dt
+            self.discharge = np.asarray([crossed[0] + crossed[2], crossed[1] + crossed[3]])
+        elif self.cycle is None or sim.cycle < self.cycle:
+            self.arrival_rate[:] = 0.0
+            self.discharge[:] = 0.0
+        self.cycle, self.arrivals, self.crossings = sim.cycle, arrivals, crossings
+
+
+def observation_v5(sim, tracker):
+    """(grid, aux) of state v5 for the simulator at a decision tick."""
+    if abs(sim.observation_zone - V5_ZONE) > 1e-9:
+        raise ValueError("state v5 needs the simulator's observation_zone = 50 m")
+    grid = np.zeros(V5_GRID_SHAPE, dtype=np.float32)
+    lanes = []
+    for a, arm in enumerate(ARMS):
+        n = min(V5_GRID_SHAPE[3], int(sim.roads[f"{arm}_in"]["num_lanes"]))
+        grid[a, 6, :, :n] = 1.0
+        lanes.append(n)
+    stopped = np.zeros(4)
+    effective = np.zeros(4)
+    longest = np.zeros(4)
+    exit_count = np.zeros(4)
+    arm_index = {arm: a for a, arm in enumerate(ARMS)}
+    stop_time = sim.zone_stop_time
+    for v in sim.vehicles:
+        if v.road == v.in_road:
+            d = v.approach_end - v.position
+            if d >= V5_ZONE:
+                continue
+            a = arm_index[v.arm]
+            row = min(9, max(0, int(max(0.0, d) // V5_CELL)))
+            lo, hi = max(0, v.lane), min(lanes[a], v.lane + v.occupied)
+            speed = max(0.0, v.speed)
+            is_stopped = speed * 3.6 < 1.0
+            for col in range(lo, hi):
+                cell = grid[a, :, row, col]
+                cell[0] = 1.0
+                cell[_KIND_CHANNEL[v.kind]] = 1.0
+                if is_stopped:
+                    cell[4] = 1.0
+                cell[5] = max(cell[5], min(1.0, speed / V5_SPEED_REF))
+            if is_stopped:
+                stopped[a] += 1
+                longest[a] = max(longest[a], stop_time.get(v.creation_id, 0.0))
+            elif max(0.0, d) <= speed * V5_EFFECTIVE_SECONDS:
+                effective[a] += 1
+        elif v.road == v.out_road:
+            _, progress = sim._road_state(v)
+            if progress <= V5_EXIT_ZONE:
+                exit_count[arm_index[v.to_arm]] += 1
+    tracker.update(sim)
+    aux = np.zeros(V5_AUX_SIZE, dtype=np.float32)
+    phase = sim.phase if sim.phase in ("LVL", "HDT") else (
+        sim.pending_phase if getattr(sim, "_phase_change_pending", False) else "LVL")
+    other = "HDT" if phase == "LVL" else "LVL"
+    max_green = max(float(getattr(sim, "max_green", 75.0)), 1e-6)
+    min_green = float(sim.min_green)
+    aux[0] = float(phase == "HDT")
+    aux[1] = sim.green_ticks * DT / max_green
+    aux[2] = sim.last_green_seconds.get(other, 0.0) / max_green
+    if getattr(sim, "signal_control", "phase") == "extend":
+        planned = sim.planned_green_ticks * DT
+    else:
+        planned = sim.green_ticks * DT
+    aux[3] = (max_green - planned) / max(max_green - min_green, 1e-6)
+    aux[4:8] = np.log1p(stopped) / _LOG200
+    aux[8:12] = np.log1p(effective) / _LOG100
+    edge = grid[:, 0, 8:10, :]
+    aux[12:16] = [edge[a, :, :lanes[a]].mean() if lanes[a] else 0.0 for a in range(4)]
+    aux[16:20] = tracker.arrival_rate / 1.5
+    aux[20:24] = longest / 120.0
+    aux[24:28] = np.log1p(exit_count) / _LOG100
+    aux[28:30] = tracker.discharge / 3.0
+    np.clip(aux, 0.0, 1.0, out=aux)
+    return grid, aux
 
 
 def _observation(cycle, phase, waiting, next_decision, created, passed,
@@ -192,6 +323,7 @@ class LVLPythonEnv(_LVLCommon, GamaTrafficEnv):
     PYTHON_SIM_MODES = ("safe", "gama_2025_6_4")
 
     def __init__(self, python_sim_mode="safe", sim_config=None, **kwargs):
+        self._zone_tracker = ZoneTracker()
         if python_sim_mode not in self.PYTHON_SIM_MODES:
             raise ValueError(
                 f"Unknown Python simulator mode: {python_sim_mode!r}; "
@@ -213,9 +345,13 @@ class LVLPythonEnv(_LVLCommon, GamaTrafficEnv):
                        if row["name"] == "demand_file_path"), None)
         if not demand:
             raise ValueError("Le Van Luong training requires a paired demand CSV")
+        config = dict(self.sim_config)
+        if getattr(self, "state_version", "v4") == "v5":
+            config.setdefault("observation_zone", V5_ZONE)
         self.sim = LeVanLuongSimulator(seed=1 if seed is None else seed, demand_file=demand,
                                       train_mode=True, mode=self.python_sim_mode,
-                                      **self.sim_config)
+                                      **config)
+        self._zone_tracker = ZoneTracker()
         return await self.read_state()
 
     async def read_state(self, force_dtse=False):
@@ -239,8 +375,17 @@ class LVLPythonEnv(_LVLCommon, GamaTrafficEnv):
                             transition_of=(sim.yellow_phase or sim._last_yellow),
                             yellow_cycles=(yellow_total - sim.yellow_ticks_left
                                            if sim.yellow_phase else 0),
-                            extra={"jam_removed": sim.jam_removed,
-                                   "hard_brake_events": sim.hard_brake_events})
+                            extra=self._extra(sim))
+
+    def _extra(self, sim):
+        extra = {"jam_removed": sim.jam_removed,
+                 "hard_brake_events": sim.hard_brake_events}
+        if getattr(self, "state_version", "v4") == "v5":
+            if not hasattr(self, "_zone_tracker"):
+                self._zone_tracker = ZoneTracker()
+            grid, aux = observation_v5(sim, self._zone_tracker)
+            extra.update(spatial=grid, aux_v5=aux)
+        return extra
 
     async def set_action(self, action):
         self.sim.set_action(action)

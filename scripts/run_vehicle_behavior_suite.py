@@ -245,23 +245,25 @@ class VehicleBehaviorTestSuite:
         sim = LeVanLuongSimulator(flow_per_approach=0)
         self.assert_test(
             "Signal", "SIG-01-FixedTimeInitial",
-            sim.phase == "LVL" and sim.step(250)["phase"] == "LVL",
-            "Pha LVL xanh chuẩn 250 tick (50s)"
+            sim.phase == "LVL" and sim.step(230)["phase"] == "LVL",
+            "Pha LVL xanh 230 tick (46 s)"
         )
         self.assert_test(
-            "Signal", "SIG-01-FixedTimeAllRed1",
-            sim.step(1)["phase"] == "none" and sim.step(14)["phase"] == "none",
-            "Đỏ toàn phần (all-red) 15 tick (3s) sau pha LVL"
+            "Signal", "SIG-01-FixedTimeYellow1",
+            sim.step(1)["phase"] == "none" and sim.yellow_phase == "LVL" and
+            sim.step(19)["phase"] == "none" and sim.yellow_phase == "LVL",
+            "Vàng LVL 20 tick (4 s)"
         )
         self.assert_test(
             "Signal", "SIG-01-FixedTimeHDT",
-            sim.step(1)["phase"] == "HDT" and sim.step(199)["phase"] == "HDT",
-            "Pha HDT xanh chuẩn 200 tick (40s)"
+            sim.step(1)["phase"] == "HDT" and sim.step(179)["phase"] == "HDT",
+            "Pha HDT xanh 180 tick (36 s)"
         )
         self.assert_test(
-            "Signal", "SIG-01-FixedTimeAllRed2",
-            sim.step(1)["phase"] == "none" and sim.step(14)["phase"] == "none",
-            "Đỏ toàn phần 15 tick sau pha HDT"
+            "Signal", "SIG-01-FixedTimeYellow2",
+            sim.step(1)["phase"] == "none" and sim.yellow_phase == "HDT" and
+            sim.step(19)["phase"] == "none" and sim.yellow_phase == "HDT",
+            "Vàng HDT 20 tick (4 s)"
         )
         self.assert_test(
             "Signal", "SIG-01-FixedTimeCycleEnd",
@@ -278,14 +280,14 @@ class VehicleBehaviorTestSuite:
             "Tick quyết định RL kích hoạt đúng mỗi 50 cycle (10.0s)"
         )
         sim.set_action(2)  # Request HDT (action 2)
-        sim.step(14)
-        in_all_red = (sim.phase == "none")
+        sim.step(20)
+        in_yellow = sim.phase == "none" and sim.yellow_phase == "LVL"
         sim.step(1)
         in_hdt = (sim.phase == "HDT")
         self.assert_test(
-            "Signal", "SIG-02-TrainAllRedClearance",
-            in_all_red and in_hdt,
-            "Đổi pha trong train mode có 15 tick dọn nút (all-red) rồi mới mở pha mới"
+            "Signal", "SIG-02-TrainYellowClearance",
+            in_yellow and in_hdt,
+            "Pha mới bắt đầu ngay sau 20 tick vàng"
         )
 
         # SIG-03: Red light stopping compliance
@@ -294,19 +296,19 @@ class VehicleBehaviorTestSuite:
             sim.step()
         se_nw_breaches = [
             v for v in sim.vehicles
-            if v.arm in ("SE", "NW") and v.position > v.approach_end
+            if v.arm in ("SE", "NW") and v.maneuver != "right" and v.position > v.approach_end
         ]
         self.assert_test(
             "Signal", "SIG-03-RedLightCompliance",
             len(se_nw_breaches) == 0,
-            f"100% xe tuân thủ đèn đỏ dừng trước vạch (số xe vi phạm={len(se_nw_breaches)})"
+            f"Xe đi thẳng và rẽ trái dừng trước vạch khi đỏ (số xe vi phạm={len(se_nw_breaches)})"
         )
 
         # SIG-04: Green light releases queue
         sim = LeVanLuongSimulator(flow_per_approach=3000, seed=77)
         sim.step(250)  # SE/NW queued up during red
         queue_before = sum(v.speed * 3.6 < 1.0 and v.arm in ("SE", "NW") for v in sim.vehicles)
-        sim.step(70)   # 15 ticks red clearance, then enough green to clear the stop line
+        sim.step(70)   # opposing green releases the stop line
         passed_into_conn = sum(v.arm in ("SE", "NW") and v.position > v.approach_end for v in sim.vehicles)
         self.assert_test(
             "Signal", "SIG-04-GreenReleasesQueue",
@@ -318,7 +320,7 @@ class VehicleBehaviorTestSuite:
         sim = LeVanLuongSimulator(flow_per_approach=0, train_mode=True)
         sim.step(50)  # 50 ticks of LVL green
         green_at_50 = sim.green_ticks
-        sim.set_action(2)  # switch to HDT -> triggers 15 ticks all-red
+        sim.set_action(2)  # switch to HDT -> starts the yellow interval
         sim.step(10)
         green_at_red = sim.green_ticks
         self.assert_test(

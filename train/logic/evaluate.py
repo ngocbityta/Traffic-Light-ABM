@@ -29,6 +29,7 @@ import time
 import torch
 
 from .three_dqn_agent import ThreeDQNAgent, FlatDQNAgent, ARCHITECTURE as THREE_ARCHITECTURE
+from .rainbow_agent import ARCHITECTURE_V5 as RAINBOW_V5_ARCHITECTURE
 from .rainbow_agent import (RainbowAgent, ARCHITECTURE as RAINBOW_ARCHITECTURE,
                            LEGACY_ARCHITECTURE, PREVIOUS_ARCHITECTURE)
 from .hybrid_agent import SpatialHybridAgent, ARCHITECTURE as HYBRID_ARCHITECTURE
@@ -174,7 +175,7 @@ async def amain(args):
                                  f"but evaluation requested {args.scenario}")
         architecture = checkpoint.get("architecture")
         is_spatial = architecture in (RAINBOW_ARCHITECTURE, LEGACY_ARCHITECTURE,
-                                      PREVIOUS_ARCHITECTURE,
+                                      PREVIOUS_ARCHITECTURE, RAINBOW_V5_ARCHITECTURE,
                                       HYBRID_ARCHITECTURE)
         reward_options = dict(checkpoint.get("reward_settings", {}))
         if is_spatial and "r1_ref" not in reward_options:
@@ -206,19 +207,22 @@ async def amain(args):
                         "gama-four-phase-flat-dqn-v1": FlatDQNAgent,
                         TABULAR_ARCHITECTURE: TabularQAgent,
                         RAINBOW_ARCHITECTURE: RainbowAgent,
+                        RAINBOW_V5_ARCHITECTURE: RainbowAgent,
                         LEGACY_ARCHITECTURE: RainbowAgent,
                         PREVIOUS_ARCHITECTURE: RainbowAgent,
                         HYBRID_ARCHITECTURE: SpatialHybridAgent}).get(architecture)
         if agent_class is None:
             raise ValueError(f"Unsupported checkpoint architecture: {architecture}")
         if architecture in (RAINBOW_ARCHITECTURE, LEGACY_ARCHITECTURE,
-                            PREVIOUS_ARCHITECTURE):
+                            PREVIOUS_ARCHITECTURE, RAINBOW_V5_ARCHITECTURE):
             agent = agent_class(buffer_size=1, warmup=1, batch_size=1,
                                 atoms=checkpoint["atoms"], v_min=checkpoint["v_min"],
                                 v_max=checkpoint["v_max"], r1_ref=reward_options["r1_ref"],
                                 reward_mode=checkpoint["reward_mode"],
                                 reward_settings=reward_options,
-                                aux_size=17 if architecture == RAINBOW_ARCHITECTURE else 13)
+                                aux_size=(None if architecture == RAINBOW_V5_ARCHITECTURE
+                                          else 17 if architecture == RAINBOW_ARCHITECTURE
+                                          else 13))
         elif architecture == HYBRID_ARCHITECTURE:
             agent = agent_class(buffer_size=1, warmup=1, batch_size=1,
                                 pressure_lambda=checkpoint["pressure_lambda"],

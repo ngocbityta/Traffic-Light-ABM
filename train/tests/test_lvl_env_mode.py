@@ -89,7 +89,7 @@ class LVLPythonEnvModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(before["approach_ew"], 1)
         self.assertGreater(before["spatial"][1, 0].sum(), 0.0)
 
-        # The switch costs 4 s yellow + 2 s all-red, so HDT turns green 6 s
+        # The switch costs 4 s yellow, so HDT turns green 4 s
         # into this 10 s decision interval and the motorbike, starting from
         # rest, is released during the next one.
         after, reward, _, info = await env.step(2, horizon=250, current_state=before)

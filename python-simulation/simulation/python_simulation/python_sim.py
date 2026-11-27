@@ -221,6 +221,29 @@ STOP_GO_MAX_DECEL = 6.0
 # Beyond this distance from the stop line at yellow the vehicle simply stops.
 STOP_GO_MAX_DISTANCE = 150.0
 
+# Yellow as the law reads it (``yellow_rule="law"``, default): Luat Trat tu,
+# an toan giao thong duong bo 2024 (36/2024/QH15), art. 11(4): on yellow a
+# vehicle must stop before the stop line unless it is already on or past
+# it; running it is fined as running a red (Nghi dinh 168/2024/ND-CP). A
+# vehicle goes on only if it cannot stop: after the brake response time it
+# would need more than its hardest stop (STOP_GO_MAX_DECEL for cars and
+# motorbikes, scaled by the SUMO decel ratio for trucks and buses).
+# Brake response 1.00 s: mean of 2,458 first-to-stop vehicles, McGee, Moriarty,
+# Gates et al. (2012), equal to the ITE default.
+YELLOW_BRAKE_RESPONSE = 1.0
+# Green countdown (``countdown=True``, fixed plan only: under the RL policy
+# the end of green is not known in advance). In the last seconds of a green
+# countdown a driver who would not be over the line in time starts braking:
+# binary logit of crossing, Chiou & Chang (2010), Accident Analysis &
+# Prevention 42, 1057-1065, Table 3, with the green signal countdown display
+# (Hsinchu, Taiwan, scooter-dominated mixed traffic, n = 3,803):
+# U = 0.5908 + 0.5436 T[s] - 0.0906 D[m] + 0.0718 V[km/h], T the green
+# seconds left on the display. Applied over the green stages G7..G1 the model
+# was estimated on, as a latent threshold: one uniform draw per vehicle and
+# green; it stops as soon as P(cross) falls below it.
+CHIOU2010_GSCD = {"constant": 0.5908, "T": 0.5436, "D": -0.0906, "V": 0.0718}
+COUNTDOWN_WINDOW = 7.0
+
 # Vehicle types. The index is the type code of the demand file (third
 # column): 0 motorbike, 1 car, 2 heavy vehicle.
 VEHICLE_KINDS = ("motorbike", "car", "heavy")
@@ -391,6 +414,8 @@ class Vehicle:
     # Stop-or-go decision for the yellow interval ``yellow_epoch``.
     yellow_go: bool = False
     yellow_epoch: int = -1
+    # Green countdown: chose to stop before the yellow of epoch + 1.
+    countdown_stop_epoch: int = -1
     # Lateral shift of the corridor sublane an impatient merger is claiming;
     # followers in that sublane yield to it (courtesy gap). NaN = no claim.
     merge_claim_shift: float = math.nan
@@ -983,14 +1008,22 @@ class LeVanLuongSimulator:
 
     def __init__(self, seed=1, flow_per_approach=2400.0,
                  motorbike_ratio=.85, p_left=.2, p_right=.2,
-                 green_lvl=50.0, green_hdt=40.0, all_red=2.0,
+                 green_lvl=50.0, green_hdt=40.0, all_red=0.0,
                  roads_path=ROOT / "includes" / "roads.geojson",
                  demand_file=None, train_mode=False, mode="safe", yellow=4.0,
                  vehicle_params=None, startup_params=None,
                  junction_model="negotiation", negotiation_params=None,
                  min_green=10.0, jam_timeout=120.0,
                  curve_lat_accel=3.0, curve_decel=2.0, max_decel=7.5,
-                 heavy_ratio=DEFAULT_HEAVY_RATIO):
+                 heavy_ratio=DEFAULT_HEAVY_RATIO, yellow_rule="law", countdown=True,
+                 signal_control="phase", max_green=75.0, ext_step=5.0,
+                 countdown_lock=8.0, decision_lead=1.0, observation_zone=0.0):
+        if yellow_rule not in ("law", "logit"):
+            raise ValueError("yellow_rule must be 'law' or 'logit'")
+        self.yellow_rule = yellow_rule
+        self.countdown = bool(countdown)
+        self.countdown_stops = 0
+        self.yellow_forced_go = 0
         if mode not in ("safe", "gama_2025_6_4"):
             raise ValueError("mode must be 'safe' or 'gama_2025_6_4'")
         self.mode = mode
@@ -1171,6 +1204,24 @@ class LeVanLuongSimulator:
         self._curve_profiles = {}
         self._curve_entry = {}
         self.hard_brake_events = 0
+        # Body guard (26/11/2026): moves of this tick shortened so that no two
+        # body footprints overlap; ``body_guard_unresolved`` counts contacts it
+        # could not undo (must stay 0).
+        self.body_guard_moves = 0
+        self.body_guard_unresolved = 0
+        self.body_guard_aborts = 0
+        self.body_guard_nudges = 0
+        self.body_guard_yields = 0
+        self.body_guard_near_start = 0
+        self.body_guard_fallbacks = 0
+        self._fallback_timers = {}
+        self.body_guard_teleports = 0
+        self.guard_teleport = 20.0
+        self._body_guard_waits = {}
+        self._body_guard_timers = {}
+        # Pairs found frozen against each other: checked at 0,1 mm (s left).
+        self._tight_pairs = {}
+        self.body_guard_tight = 0
         self.masked_actions = 0
         self.train_mode = bool(train_mode)
         self.dqn_waiting_action = False
@@ -1179,6 +1230,9 @@ class LeVanLuongSimulator:
         self.red_ticks_left = 0
         self.pending_phase = "LVL"
         self._phase_change_pending = False
+        self._init_extension_control(signal_control, max_green, ext_step,
+                                     countdown_lock, decision_lead)
+        self._init_observation_zone(observation_zone)
         self._rows = []
         self._cursor = 0
         self._replay = demand_file is not None
@@ -1234,6 +1288,202 @@ class LeVanLuongSimulator:
             return "none", "HDT"
         return "none", None
 
+    # ------------------------------------------------------------------
+    # Extension control (``signal_control="extend"``, train mode only).
+    #
+    # Each green starts with ``min_green`` seconds planned. The policy is
+    # asked when the red countdown of the waiting axis (green left + yellow
+    # + all-red) is ``countdown_lock + decision_lead`` seconds: choosing the
+    # running phase adds ``ext_step`` seconds, choosing the other phase
+    # commits the switch. With the red countdown at ``countdown_lock`` or
+    # less the end of green never moves (hard rule), so a countdown shown
+    # from then on is always truthful. Lock 8 s, lead 1 s, yellow 4 s and no
+    # all-red give the decision at 5 s of green left, as in
+    # reports/countdown/bao_cao.md. A green that cannot be extended without
+    # exceeding ``max_green`` is locked without asking (no forced decision).
+    # Greens therefore last min_green + k * ext_step <= max_green seconds.
+    # ------------------------------------------------------------------
+    def _init_extension_control(self, signal_control, max_green, ext_step,
+                                countdown_lock, decision_lead):
+        if signal_control not in ("phase", "extend"):
+            raise ValueError("signal_control must be 'phase' or 'extend'")
+        self.signal_control = signal_control
+        self.max_green = float(max_green)
+        self.ext_step = float(ext_step)
+        self.countdown_lock = float(countdown_lock)
+        self.decision_lead = float(decision_lead)
+        self.planned_green_ticks = 0
+        self.signal_locked = False
+        self.extensions = 0
+        self.extension_decisions = 0
+        self.auto_locks = 0
+        self.unanswered_decisions = 0
+        self.last_green_seconds = {"LVL": 0.0, "HDT": 0.0}
+        self.green_log = []
+        if signal_control != "extend":
+            return
+
+        def ticks(seconds, name):
+            value = float(seconds)
+            n = int(round(value / DT))
+            if not math.isfinite(value) or value < 0 or abs(n * DT - value) > 1e-6:
+                raise ValueError(f"{name} must be a non-negative multiple of {DT} s")
+            return n
+
+        self._max_green_ticks = ticks(max_green, "max_green")
+        self._ext_ticks = ticks(ext_step, "ext_step")
+        self._lock_ticks = ticks(countdown_lock, "countdown_lock")
+        lead_ticks = ticks(decision_lead, "decision_lead")
+        clearance = ticks(self._yellow, "yellow") + ticks(self.all_red, "all_red")
+        # Green left (ticks) at a decision.
+        self._decide_green_left = self._lock_ticks + lead_ticks - clearance
+        if self._ext_ticks <= 0 or lead_ticks <= 0:
+            raise ValueError("ext_step and decision_lead must be positive")
+        if self._decide_green_left <= 0:
+            raise ValueError("countdown_lock + decision_lead must exceed yellow + all_red")
+        if self._min_green_ticks <= self._decide_green_left:
+            raise ValueError("min_green must exceed the green left at a decision "
+                             f"({self._decide_green_left * DT:g} s)")
+        if self._max_green_ticks < self._min_green_ticks:
+            raise ValueError("max_green must be >= min_green")
+        self.planned_green_ticks = self._min_green_ticks
+        # The first green starts at cycle 1: first decision at this cycle.
+        self.next_decision_in_cycles = self._min_green_ticks - self._decide_green_left
+
+    def _extend_decision_due(self):
+        return (self.phase in ("LVL", "HDT") and not self.signal_locked and
+                self.planned_green_ticks - self.green_ticks == self._decide_green_left)
+
+    def _ticks_to_next_extend_decision(self):
+        """Exact ticks until the next decision tick (>= 1)."""
+        first = self._min_green_ticks - self._decide_green_left
+        if self.phase in ("LVL", "HDT"):
+            if not self.signal_locked:
+                return max(1, self.planned_green_ticks - self._decide_green_left
+                           - self.green_ticks)
+            left = self.planned_green_ticks - self.green_ticks
+            return max(1, left + int(round(self._yellow / DT)) +
+                       int(round(self.all_red / DT)) + first)
+        return max(1, self.yellow_ticks_left + self.red_ticks_left + first)
+
+    def _advance_signal_extend(self):
+        previous_yellow = self.yellow_phase
+        if self.dqn_waiting_action:
+            # Stepped past a decision without an answer: commit the switch,
+            # the default that keeps a shown countdown truthful.
+            self.dqn_waiting_action = False
+            self.signal_locked = True
+            self.unanswered_decisions += 1
+        if self.dqn_action >= 0:
+            wanted = "LVL" if self.dqn_action == 0 else "HDT"
+            if wanted == self.phase:
+                self.planned_green_ticks += self._ext_ticks
+                self.extensions += 1
+            else:
+                self.signal_locked = True
+            self.dqn_action = -1
+        if (self.phase in ("LVL", "HDT") and not self._phase_change_pending and
+                self.green_ticks >= self.planned_green_ticks):
+            # Green ran its planned length: yellow of this phase starts now.
+            seconds = self.green_ticks * DT
+            self.last_green_seconds[self.phase] = seconds
+            self.green_log.append((self.phase, round(seconds, 3),
+                                   (self.planned_green_ticks - self._min_green_ticks)
+                                   // self._ext_ticks))
+            self.pending_phase = "HDT" if self.phase == "LVL" else "LVL"
+            self._phase_change_pending = True
+            self._yellow_from = self.phase
+            self.yellow_ticks_left = int(round(self._yellow / DT))
+            self.red_ticks_left = int(round(self.all_red / DT))
+        if self.yellow_ticks_left > 0:
+            self.phase = "none"
+            self.yellow_phase = self._yellow_from
+            if previous_yellow is None:
+                self._yellow_epoch += 1
+            self.yellow_ticks_left -= 1
+        elif self.red_ticks_left > 0:
+            self.yellow_phase = None
+            self.phase = "none"
+            self.red_ticks_left -= 1
+        elif self._phase_change_pending:
+            self.phase = self.pending_phase
+            self.yellow_phase = None
+            self._phase_change_pending = False
+            self.planned_green_ticks = self._min_green_ticks
+            self.signal_locked = False
+        self._update_last_yellow()
+        if self.phase in ("LVL", "HDT"):
+            self.green_ticks += 1
+        else:
+            self.green_ticks = 0
+        if self._extend_decision_due():
+            if self.planned_green_ticks + self._ext_ticks <= self._max_green_ticks:
+                self.dqn_waiting_action = True
+                self.extension_decisions += 1
+            else:
+                self.signal_locked = True
+                self.auto_locks += 1
+        self.next_decision_in_cycles = (1 if self.dqn_waiting_action else
+                                        self._ticks_to_next_extend_decision())
+
+    def red_countdown(self):
+        """Seconds of red left for the waiting axis once the switch is fixed
+        (extension control), else None."""
+        if self.signal_control != "extend" or not self.train_mode:
+            return None
+        if self.phase in ("LVL", "HDT"):
+            if not self.signal_locked:
+                return None
+            left = self.planned_green_ticks - self.green_ticks
+            return (left + int(round(self._yellow / DT)) +
+                    int(round(self.all_red / DT))) * DT
+        return (self.yellow_ticks_left + self.red_ticks_left) * DT
+
+    def red_countdown_display(self):
+        """Number shown on the waiting axis' red countdown: only once the
+        switch is fixed and at most ``countdown_lock`` seconds, else None."""
+        left = self.red_countdown()
+        if left is None or left > self.countdown_lock + 1e-9 or left <= 0:
+            return None
+        return int(math.ceil(left - 1e-9))
+
+    # ------------------------------------------------------------------
+    # Observation zone counters (``observation_zone`` > 0): what a camera
+    # covering that many metres before each stop line can count. Distances
+    # are those of the vehicle reference point to the stop line.
+    # ------------------------------------------------------------------
+    def _init_observation_zone(self, observation_zone):
+        zone = float(observation_zone)
+        if not math.isfinite(zone) or zone < 0:
+            raise ValueError("observation_zone must be a non-negative number")
+        self.observation_zone = zone
+        self.zone_arrivals = dict.fromkeys(ARMS, 0)
+        self.stopline_crossings = dict.fromkeys(ARMS, 0)
+        self.zone_stop_time = {}
+        self._zone_seen = set()
+
+    def _measure_zone(self):
+        zone = self.observation_zone
+        seen = self._zone_seen
+        stop_time = self.zone_stop_time
+        for v in self.vehicles:
+            if v.road != v.in_road:
+                continue
+            distance = v.approach_end - v.position
+            if distance > zone:
+                continue
+            cid = v.creation_id
+            if cid not in seen:
+                seen.add(cid)
+                self.zone_arrivals[v.arm] += 1
+            if v.speed * 3.6 < 1.0:
+                stop_time[cid] = stop_time.get(cid, 0.0) + DT
+        if self.cycle % 1000 == 0 and seen:
+            live = {v.creation_id for v in self.vehicles if v.road == v.in_road}
+            seen.intersection_update(live)
+            for cid in [c for c in stop_time if c not in live]:
+                del stop_time[cid]
+
     def _update_last_yellow(self):
         if self.yellow_phase is not None:
             self._last_yellow = self.yellow_phase
@@ -1247,6 +1497,11 @@ class LeVanLuongSimulator:
         ``min_green`` seconds of green; during yellow/all-red the pending
         phase is the only legal choice.
         """
+        if self.signal_control == "extend" and self.train_mode:
+            if self.dqn_waiting_action:
+                return (True, False, True, False)
+            current = self.phase if self.phase in ("LVL", "HDT") else self.pending_phase
+            return (current == "LVL", False, current == "HDT", False)
         if self.phase in ("LVL", "HDT"):
             current = self.phase
             may_switch = self.green_ticks >= self._min_green_ticks
@@ -1268,6 +1523,9 @@ class LeVanLuongSimulator:
         self.dqn_waiting_action = False
 
     def _advance_signal(self):
+        if self.train_mode and self.signal_control == "extend":
+            self._advance_signal_extend()
+            return
         previous_yellow = self.yellow_phase
         if not self.train_mode:
             self.phase, self.yellow_phase = self._signal()
@@ -1502,10 +1760,14 @@ class LeVanLuongSimulator:
                 leader.speed <= 0.5):
             return 0.0
         advance = max(0.0, leader.speed * DT - 0.5 * leader.decel * DT * DT)
-        if leader.leading_heavy:
+        if leader.leading_heavy or (self.mode == "safe" and road.endswith(("_in", "_out"))):
             # The leader follows a truck or bus, which can stop short (it is
             # held by a junction stop, or yaws through a lane change): count
-            # no more than the leader's own room.
+            # no more than the leader's own room. The same holds in a creeping
+            # queue: a leader that is itself right behind its own leader
+            # moves only what that gap allows (seed 2: a motorbike counted on
+            # its leader's full step, the leader stopped 1 m behind a car,
+            # and the road guard pushed the follower back 1.8 cm).
             room = leader.leading_distance
             road, position = leader.leading_from
             if road == leader.road:
@@ -1587,7 +1849,7 @@ class LeVanLuongSimulator:
         if self.mode == "safe" and vehicle.maneuver == "right":
             return True
         if self._arm_is_green(vehicle.arm):
-            return True
+            return not self._countdown_stops(vehicle)
         if self.yellow_phase is None or not self._arm_is_yellow(vehicle.arm):
             # A "go" decision taken during the last yellow stays valid through
             # the following all-red (the vehicle runs the early red, as
@@ -1617,12 +1879,78 @@ class LeVanLuongSimulator:
             utility += c["intermediate_lane"]
         return 1.0 / (1.0 + math.exp(-utility))
 
+    def _stop_decel_limit(self, vehicle):
+        return STOP_GO_MAX_DECEL * min(1.0, vehicle.decel / DEFAULT_VEHICLE_PARAMS["car"]["decel"])
+
+    def _green_remaining(self):
+        """Seconds of green left on the countdown, None if not known."""
+        if (self.train_mode and self.signal_control == "extend" and
+                self.phase in ("LVL", "HDT")):
+            if not self.signal_locked:
+                return None
+            return max(0.0, (self.planned_green_ticks - self.green_ticks) * DT)
+        if self.train_mode or self.phase not in ("LVL", "HDT"):
+            return None
+        length = self.green_lvl + self.green_hdt + 2 * self.all_red
+        if length <= 0:
+            return None
+        t = (max(0, self.cycle - 1) * DT) % length
+        if self.phase == "LVL":
+            end = self.green_lvl - self._yellow
+        else:
+            end = self.green_lvl + self.all_red + self.green_hdt - self._yellow
+        return max(0.0, end - t)
+
+    def countdown_cross_probability(self, vehicle, seconds_left):
+        """P(cross) of the Chiou & Chang (2010) logit with a countdown."""
+        c = CHIOU2010_GSCD
+        d = max(0.0, self._stop_position(vehicle) - vehicle.position)
+        u = (c["constant"] + c["T"] * seconds_left + c["D"] * d +
+             c["V"] * max(0.0, vehicle.speed) * 3.6)
+        return 1.0 / (1.0 + math.exp(-max(-60.0, min(60.0, u))))
+
+    def _countdown_stops(self, vehicle):
+        """Whether this vehicle has chosen to stop at the end of this green."""
+        if vehicle.countdown_stop_epoch == self._yellow_epoch:
+            return True
+        if (not self.countdown or self._yellow <= 0.0 or self.mode != "safe" or
+                vehicle.road != vehicle.in_road):
+            return False
+        left = self._green_remaining()
+        if left is None or left > COUNTDOWN_WINDOW or left <= 0.0:
+            return False
+        stop = self._stop_position(vehicle)
+        room = stop - vehicle.position
+        if room <= 1e-8:
+            return False  # on or past the line
+        shown = math.ceil(left - 1e-9)
+        draw = random.Random((self.seed * 6151) ^ (vehicle.creation_id * 92821)
+                             ^ (self._yellow_epoch * 15485863)).random()
+        if draw < self.countdown_cross_probability(vehicle, shown):
+            return False
+        if vehicle.speed * vehicle.speed / (2.0 * max(room, 0.05)) > self._stop_decel_limit(vehicle):
+            return False  # too late to stop: it keeps going
+        vehicle.countdown_stop_epoch = self._yellow_epoch
+        self.countdown_stops += 1
+        return True
+
     def _decide_stop_or_go(self, vehicle):
         if vehicle.road != vehicle.in_road:
             return True
         stop = self._stop_position(vehicle)
         if vehicle.position > stop + 1e-8:
             return True
+        if self.yellow_rule == "law":
+            # Must stop unless it cannot (see YELLOW_BRAKE_RESPONSE).
+            if vehicle.countdown_stop_epoch == self._yellow_epoch - 1:
+                return False
+            room = stop - vehicle.position
+            v = max(0.0, vehicle.speed)
+            need = v * YELLOW_BRAKE_RESPONSE + v * v / (2.0 * self._stop_decel_limit(vehicle))
+            if need > room:
+                self.yellow_forced_go += 1
+                return True
+            return False
         x = vehicle.approach_end - vehicle.position - vehicle.length / 2.0
         if x > STOP_GO_MAX_DISTANCE:
             return False
@@ -1939,6 +2267,13 @@ class LeVanLuongSimulator:
             self._update_body_sweep()
         starting_positions = {v.creation_id: v.position for v in self.vehicles}
         starting_speeds = {v.creation_id: v.speed for v in self.vehicles}
+        body_start = ({v.creation_id: (v.position, v.speed, v.lane_change_progress,
+                                       self._road_state(v)[0], v.current_lateral_shift,
+                                       v.start_lateral_shift, v.target_lateral_shift,
+                                       v.lane, v.lane_change_from, v.rear_axle,
+                                       v.front_axle_s, v.speed)
+                       for v in self.vehicles}
+                      if self.mode == "safe" and self.junction_model == "negotiation" else None)
         # GAMA iterates agents in insertion order. Each agent performs its
         # lane choice and movement before the next agent reads its neighbors.
         lane_maps = {}
@@ -2290,6 +2625,19 @@ class LeVanLuongSimulator:
                                            leader.road.endswith("_out")):
                     room -= max(1.0, vehicle.gap, leader.gap)
                 distance = min(distance, max(0.0, room))
+                if (leader is not None and leader.road == old_road and
+                        old_road.endswith(("_in", "_out")) and
+                        abs(vehicle.current_lateral_shift - leader.current_lateral_shift) <
+                        vehicle.half_width + leader.half_width + LATERAL_CLEARANCE):
+                    # The same distance the road guard (``road_safety_corrections``)
+                    # measures: centre progress minus half lengths. The lane-map gap
+                    # can read a few cm more (a wide leader offset to one side),
+                    # which let a follower close in and be pushed back.
+                    lead_p = self._road_state(leader)[1] + self._leader_advance(
+                        leader, old_road, moved_ids)
+                    body_room = (lead_p - old_progress - (vehicle.length + leader.length) / 2.0
+                                 - max(1.0, vehicle.gap, leader.gap))
+                    distance = min(distance, max(0.0, body_room))
             if junction_stop is not None:
                 # Hard guard: the front never passes the junction stop point.
                 junction_room = max(0.0, junction_stop - (vehicle.position + vehicle.length / 2.0)
@@ -2359,6 +2707,7 @@ class LeVanLuongSimulator:
                             self.permitted_right_on_red_entries += 1
                         else:
                             self.entries_during_red += 1
+                    self.stopline_crossings[vehicle.arm] += 1
                     vehicle.road = vehicle.conn_road
                 else:
                     vehicle.road = vehicle.out_road
@@ -2698,7 +3047,519 @@ class LeVanLuongSimulator:
             self._resolve_road_conflicts()
             self._resolve_connector_overlaps(starting_positions, starting_speeds)
             self._resolve_seam_overlaps(starting_positions, starting_speeds)
+            self._resolve_body_overlaps(body_start)
         self._commit_axles()
+        if body_start is not None:
+            self._final_body_check(body_start)
+
+    def _final_body_check(self, body_start):
+        """Last word on body contact, after the axles are committed.
+
+        Bodies are compared exactly (no margin) as the observer and the
+        verification compare them. A vehicle in contact with another is put
+        back to its whole state at the start of the tick (position, sideways
+        state, lane, road, axles) and stops; this repeats until no contact is
+        left. Each vehicle is put back at most once, and once every vehicle
+        that moved is back the bodies are those of the start of the tick,
+        which did not touch. So the loop ends, and no contact survives a tick
+        (``body_guard_fallbacks`` counts the vehicles put back; it is 0 when
+        the guard above already left every body clear).
+        """
+        restored = set()
+        while True:
+            entries = []
+            for v in self.vehicles:
+                polys = self._body_polygons(v)
+                xs = [p[0] for poly in polys for p in poly]
+                ys = [p[1] for poly in polys for p in poly]
+                entries.append((v, polys, min(xs), min(ys), max(xs), max(ys)))
+            entries.sort(key=lambda e: e[2])
+            hit = []
+            for i, a in enumerate(entries):
+                for b in entries[i + 1:]:
+                    if b[2] > a[4]:
+                        break
+                    if b[3] > a[5] or a[3] > b[5]:
+                        continue
+                    if any(polygons_overlap(pa, pb, 0.0) for pa in a[1] for pb in b[1]):
+                        hit.append((a[0], b[0]))
+            if not hit:
+                break
+            changed = False
+            for a, b in hit:
+                for v in (a, b):
+                    st = body_start.get(v.creation_id)
+                    if st is None or v.creation_id in restored:
+                        continue
+                    (v.position, _, v.lane_change_progress, v.road, v.current_lateral_shift,
+                     v.start_lateral_shift, v.target_lateral_shift, v.lane,
+                     v.lane_change_from, v.rear_axle, v.front_axle_s, _) = st
+                    v.speed = 0.0
+                    restored.add(v.creation_id)
+                    self.body_guard_fallbacks += 1
+                    changed = True
+            self._axle_cache.clear()
+            if not changed:
+                # Only bodies already at their start state are left in
+                # contact: they touched before this tick (cannot happen from
+                # an empty junction).
+                self.body_guard_unresolved += len(hit)
+                break
+        # A vehicle put back every tick would wait for good: same 20 s limit
+        # as for a vehicle the guard keeps stopping.
+        timers = {vid: self._fallback_timers.get(vid, 0.0) + DT for vid in restored}
+        gone = {v.creation_id for v in self.vehicles
+                if timers.get(v.creation_id, 0.0) > self.guard_teleport
+                and self._road_state(v)[0] == v.conn_road}
+        if gone:
+            self.vehicles = [v for v in self.vehicles if v.creation_id not in gone]
+            self.body_guard_teleports += len(gone)
+            self.jam_removed += len(gone)
+        self._fallback_timers = {vid: t for vid, t in timers.items() if vid not in gone}
+
+    def _resolve_body_overlaps(self, body_start):
+        """Final body guard: no two body footprints overlap after a tick.
+
+        Every move of this tick (along the path and sideways) is a segment
+        from the state at the start of the tick to the current state. If two
+        bodies overlap, the vehicle whose own move can be shortened to clear
+        the other is moved back along its segment (bisection on the fraction
+        of the move), as little as needed; if neither can clear alone, both
+        go back to their start states, which did not overlap. Moves are only
+        ever shortened, so the loop ends, and by induction from an empty
+        junction no overlap can appear. A vehicle is never moved back across
+        a road boundary it crossed this tick. Interventions are counted in
+        ``body_guard_moves``; contacts left (only possible if the start
+        states already touched) in ``body_guard_unresolved``.
+        """
+        if not body_start or not self.vehicles:
+            return
+        seg = {}
+        for v in self.vehicles:
+            st = body_start.get(v.creation_id)
+            if st is None:
+                continue  # spawned this tick, placed clear of others
+            p0, v0, u_start, road0, cs0, ss0, ts0, lane0, lcf0 = st[:9]
+            road1 = self._road_state(v)[0]
+            p1, u1, cs1 = v.position, v.lane_change_progress, v.current_lateral_shift
+            end = (v.road, v.current_lateral_shift, v.start_lateral_shift,
+                   v.target_lateral_shift, v.lane, v.lane_change_from, u1)
+            crossed = road1 != road0
+            pmin = p0
+            if crossed:
+                bound = (v.approach_end if road1 == v.conn_road else v.connector_end) + 1e-6
+                pmin = min(max(p0, bound), p1)
+            if (abs(p1 - p0) < 1e-9 and abs(cs1 - cs0) < 1e-9 and abs(u1 - u_start) < 1e-12
+                    and not crossed):
+                continue
+            seg[v.creation_id] = [pmin, p1, u_start, u1, not crossed, p0, v0, 1.0,
+                                  st, end, crossed, 1.0]
+
+        def place(v, lam, lat=None):
+            # ``lam``: share of this tick's move along the path kept;
+            # ``lat``: share of its sideways move kept (default the same).
+            if lat is None:
+                lat = lam
+            sg = seg[v.creation_id]
+            sg[7], sg[11] = lam, lat
+            st, end = sg[8], sg[9]
+            if v.wheelbase > 0.0:
+                # The axle cache is keyed by position and shift, not by lane
+                # and road, which this may change as well.
+                self._axle_cache.clear()
+            if lam <= 0.0 and (lat <= 0.0 or not sg[4]):
+                # Exactly the state at the start of the tick.
+                (v.position, _, v.lane_change_progress, v.road, v.current_lateral_shift,
+                 v.start_lateral_shift, v.target_lateral_shift, v.lane,
+                 v.lane_change_from) = st[:9]
+                return
+            (v.road, v.current_lateral_shift, v.start_lateral_shift,
+             v.target_lateral_shift, v.lane, v.lane_change_from,
+             v.lane_change_progress) = end
+            v.position = sg[0] + lam * (sg[1] - sg[0])
+            if sg[4]:
+                v.lane_change_progress = st[2] + lat * (end[6] - st[2]) if st[2] <= end[6] else end[6]
+                v.current_lateral_shift = st[4] + lat * (end[1] - st[4])
+
+        cell = 8.0
+        def boxes():
+            out = {}
+            grid = {}
+            for v in self.vehicles:
+                polys = self._body_polygons(v)
+                xs = [p[0] for poly in polys for p in poly]
+                ys = [p[1] for poly in polys for p in poly]
+                box = (min(xs), min(ys), max(xs), max(ys))
+                out[v.creation_id] = (v, polys, box)
+                for gx in range(int(math.floor(box[0] / cell)), int(math.floor(box[2] / cell)) + 1):
+                    for gy in range(int(math.floor(box[1] / cell)), int(math.floor(box[3] / cell)) + 1):
+                        grid.setdefault((gx, gy), []).append(v.creation_id)
+            return out, grid
+
+        # A 1 cm margin on each body: bisection stops right at contact, and
+        # the next evaluation of a two-axle body (axles re-integrated after
+        # the commit) may differ in the last digits. The 2 cm it leaves
+        # between bodies also keeps dense traffic from locking up (1 mm
+        # gave more vehicles stuck at 130 % demand).
+        margin = 0.01
+        # A pair the deadlock breaker found frozen at that margin (every move
+        # of either brings them a few mm closer, though never into contact)
+        # is checked at 0,1 mm for a while: the exact check after the commit
+        # still keeps any contact out (``body_guard_tight``).
+        tight = {k: t - DT for k, t in self._tight_pairs.items() if t - DT > 0.0}
+        self._tight_pairs = tight
+        def touching(entry, other):
+            m = margin
+            if tight:
+                ia, ib = entry[0].creation_id, other[0].creation_id
+                if (ia, ib) in tight or (ib, ia) in tight:
+                    m = 0.0001
+            return any(polygons_overlap(a, b, m) for a in entry[1] for b in other[1])
+
+        def neighbours(vid, data, grid):
+            box = data[vid][2]
+            found = set()
+            for gx in range(int(math.floor(box[0] / cell)) - 1, int(math.floor(box[2] / cell)) + 2):
+                for gy in range(int(math.floor(box[1] / cell)) - 1, int(math.floor(box[3] / cell)) + 2):
+                    found.update(grid.get((gx, gy), ()))
+            found.discard(vid)
+            return [data[o] for o in found]
+
+        def clear_of(v, others):
+            own = (v, self._body_polygons(v), None)
+            return not any(touching(own, o) for o in others)
+
+        def shorten_from(v, others, hi):
+            lo = 0.0
+            place(v, hi)
+            if clear_of(v, others):
+                return hi
+            for _ in range(18):
+                mid = (lo + hi) / 2.0
+                place(v, mid)
+                if clear_of(v, others):
+                    lo = mid
+                else:
+                    hi = mid
+            return lo
+
+        def shorten(v, others):
+            """Largest part (<= current) of v's move clear of ``others``, as
+            (share along the path, share sideways); None if even the start
+            of the move touches one of them. A sideways move that runs into a
+            neighbour is given up first: a vehicle that can still go straight
+            on is not stopped for it."""
+            sg = seg[v.creation_id]
+            f0, l0 = sg[7], sg[11]
+            if sg[4] and l0 > 0.0:
+                place(v, f0, 0.0)
+                if clear_of(v, others):
+                    lo, hi = 0.0, l0
+                    for _ in range(18):
+                        mid = (lo + hi) / 2.0
+                        place(v, f0, mid)
+                        if clear_of(v, others):
+                            lo = mid
+                        else:
+                            hi = mid
+                    place(v, f0, lo)
+                    return (f0, lo)
+            place(v, 0.0, 0.0)
+            if not clear_of(v, others):
+                place(v, f0, l0)
+                return None
+            lo, hi = 0.0, 1.0
+            for _ in range(18):
+                mid = (lo + hi) / 2.0
+                place(v, mid * f0, mid * l0)
+                if clear_of(v, others):
+                    lo = mid
+                else:
+                    hi = mid
+            place(v, lo * f0, lo * l0)
+            return (lo * f0, lo * l0)
+
+        moved = set()
+        stuck = set()
+        aborted = set()
+        blocked_by = {}
+        for _ in range(4 * len(self.vehicles) + 8):
+            data, grid = boxes()
+            pair = None
+            for vid, entry in data.items():
+                for other in neighbours(vid, data, grid):
+                    if other[0].creation_id < vid or (vid, other[0].creation_id) in stuck:
+                        continue
+                    if touching(entry, other):
+                        pair = (entry[0], other[0])
+                        break
+                if pair:
+                    break
+            if pair is None:
+                break
+            a, b = pair
+            options = []
+            for x, y in ((a, b), (b, a)):
+                if x.creation_id not in seg or (seg[x.creation_id][7] <= 0.0 and
+                                                seg[x.creation_id][11] <= 0.0):
+                    continue
+                sg = seg[x.creation_id]
+                keep = (sg[7], sg[11])
+                others = neighbours(x.creation_id, data, grid)
+                lam = shorten(x, others)
+                place(x, *keep)
+                if lam is not None:
+                    side = abs(sg[9][1] - sg[8][4]) if sg[4] else 0.0
+                    cost = (keep[0] - lam[0]) * abs(sg[1] - sg[0]) + (keep[1] - lam[1]) * side
+                    options.append((cost, x.creation_id, x, lam))
+            if options:
+                options.sort(key=lambda o: (o[0], o[1]))
+                _, _, x, lam = options[0]
+                place(x, *lam)
+                moved.add(x.creation_id)
+                blocked_by[x.creation_id] = b if x is a else a
+                continue
+            backed = False
+            for x in (a, b):
+                if x.creation_id in seg and (seg[x.creation_id][7] > 0.0 or
+                                             seg[x.creation_id][11] > 0.0):
+                    place(x, 0.0, 0.0)
+                    moved.add(x.creation_id)
+                    backed = True
+            if backed:
+                # Neither move alone clears the other's: both went back. Give
+                # the one further downstream as much of its move as it can
+                # take with the other standing at its start, so that a pair
+                # pressing into one gap cannot freeze each other for good.
+                def rank(x):
+                    r = self._road_state(x)[0]
+                    return (2 if r == x.out_road else 1 if r == x.conn_road else 0, x.position)
+                first = max((a, b), key=rank)
+                if first.creation_id in seg:
+                    sg = seg[first.creation_id]
+                    sg[7] = 1.0
+                    place(first, 0.0)
+                    data2, grid2 = boxes()
+                    lam = shorten_from(first, neighbours(first.creation_id, data2, grid2), 1.0)
+                    place(first, lam)
+                    blocked_by[first.creation_id] = b if first is a else a
+                continue
+            if not backed:
+                # Within the margin of each other at the start of the tick:
+                # nothing to undo here (the exact check below decides).
+                self.body_guard_near_start += 1
+                stuck.add((min(a.creation_id, b.creation_id), max(a.creation_id, b.creation_id)))
+        # Deadlock breaker. On the stop-line jog a body that is tangent to its
+        # path turns as its centre passes the kink, and its rear corner can
+        # swing into a vehicle standing just beside it; in a full junction a
+        # few bodies can also press into one gap. The guard would then stop
+        # the same vehicle every tick for good. After 1 s of that the blocked
+        # vehicle steers a little sideways (up to 0,8 m, as a driver pulling
+        # out past a neighbour would), if that clears every body
+        # (``body_guard_nudges``). A vehicle still held by the guard after
+        # ``guard_teleport`` seconds is taken out of the junction like the
+        # jam safety net (``body_guard_teleports``, also in ``jam_removed``).
+        by_id = {v.creation_id: v for v in self.vehicles}
+        waits = self._body_guard_waits
+        live = {}
+        for vid, other in blocked_by.items():
+            sg = seg.get(vid)
+            x = by_id.get(vid)
+            if sg is None or x is None or sg[7] > 0.25:
+                continue
+            live[vid] = waits.get(vid, 0) + 1
+            if live[vid] < 5:
+                continue
+            road_x = self._road_state(x)[0]
+            lo_lim, hi_lim = -math.inf, math.inf
+            if road_x == x.in_road or road_x == x.out_road:
+                lanes = self.roads[road_x]["num_lanes"]
+                lo_lim = (x.occupied - 1) / 2.0 * SUBLANE_WIDTH
+                hi_lim = (lanes - 1 - (x.occupied - 1) / 2.0) * SUBLANE_WIDTH
+            lam_prev, lateral_prev = (sg[7], sg[11]), sg[4]
+            place(x, 1.0)
+            sg[4] = False
+            base_shift = x.current_lateral_shift
+            data, grid = boxes()
+            others = neighbours(vid, data, grid)
+            done = False
+            for d in (0.15, 0.3, 0.45, 0.6, 0.8):
+                for sign in (1.0, -1.0):
+                    shift = base_shift + sign * d
+                    if not lo_lim - 1e-9 <= shift <= hi_lim + 1e-9:
+                        continue
+                    x.current_lateral_shift = shift
+                    if clear_of(x, others):
+                        done = True
+                        break
+                if done:
+                    break
+            if not done:
+                x.current_lateral_shift = base_shift
+                # The blocked body has no room to steer, but the one holding
+                # it is a narrower vehicle standing beside it (typically a
+                # motorbike squeezed along the flank of a truck whose body
+                # turns into the connector). That rider edges a little
+                # sideways, as one would to let the truck through, if that
+                # clears every body (``body_guard_yields``).
+                y = other if other is not None else None
+                if (y is not None and y.creation_id in by_id and y.speed < 0.5
+                        and self._half_width(y) < self._half_width(x)):
+                    road_y = self._road_state(y)[0]
+                    ylo, yhi = -math.inf, math.inf
+                    if road_y == y.in_road or road_y == y.out_road:
+                        lanes_y = self.roads[road_y]["num_lanes"]
+                        ylo = (y.occupied - 1) / 2.0 * SUBLANE_WIDTH
+                        yhi = (lanes_y - 1 - (y.occupied - 1) / 2.0) * SUBLANE_WIDTH
+                    y_shift = y.current_lateral_shift
+                    for d in (0.05, 0.1, 0.2, 0.3, 0.45):
+                        for sign in (1.0, -1.0):
+                            shift = y_shift + sign * d
+                            if not ylo - 1e-9 <= shift <= yhi + 1e-9:
+                                continue
+                            y.current_lateral_shift = shift
+                            if y.wheelbase > 0.0:
+                                self._axle_cache.clear()
+                            data_y, grid_y = boxes()
+                            if (clear_of(y, neighbours(y.creation_id, data_y, grid_y)) and
+                                    clear_of(x, neighbours(vid, data_y, grid_y))):
+                                done = True
+                                break
+                        if done:
+                            break
+                    if done:
+                        y.start_lateral_shift = y.target_lateral_shift = y.current_lateral_shift
+                        y.lane_change_progress = 1.0
+                        sg_y = seg.get(y.creation_id)
+                        if sg_y is not None:
+                            sg_y[9] = (y.road, y.current_lateral_shift, y.start_lateral_shift,
+                                       y.target_lateral_shift, y.lane, y.lane_change_from, 1.0)
+                        self.body_guard_yields += 1
+                    else:
+                        y.current_lateral_shift = y_shift
+                        if y.wheelbase > 0.0:
+                            self._axle_cache.clear()
+            if not done and live[vid] >= 15:
+                # Still held after 3 s: stronger means.
+                x.current_lateral_shift = base_shift
+                if x.wheelbase > 0.0:
+                    self._axle_cache.clear()
+                data, grid = boxes()
+                others = neighbours(vid, data, grid)
+                own = (x, self._body_polygons(x), None)
+                hold = [o[0] for o in others if touching(own, o)]
+                # (1) Frozen only by the 1 cm margin: check the pair at 0,1 mm.
+                for o in hold:
+                    tight[(vid, o.creation_id)] = 8.0
+                if clear_of(x, others):
+                    done = True
+                    self.body_guard_tight += 1
+                # (2) Small steer of the held vehicle itself.
+                if not done:
+                    for d in (0.05, 0.1):
+                        for sign in (1.0, -1.0):
+                            shift = base_shift + sign * d
+                            if not lo_lim - 1e-9 <= shift <= hi_lim + 1e-9:
+                                continue
+                            x.current_lateral_shift = shift
+                            if x.wheelbase > 0.0:
+                                self._axle_cache.clear()
+                            if clear_of(x, others):
+                                done = True
+                                break
+                        if done:
+                            break
+                    if not done:
+                        x.current_lateral_shift = base_shift
+                        if x.wheelbase > 0.0:
+                            self._axle_cache.clear()
+                # (3) Every vehicle in the way that is (almost) standing edges
+                # a little sideways, whatever its width.
+                if not done and hold and all(y.speed < 0.5 for y in hold):
+                    saved = [(y, y.current_lateral_shift) for y in hold]
+                    ok = True
+                    for y in hold:
+                        road_y = self._road_state(y)[0]
+                        ylo, yhi = -math.inf, math.inf
+                        if road_y == y.in_road or road_y == y.out_road:
+                            lanes_y = self.roads[road_y]["num_lanes"]
+                            ylo = (y.occupied - 1) / 2.0 * SUBLANE_WIDTH
+                            yhi = (lanes_y - 1 - (y.occupied - 1) / 2.0) * SUBLANE_WIDTH
+                        y_shift = y.current_lateral_shift
+                        stepped = False
+                        for d in (0.05, 0.1, 0.2, 0.3, 0.45):
+                            for sign in (1.0, -1.0):
+                                shift = y_shift + sign * d
+                                if not ylo - 1e-9 <= shift <= yhi + 1e-9:
+                                    continue
+                                y.current_lateral_shift = shift
+                                if y.wheelbase > 0.0:
+                                    self._axle_cache.clear()
+                                data_y, grid_y = boxes()
+                                if clear_of(y, neighbours(y.creation_id, data_y, grid_y)):
+                                    stepped = True
+                                    break
+                            if stepped:
+                                break
+                        if not stepped:
+                            y.current_lateral_shift = y_shift
+                            if y.wheelbase > 0.0:
+                                self._axle_cache.clear()
+                            ok = False
+                            break
+                    if ok:
+                        data_y, grid_y = boxes()
+                        ok = clear_of(x, neighbours(vid, data_y, grid_y))
+                    if ok:
+                        for y, _ in saved:
+                            y.start_lateral_shift = y.target_lateral_shift = y.current_lateral_shift
+                            y.lane_change_progress = 1.0
+                            sg_y = seg.get(y.creation_id)
+                            if sg_y is not None:
+                                sg_y[9] = (y.road, y.current_lateral_shift, y.start_lateral_shift,
+                                           y.target_lateral_shift, y.lane, y.lane_change_from, 1.0)
+                            self.body_guard_yields += 1
+                        done = True
+                    else:
+                        for y, sh in saved:
+                            y.current_lateral_shift = sh
+                        self._axle_cache.clear()
+            if done:
+                x.start_lateral_shift = x.target_lateral_shift = x.current_lateral_shift
+                x.lane_change_progress = 1.0
+                sg[9] = (x.road, x.current_lateral_shift, x.start_lateral_shift,
+                         x.target_lateral_shift, x.lane, x.lane_change_from, 1.0)
+                self.body_guard_nudges += 1
+                live.pop(vid, None)
+            else:
+                sg[4] = lateral_prev
+                place(x, *lam_prev)
+        self._body_guard_waits = live
+        timers = self._body_guard_timers
+        new_timers = {}
+        teleport = []
+        for vid in blocked_by:
+            x = by_id.get(vid)
+            sg = seg.get(vid)
+            if x is None or sg is None or sg[7] > 0.25:
+                continue
+            new_timers[vid] = timers.get(vid, 0.0) + DT
+            if new_timers[vid] > self.guard_teleport and self._road_state(x)[0] == x.conn_road:
+                teleport.append(x)
+        self._body_guard_timers = new_timers
+        if teleport:
+            gone = {x.creation_id for x in teleport}
+            self.vehicles = [v for v in self.vehicles if v.creation_id not in gone]
+            self.body_guard_teleports += len(gone)
+            self.jam_removed += len(gone)
+            moved -= gone
+        for vid in moved:
+            sg = seg[vid]
+            v = next(x for x in self.vehicles if x.creation_id == vid)
+            v.speed = max(0.0, min(v.speed, 2.0 * (v.position - sg[5]) / DT - sg[6]))
+        self.body_guard_moves += len(moved)
+        if moved:
+            self._axle_cache.clear()
 
     @cython.annotation_typing(True)
     def _resolve_connector_overlaps(self, starting_positions, starting_speeds):
@@ -3547,6 +4408,8 @@ class LeVanLuongSimulator:
                 used[v.arm].update(range(v.lane, v.lane + v.occupied))
         for arm in ARMS:
             self.front_row_max[arm] = max(self.front_row_max[arm], len(used[arm]))
+        if self.observation_zone > 0:
+            self._measure_zone()
 
     def step(self, cycles=1):
         if not isinstance(cycles, int) or cycles < 0:
@@ -3624,7 +4487,7 @@ def main():
     parser.add_argument("--p-right", type=float, default=.2)
     parser.add_argument("--green-lvl", type=float, default=50)
     parser.add_argument("--green-hdt", type=float, default=40)
-    parser.add_argument("--all-red", type=float, default=2)
+    parser.add_argument("--all-red", type=float, default=0)
     parser.add_argument("--yellow", type=float, default=4.0,
                         help="yellow interval carved from the end of each green")
     parser.add_argument("--demand-file", type=Path, default=None,

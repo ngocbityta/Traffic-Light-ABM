@@ -20,15 +20,84 @@ from python_simulation.demand import generate_demand
 from python_simulation.python_sim import LeVanLuongSimulator
 from python_simulation.sim_config import load_sim_config
 from python_simulation.vehicle_geometry import SUBLANE_WIDTH
+from python_simulation.python_sim import DT
+
+
+class RainbowController:
+    """Greedy Rainbow DQN policy from a training run, acting on the observer's
+    simulator exactly as ``train/logic/evaluate.py`` does in the Python env."""
+
+    def __init__(self, weights):
+        import torch
+        from train.logic.gama_env import featurize
+        from train.logic.lvl_env import _observation
+        from train.logic.rainbow_agent import (ARCHITECTURE, LEGACY_ARCHITECTURE,
+                                               PREVIOUS_ARCHITECTURE, RainbowAgent)
+        weights = Path(weights).resolve()
+        checkpoint = torch.load(weights, map_location="cpu", weights_only=False)
+        architecture = checkpoint.get("architecture")
+        if architecture not in (ARCHITECTURE, LEGACY_ARCHITECTURE, PREVIOUS_ARCHITECTURE):
+            raise ValueError(f"Not a Rainbow checkpoint: {architecture}")
+        settings = dict(checkpoint.get("reward_settings", {}))
+        r1_ref = settings.get("r1_ref", checkpoint.get("r1_ref", 50.0))
+        settings.setdefault("r1_ref", r1_ref)
+        config_path = weights.parent / "training_config.json"
+        config = json.loads(config_path.read_text()) if config_path.exists() else {}
+        self.queue_feature_scale = (settings.get("queue_feature_scale") or
+                                    config.get("queue_feature_scale", "linear"))
+        self.agent = RainbowAgent(buffer_size=1, warmup=1, batch_size=1,
+                                  atoms=checkpoint["atoms"], v_min=checkpoint["v_min"],
+                                  v_max=checkpoint["v_max"], r1_ref=r1_ref,
+                                  reward_mode=checkpoint["reward_mode"],
+                                  reward_settings=settings, device="cpu",
+                                  aux_size=17 if architecture == ARCHITECTURE else 13)
+        self.agent.load(str(weights))
+        self.agent.eps = 0.0
+        self.name = f"Rainbow DQN ({checkpoint['reward_mode'].upper()}) · {weights.parent.name}/{weights.name}"
+        self._featurize, self._observation = featurize, _observation
+        self.decisions = 0
+        self.last_action = None
+
+    def observe(self, sim):
+        # Same observation as LVLPythonEnv.read_state (train/logic/lvl_env.py).
+        vehicles = []
+        for vehicle in sim.vehicles:
+            road, progress = sim._road_state(vehicle)
+            remaining = max(0.0, sim.roads[road]["length"] - progress)
+            vehicles.append((vehicle.speed, vehicle.desired, vehicle.lane,
+                             vehicle.occupied, road, remaining))
+        yellow_total = int(round(sim._yellow / DT))
+        return self._observation(sim.cycle, sim.phase, sim.dqn_waiting_action,
+                                 sim.next_decision_in_cycles, sim.created, sim.passed,
+                                 sim.queue_time_integral, sim.system_time_integral,
+                                 sim.weighted_delay_integral, vehicles, "spatial",
+                                 green_cycles=getattr(sim, "green_ticks", None),
+                                 mask=sim.action_mask(),
+                                 transition_of=(sim.yellow_phase or sim._last_yellow),
+                                 yellow_cycles=(yellow_total - sim.yellow_ticks_left
+                                                if sim.yellow_phase else 0),
+                                 extra={"jam_removed": sim.jam_removed,
+                                        "hard_brake_events": sim.hard_brake_events})
+
+    def act(self, sim):
+        state = self.observe(sim)
+        action = self.agent.act(self._featurize(state, self.queue_feature_scale),
+                                greedy=True, action_mask=state["action_mask"])
+        sim.set_action(int(action))
+        self.decisions += 1
+        self.last_action = int(action)
+        return action
 
 
 class Observer:
     def __init__(self, seed=1, mode="fixed", junction_model=None,
-                 sim_kwargs=None):
+                 sim_kwargs=None, flow=3000.0, controller=None):
         self.sim_kwargs = load_sim_config(config=sim_kwargs)
         configured_junction = self.sim_kwargs.pop("junction_model")
         self.junction_model = junction_model or configured_junction
         self.lock = threading.RLock()
+        self.flow = float(flow)
+        self.controller = controller
         self.seed = seed
         self._demand_path = None
         self.sim = None
@@ -38,12 +107,15 @@ class Observer:
     def reset(self, seed, mode="fixed"):
         if mode not in ("fixed", "train"):
             raise ValueError("mode must be 'fixed' or 'train'")
+        if self.controller is not None:
+            mode = "train"  # the trained policy drives the signal
         if self._demand_path:
             self._demand_path.unlink(missing_ok=True)
         temp = tempfile.NamedTemporaryFile(prefix="lvl_observer_", suffix=".csv", delete=False)
         temp.close()
         self._demand_path = Path(temp.name)
         generate_demand(self._demand_path, seed=seed, horizon=8000,
+                        flow_per_approach=self.flow,
                         heavy_ratio=self.sim_kwargs["heavy_ratio"])
         self.seed = seed
         self.mode = mode
@@ -51,7 +123,15 @@ class Observer:
                                        train_mode=(mode == "train"),
                                        junction_model=self.junction_model,
                                        **self.sim_kwargs)
+        if self.controller is not None:
+            self.controller.decisions = 0
+            self.controller.last_action = None
+        self.auto_act()
         return self.state()
+
+    def auto_act(self):
+        if self.controller is not None and self.sim.dqn_waiting_action:
+            self.controller.act(self.sim)
 
     def _body(self, vehicle):
         pose = self.sim._rigid_pose(vehicle)
@@ -61,6 +141,12 @@ class Observer:
         result = self.sim.snapshot()
         result["mode"] = self.mode
         result["junction_model"] = self.junction_model
+        result["flow_per_approach"] = self.flow
+        result["controller"] = (self.controller.name if self.controller is not None
+                                else "fixed plan" if self.mode == "fixed" else "manual")
+        if self.controller is not None:
+            result["agent_decisions"] = self.controller.decisions
+            result["agent_last_action"] = self.controller.last_action
         result["simulation_config"] = {"junction_model": self.junction_model,
                                        **self.sim_kwargs}
         vehicles = []
@@ -183,6 +269,15 @@ def make_handler(observer):
                     if type(cycles) is not int or not 1 <= cycles <= 100:
                         raise ValueError("cycles must be an integer from 1 to 100")
                     with observer.lock:
+                        if observer.controller is not None:
+                            for _ in range(cycles):
+                                observer.auto_act()
+                                observer.sim.step(1)
+                            observer.auto_act()
+                            result = observer.state()
+                            result["step_status"] = "advanced"
+                            result["cycles_advanced"] = cycles
+                            return self._json(result)
                         if observer.mode == "train":
                             advanced = 0
                             while advanced < cycles and not observer.sim.dqn_waiting_action:
@@ -203,6 +298,8 @@ def make_handler(observer):
                     if type(action) is not int or action not in (0, 2):
                         raise ValueError("action must be the integer 0 or 2")
                     with observer.lock:
+                        if observer.controller is not None:
+                            return self._json({"error": "The trained policy controls the signal"}, 409)
                         if observer.mode != "train":
                             return self._json({"error": "Actions are only available in train mode"}, 409)
                         if not observer.sim.dqn_waiting_action:
@@ -244,6 +341,12 @@ def main():
                         help="Shared simulator JSON or calibrate_discharge output")
     parser.add_argument("--heavy-ratio", type=float, default=None,
                         help="share of heavy vehicles (trucks, buses) in the demand")
+    parser.add_argument("--flow", type=float, default=3000.0,
+                        help="demand per approach in vehicles/h (default 3000)")
+    parser.add_argument("--weights", type=Path, default=None,
+                        help="Rainbow DQN weights (.pt) of a training run: the greedy "
+                             "policy drives the signal, e.g. "
+                             "train/results/rainbow_r1_5m/best_weights.pt")
     args = parser.parse_args()
     simulation = load_sim_config(args.sim_config)
     if args.junction_model:
@@ -257,9 +360,12 @@ def main():
         startup["discharge_headway"] = args.startup_headway
     simulation["startup_params"] = startup
     junction_model = simulation.pop("junction_model")
+    controller = RainbowController(args.weights) if args.weights else None
     observer = Observer(args.seed, junction_model=junction_model,
-                        sim_kwargs=simulation)
+                        sim_kwargs=simulation, flow=args.flow, controller=controller)
     print(f"Junction model: {junction_model}")
+    print(f"Demand: {args.flow:.0f} vehicles/h per approach")
+    print(f"Signal: {controller.name if controller else 'fixed plan / manual'}")
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(observer))
     print(f"LVL observer listening at http://127.0.0.1:{args.port}/")
     try:

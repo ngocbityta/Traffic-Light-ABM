@@ -161,7 +161,7 @@ class MinimumGreenTests(unittest.TestCase):
         self.assertTrue(sim.dqn_waiting_action)
         self.assertEqual(sim.action_mask(), (True, False, True, False))  # 10 s of LVL
         sim.set_action(2)
-        sim.step(50)                      # 4 s yellow + 2 s all-red + 4 s HDT
+        sim.step(50)                      # 4 s yellow + 6 s HDT
         self.assertEqual(sim.phase, "HDT")
         self.assertEqual(sim.action_mask(), (False, False, True, False))
         sim.set_action(0)                 # illegal: becomes a hold, not an error

@@ -3,12 +3,17 @@ import json
 from pathlib import Path
 
 DEFAULT_CONFIG = {"junction_model": "negotiation", "yellow": 4.0,
-                  "all_red": 2.0, "vehicle_params": {}, "startup_params": {},
+                  "all_red": 0.0, "vehicle_params": {}, "startup_params": {},
                   "min_green": 10.0, "jam_timeout": 120.0,
                   "curve_lat_accel": 3.0, "curve_decel": 2.0, "max_decel": 7.5,
                   # Share of heavy vehicles (trucks, buses) in generated demand.
                   "heavy_ratio": 0.03}
-ALLOWED = set(DEFAULT_CONFIG) | {"negotiation_params"}
+# Signal control and observation zone (27/11/2026). Not in DEFAULT_CONFIG,
+# so configurations saved before keep their exact meaning; the simulator
+# defaults apply (legacy phase choice every 10 s, no zone counters).
+SIGNAL_FIELDS = {"signal_control", "max_green", "ext_step", "countdown_lock",
+                 "decision_lead", "observation_zone"}
+ALLOWED = set(DEFAULT_CONFIG) | {"negotiation_params"} | SIGNAL_FIELDS
 
 
 def load_sim_config(path=None, *, config=None):

@@ -75,7 +75,7 @@ một file JSON cho giao diện và huấn luyện:
 {
   "junction_model": "negotiation",
   "yellow": 4.0,
-  "all_red": 2.0,
+  "all_red": 0.0,
   "vehicle_params": {"motorbike": {"headway": 0.75}},
   "heavy_ratio": 0.03,
   "startup_params": {"reaction_delay": 0.7}
@@ -120,7 +120,7 @@ bằng quỹ đạo xe đo tại ngã tư này.
 `LeVanLuongSimulator(yellow=4.0)` (mặc định 4 s) lấy 4 s cuối mỗi pha xanh làm
 đèn vàng; độ dài chu kỳ và thời điểm bắt đầu xanh không đổi. Có thể truyền
 `yellow=0` cho các benchmark cần kế hoạch cũ. Ở chế độ train, mỗi lần đổi pha
-có 4 s vàng rồi tới 2 s đỏ toàn phần.
+mặc định có 4 s vàng rồi mở xanh trục tiếp theo (all_red = 0 s).
 
 Khi vàng bật, mỗi xe chưa qua vạch quyết định dừng/đi một lần theo logit Point
 Data Model của Chauhan, Dhamaniya & Arkatkar (2022, TRF 89:222–235):
@@ -303,8 +303,7 @@ Các thay đổi sau áp dụng cho chế độ `safe`; chế độ `gama_2025_6
 
 - **Xanh tối thiểu.** `min_green=10.0` (s). `sim.action_mask()` chỉ cho đổi pha
   khi pha đang chạy đã xanh đủ lâu; `set_action` với action bị che được coi là
-  giữ pha (đếm trong `masked_actions`). Với quyết định mỗi 10 s và 6 s
-  vàng + đỏ toàn phần, agent đổi pha nhanh nhất mỗi 20 s.
+  giữ pha (đếm trong `masked_actions`). Với quyết định mỗi 10 s và 4 s vàng, agent đổi pha nhanh nhất mỗi 20 s.
 - **Giữ trống lòng nút.** `negotiation_params={"box_clear": true}` (mặc định):
   xe của pha mới chỉ chờ ở vạch dừng khi nó thật sự phải nhường một xe sót
   của pha cũ, tức xe sót chưa kịp rời vùng xung đột trước lúc xe này tới nơi.

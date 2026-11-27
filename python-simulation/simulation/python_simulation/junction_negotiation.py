@@ -268,6 +268,15 @@ class NegotiationParams:
     # Before the decision point (comfortable stopping distance + margin) a
     # left turner only goes on when every driver would accept the gap.
     logit_far_gap: float = 3.0
+    # Before its decision point, a left turner still on its approach is not
+    # held for a through vehicle that could stop at the zone with its
+    # comfortable deceleration: nothing is decided yet, it keeps driving
+    # and asks again each tick; at the decision point the logit decides.
+    # Holding it there (it went on only if the gap was >= 3 s and the
+    # through vehicle need not slow at all) made it, and the platoon behind
+    # it, brake for a vehicle far away that could easily have braked
+    # (26/11/2026: about half of these holds at 3000 veh/h).
+    logit_approach_open: bool = True
     decision_margin: float = 2.0
     # Lateral evasion of a through vehicle facing a crossing left turner:
     # "cut tail" (pass behind it) or "run in front" (pass ahead of it) by a
@@ -519,6 +528,10 @@ class JunctionNegotiator:
                 # Not yet at the decision point.
                 if tg >= self.p.logit_far_gap and clear_ahead:
                     return "ok", "ahead"
+                if (self.p.logit_approach_open and not m.on_junction and
+                        self.can_stop(f, z.b_in, f.decel)):
+                    # Undecided: no stop for m, no claim on f.
+                    return "ok", "approach_open"
                 return "block", "approach"
             p = self.accept_probability(m, tg)
             accepted = self._draw(m.vid, f.vid) < p
@@ -1043,7 +1056,7 @@ class JunctionNegotiator:
             else:
                 self.stats["minor_gap"] += 1
 
-        self._release_blocked_minor_claims(edges, minor_waits, stop)
+        self._release_blocked_minor_claims(edges, minor_waits, stop, agents)
 
         for first, second, seen, reason in edges:
             target = INF
@@ -1087,7 +1100,48 @@ class JunctionNegotiator:
         self.last_decisions = decisions
         return stop, commits
 
-    def _release_blocked_minor_claims(self, edges, minor_waits, stop):
+    @staticmethod
+    def _follow_edges(agents):
+        """(follower, leader) for every vehicle standing behind another body.
+
+        A queue is a wait as well: a vehicle stopped right behind a leader
+        will not pass before that leader moves. Without these the wait-for
+        graph misses rings such as through car A holds for left turner B in
+        its zone, B holds for through motorbike C in the next zone, and C
+        stands behind A (seed 3, 125 % demand: 51 vehicles locked)."""
+        cell = 6.0
+        grid = {}
+        for g in agents:
+            if g.xy is None:
+                continue
+            grid.setdefault((int(g.xy[0] // cell), int(g.xy[1] // cell)), []).append(g)
+        out = []
+        for s in agents:
+            if not s.stalled or s.xy is None or s.heading is None:
+                continue
+            hx, hy = s.heading
+            cx, cy = int(s.xy[0] // cell), int(s.xy[1] // cell)
+            best, best_along = None, INF
+            for gx in range(cx - 2, cx + 3):
+                for gy in range(cy - 2, cy + 3):
+                    for g in grid.get((gx, gy), ()):
+                        if g is s:
+                            continue
+                        dx, dy = g.xy[0] - s.xy[0], g.xy[1] - s.xy[1]
+                        along = dx * hx + dy * hy
+                        if along <= 0.0 or along >= best_along:
+                            continue
+                        reach = (s.length + g.length) / 2.0 + s.min_gap + 2.0
+                        if along > reach:
+                            continue
+                        if abs(dx * hy - dy * hx) > s.half_width + g.half_width + 0.2:
+                            continue
+                        best, best_along = g, along
+            if best is not None:
+                out.append((s, best))
+        return out
+
+    def _release_blocked_minor_claims(self, edges, minor_waits, stop, agents=()):
         """Drop a minor's claim on a zone when the claim closes a wait cycle.
 
         The minor gate runs after ``_break_cycles`` and lets a turning vehicle
@@ -1101,12 +1155,15 @@ class JunctionNegotiator:
         the zone it has not entered yet.
         """
         claims = ("ahead", "forced", "group")
+        follow = self._follow_edges(agents) if agents else []
         for _ in range(len(edges) + 1):
             waits = {}
             for item in edges:
                 waits.setdefault(item[1].vid, []).append((item[0].vid, item))
             for foe, minor in minor_waits:
                 waits.setdefault(minor.vid, []).append((foe.vid, None))
+            for follower, lead in follow:
+                waits.setdefault(follower.vid, []).append((lead.vid, None))
             state, released = {}, False
             for root in list(waits):
                 if state.get(root) is not None or released:
@@ -1138,6 +1195,24 @@ class JunctionNegotiator:
                                     "claim_released", 0) + 1
                                 released = True
                                 break
+                        if not released:
+                            # No claim to give back: the ring is held by
+                            # bodies in zones. After ``squeeze_after`` the
+                            # vehicle held longest for such a body edges on
+                            # (the body guard still keeps the bodies apart).
+                            stuck = [c for c in cycle_items
+                                     if c is not None and c[3] in ("in_zone", "both_in_zone")
+                                     and c[0].speed < 0.5 and c[1].speed < 0.5
+                                     and c[1].hold_time >= self.p.squeeze_after]
+                            if stuck:
+                                e = max(stuck, key=lambda c: (c[1].hold_time, c[1].front))
+                                for index, item_ in enumerate(edges):
+                                    if item_ is e:
+                                        del edges[index]
+                                        break
+                                self.stats["squeeze_ring"] = self.stats.get(
+                                    "squeeze_ring", 0) + 1
+                                released = True
                     elif state.get(nxt) is None:
                         state[nxt] = 1
                         stack.append(nxt)

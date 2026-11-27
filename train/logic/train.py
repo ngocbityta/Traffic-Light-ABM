@@ -113,6 +113,10 @@ def parse_args(argv=None):
                    help="Highest demand level of a training episode")
     p.add_argument("--axis-imbalance-max", type=float, default=0.0,
                    help="Largest extra share of the NW-SE axis per arm (0.2 = 20 %% busier)")
+    p.add_argument("--state-version", choices=("v4", "v5"), default="v4",
+                   help="v4: grid 4x6x20x16 + aux 17 (historical runs); v5: 50 m camera "
+                        "grid 4x7x10x12 + aux 30 (lvl_env.observation_v5), Rainbow + "
+                        "Python LVL backend only")
     p.add_argument("--queue-feature-scale", choices=QUEUE_FEATURE_SCALES, default="linear",
                    help="Queue counts in the observation: linear (/100, /50, clipped) or "
                         "log (log1p(n)/log1p(1000); does not saturate at heavy demand)")
@@ -185,6 +189,9 @@ def parse_args(argv=None):
         p.error("Horizon must exceed 100 cycles; total-steps and validate-every must be positive")
     if args.backend == "python" and args.start_server:
         p.error("--start-server is only valid with --backend gama")
+    if args.state_version == "v5" and (args.algorithm != "rainbow" or args.backend != "python"
+                                       or args.scenario != "lvl"):
+        p.error("--state-version v5 needs --algorithm rainbow --backend python --scenario lvl")
     if args.python_sim_mode != "safe" and (args.backend != "python" or args.scenario != "lvl"):
         p.error("--python-sim-mode gama_2025_6_4 requires --backend python --scenario lvl")
     if args.backend == "python" and args.demand_mode != "paired":
@@ -226,8 +233,9 @@ def parse_args(argv=None):
             math.isfinite(a) and math.isfinite(b) and a > 0 and b >= 0
             for a, b in args.validation_levels):
         p.error("--validation-levels needs positive scales and non-negative imbalances")
-    if (random_level or set(args.validation_levels) != {(1.0, 0.0)}) and args.scenario != "lvl":
-        p.error("Demand levels exist only for --scenario lvl")
+    if (random_level or set(args.validation_levels) != {(1.0, 0.0)}) and (
+            args.scenario != "lvl" or args.demand_mode != "paired"):
+        p.error("Demand levels exist only for --scenario lvl with --demand-mode paired")
     possible_episodes = min(args.total_steps, args.episodes) if args.episodes else args.total_steps
     training_end = args.seed_base + possible_episodes
     if any(args.seed_base < args.validation_seed_base + offset <= training_end
@@ -250,7 +258,7 @@ def training_config(args):
               "validation_seed_base", "lr", "gamma",
               "reward_mode", "r1_ref", "r2_ref", "b_ref", "r2_lambda", "r3_beta",
               "pressure_lambda", "demand_mode", "demand_scale_min", "demand_scale_max",
-              "axis_imbalance_max", "validation_levels", "queue_feature_scale", "max_delay_sq", "buffer_size", "warmup", "batch_size",
+              "axis_imbalance_max", "validation_levels", "queue_feature_scale", "state_version", "max_delay_sq", "buffer_size", "warmup", "batch_size",
               "tau", "eps_start", "eps_decay_steps", "eps_min", "model_path")
     config = {name: getattr(args, name) for name in fields}
     # JSON has no tuples: keep the in-memory config equal to the saved one,
@@ -375,6 +383,8 @@ def reward_settings(args):
                     r2_lambda=args.r2_lambda, r3_beta=args.r3_beta)
     if args.queue_feature_scale != "linear":
         settings["queue_feature_scale"] = args.queue_feature_scale
+    if getattr(args, "state_version", "v4") != "v4":
+        settings["state_version"] = args.state_version
     return settings
 
 

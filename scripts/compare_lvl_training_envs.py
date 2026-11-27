@@ -58,6 +58,7 @@ async def main(args):
     rows = []
     gama_wall = python_wall = 0.0
     agent = None
+    scale = "linear"
     if args.weights:
         checkpoint = torch.load(args.weights, map_location="cpu", weights_only=False)
         architecture = checkpoint.get("architecture")
@@ -77,6 +78,8 @@ async def main(args):
             raise ValueError(f"Unsupported checkpoint architecture: {architecture}")
         agent.load(args.weights)
         agent.eps = 0.0
+        # The observation scale the policy was trained with (log since 22/11/2026).
+        scale = checkpoint["reward_settings"].get("queue_feature_scale", "linear")
     try:
         manager.start(reuse_running=False)
         await gama.setup()
@@ -95,9 +98,9 @@ async def main(args):
         for decision in range(args.horizon // 50 - 1):
             action = (0, 2, 2, 0)[decision % 4]
             if agent:
-                gama_action = agent.act(featurize(gs), greedy=True,
+                gama_action = agent.act(featurize(gs, scale), greedy=True,
                                         action_mask=gs["action_mask"])
-                python_action = agent.act(featurize(ps), greedy=True,
+                python_action = agent.act(featurize(ps, scale), greedy=True,
                                           action_mask=ps["action_mask"])
             elif args.policy == "queue":
                 gama_action = 0 if gs["queue_ns"] >= gs["queue_ew"] else 2
@@ -126,8 +129,8 @@ async def main(args):
                                    f"waiting={gs['dqn_waiting_action']} next={gs['next_decision_in_cycles']}; "
                                    f"Python {ps['cycle']} waiting={ps['dqn_waiting_action']} "
                                    f"next={ps['next_decision_in_cycles']}")
-            g_features = featurize(gs)
-            p_features = featurize(ps)
+            g_features = featurize(gs, scale)
+            p_features = featurize(ps, scale)
             reward_error = abs(gr - pr) / max(1.0, abs(gr), abs(pr))
             queue_integral_error = abs(gs["queue_time_integral"] - ps["queue_time_integral"]) / max(
                 1.0, abs(gs["queue_time_integral"]), abs(ps["queue_time_integral"]))

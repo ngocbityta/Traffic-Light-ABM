@@ -41,6 +41,7 @@ cdef class Vehicle:
     cdef public double merge_wait
     cdef public bint yellow_go
     cdef public object yellow_epoch
+    cdef public object countdown_stop_epoch
     cdef public double merge_claim_shift
     cdef public double queue_stop_offset
     cdef public double junction_standstill
